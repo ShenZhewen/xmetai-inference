@@ -3,7 +3,7 @@
 
 归一化已烘焙进 ONNX 图，输入/输出都在物理量空间，normalize/denormalize 继承恒等。
 """
-from .onnx_backend import OnnxInferModel
+from backends.onnx import OnnxInferModel
 
 
 class FuxiEnsOnnxModel(OnnxInferModel):

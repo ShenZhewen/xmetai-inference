@@ -5,7 +5,7 @@
 normalize / denormalize / zero_recurrent 全部继承恒等实现。这里只是一个「模型身份」
 占位：告诉框架「这是 aifs11_ckpt，跑 ckpt 后端」。
 """
-from .ckpt_backend import CkptInferModel
+from backends.ckpt import CkptInferModel
 
 
 class Aifs11CkptModel(CkptInferModel):

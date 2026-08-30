@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """第②③步：自回归推理 + NetCDF 输出（合并版）。
 
-推理后端（BaseInferModel）与各模型子类已拆到 models/ 包，数据源拆到 loaders/
-包；本文件只保留「输出选择/单位换算/异步写盘/多卡切分」和主流程编排。加新模型、
-新数据源只需在对应注册表登记，无需改动本文件。
+推理后端（BaseInferModel）拆到 backends/ 包、各模型子类拆到 models/ 包，数据源
+拆到 loaders/ 包；本文件只保留「输出选择/单位换算/异步写盘/多卡切分」和主流程
+编排。加新模型、新数据源只需在对应注册表登记，无需改动本文件。
 
 用法（单次起报）：
     python infer.py --model fuxi.onnx --time 2024010200 --steps 10 --out ./output
@@ -43,10 +43,11 @@ import xarray as xr
 
 from build_input import build_input, load_spec, grid_coords
 from loaders import create_loader
-from models import BACKEND_REGISTRY, MODEL_REGISTRY, create_backend, create_model
+from backends import BACKEND_REGISTRY, create_backend
+from models import MODEL_REGISTRY, create_model
 
 
-# 推理后端（BaseInferModel / Onnx / Pt2 / 各模型子类）已拆到 models/ 包，见顶部 import。
+# 推理后端（BaseInferModel / Onnx / Pt2 / Ckpt）在 backends/，各模型子类在 models/，见顶部 import。
 
 
 # ---------------------------------------------------------------------------

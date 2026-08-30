@@ -10,7 +10,7 @@ import os
 import numpy as np
 import xarray as xr
 
-from .pt2_backend import Pt2InferModel
+from backends.pt2 import Pt2InferModel
 
 # 诊断通道（fuxiens README "How It Works" 第 3 步：回填前清零）。这 5 个场是
 # decoder 的诊断输出（辐射通量 + 降水），不是预报量；回填下一拍输入前必须清零，

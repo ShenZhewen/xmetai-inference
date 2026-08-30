@@ -24,12 +24,15 @@
 │   ├── era.py          #   ERA 逐变量 .nc 文件
 │   ├── zarr.py         #   打包好的 zarr store（通用，无默认地址）
 │   └── era5_store.py   #   ERA5 基础库（多组 zarr，默认地址内置）
-├── models/             # 推理后端 + 各模型子类 + 注册表
-│   ├── base.py         #   BaseInferModel：run 主循环（含进度条）
-│   ├── onnx_backend.py #   ONNX Runtime 后端（CUDAExecutionProvider）
-│   ├── pt2_backend.py  #   TorchScript/PT2 后端
+├── backends/           # 执行引擎（只懂 load + 跑，不懂模型语义）
+│   ├── base.py         #   BaseInferModel：run 主循环（含进度条）+ to_dataset
+│   ├── onnx.py         #   ONNX Runtime 后端（CUDAExecutionProvider）
+│   ├── pt2.py          #   TorchScript/PT2 后端
+│   └── ckpt.py         #   checkpoint 后端（anemoi SimpleRunner，覆盖 run）
+├── models/             # 具体模型（继承某引擎 + 覆盖钩子）+ 模型注册表
 │   ├── fuxi_ens_onnx.py#   FuXi-Ens（归一化已烘焙进图）
-│   └── fuxi21_pt2.py   #   FuXi-2.1（z-score 空间，mean/std 反归一化）
+│   ├── fuxi21_pt2.py   #   FuXi-2.1（z-score 空间，mean/std 反归一化）
+│   └── aifs11_ckpt.py  #   AIFS 1.1（GNN，归一化烘焙进 ckpt）
 └── 官方/ 参考/ 参考二/  # 上游参考实现（FengWu / FuXi-2.1 / FengQing 等）
 ```
 
