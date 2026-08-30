@@ -21,7 +21,7 @@ TIME="${TIME:-2025010600}"
 LEAD="${LEAD:-6}"
 SPEC="${SPEC:-aifs11.json}"
 
-# —— GPU 显存/分块（官方 notebook 建议，防止 mapper 一次性加载爆显存）——
+# —— GPU 显存/分块（fuxiens notebook 建议，防止 mapper 一次性加载爆显存）——
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export ANEMOI_INFERENCE_NUM_CHUNKS="${ANEMOI_INFERENCE_NUM_CHUNKS:-16}"
 # 多卡时指定用哪张卡（默认不设，让 torch 自选）

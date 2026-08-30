@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """推理后端基类。
 
-抽象出「加载 + 一步前向」两个接口，其余（自回归 rollout、归一化钩子）全部复用。
-换后端（ONNX / PT2 / checkpoint）或换模型（FuXi-Ens / FuXi-2.1 / FengShun）只需实现
-load + forward 两个方法，需要个性化处理（如 z-score 归一化、扰动）时覆盖
-normalize / denormalize 钩子即可。
+两层契约：单步前向 forward（默认循环走它）+ 自回归 run 循环（推理主入口）。
+换后端（ONNX / PT2 / checkpoint）只需实现 load + forward 两个方法，框架用默认
+run 循环把它们串起来；后端若自带循环（如 ckpt/anemoi 的 SimpleRunner）可整体
+覆盖 run()。模型层需要个性化处理（如 z-score 归一化、扰动）时覆盖
+normalize / denormalize / zero_recurrent 钩子即可。
 """
 import gc
 from abc import ABC, abstractmethod
@@ -31,6 +32,25 @@ def _default_gpu_mem_limit(device_id, fraction):
     return max(int(props.total_memory * fraction), 0)
 
 
+def _out_name(spec, channel):
+    """输出变量名（大写）：Z50/T50/.../TP。"""
+    var, level = spec["_parse"][channel]
+    if level is not None:
+        return f"{var.upper()}{level}"
+    return var.upper()
+
+
+def _transform(var, data, spec=None):
+    """tp: 模型规范单位 -> mm（clamp>=0）；q: g/kg -> kg/kg（×0.001）。"""
+    if var == "tp":
+        unit = spec["variables"]["tp"]["unit"] if spec is not None else "m"
+        scale = 1000.0 if unit == "m" else 1.0
+        return np.maximum(data, 0.0) * scale
+    if var == "q":
+        return data * 0.001
+    return data
+
+
 class BaseInferModel(ABC):
     """所有推理后端的公共基类。
 
@@ -40,7 +60,7 @@ class BaseInferModel(ABC):
 
     forward 的约定：输入 x 为 (1, in_frames, C, H, W) 的 numpy float32，
     返回同样 (1, in_frames, C, H, W) 的完整模型输出（末帧是本步预报）。
-    这条约定定了，rollout 就完全不用知道后端是 ONNX 还是 PyTorch；回填用
+    这条约定定了，run 就完全不用知道后端是 ONNX 还是 PyTorch；回填用
     完整输出（state = result），与官方 inference.py 的 `new_input = model.run(...)` 一致。
     """
     backend = "base"
@@ -87,10 +107,40 @@ class BaseInferModel(ABC):
         """
         return state
 
-    def rollout(self, base_input, steps, members=1, hour_interval=6,
-                init_time=None, member_start=0, member_stride=1, on_step=None,
-                log_step=False, progress=True, progress_label=""):
-        """自回归 rollout（step 外层、member 内层），与后端无关。
+    def to_dataset(self, step_state, spec, save_names=None, lat=None, lon=None):
+        """一步 × 一成员的输出 → xarray Dataset（落盘前最后一步，后端无关入口）。
+
+        默认实现按 onnx/pt2 通道张量语义：step_state 形状 (C,H,W)，用 spec 的
+        _channels/_parse 解码变量名、套 lat/lon 坐标、挑 save_names（None=全部通道）。
+        ckpt 后端覆盖为 field dict → N320 节点 Dataset。落盘统一走这里，infer.py
+        不再关心状态表示（Step 4 接入）。
+        """
+        import xarray as xr
+
+        channels = spec["_channels"]
+        parse = spec["_parse"]
+        if save_names is None:
+            save_indices = list(range(len(channels)))
+        else:
+            name2idx = {str(c).lower(): i for i, c in enumerate(channels)}
+            save_indices = [name2idx[str(n).lower()] for n in save_names]
+        data_vars = {}
+        for ci in save_indices:
+            channel = channels[ci]
+            var = parse[channel][0]
+            arr = step_state[ci]                        # (H, W)，北->南
+            arr = _transform(var, arr, spec)
+            data_vars[_out_name(spec, channel)] = (("lat", "lon"), arr)
+        return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
+
+    def run(self, base_input, steps, members=1, hour_interval=6,
+            init_time=None, member_start=0, member_stride=1, on_step=None,
+            log_step=False, progress=True, progress_label=""):
+        """自回归推理循环（step 外层、member 内层），与后端无关——推理主契约。
+
+        默认实现走「单步 forward + state=result 回填」，适配 onnx/pt2 这类「后端只
+        暴露单步、循环归框架」的引擎；后端若自带循环（如 ckpt/anemoi 的
+        SimpleRunner），可整体覆盖 run()，完全不碰 forward。
 
         base_input: (1, in_frames, C, H, W) 的初始状态。
         member_start / member_stride 用于多卡拆成员：rank r 传 (r, world_size)，
@@ -123,7 +173,7 @@ class BaseInferModel(ABC):
             t0 = perf_counter()
             step_buf = np.empty((n_my, C, H, W), dtype=np.float32)
             # valid = 起报 + s 步 = 输入窗口最新帧的时刻（不是 s+1 步的预报时刻）。
-            # hour/doy 标注的是"当前输入状态"的时间，官方 inference.py 与参考
+            # hour/doy 标注的是"当前输入状态"的时间，fuxiens inference.py 与参考
             # onnx_infer_dfens.py 都用 t*interval，这里对齐；step 标量仍用 s（0-based）。
             valid = init + pd.Timedelta(hours=s * hour_interval) if init is not None else None
             for mi in range(n_my):

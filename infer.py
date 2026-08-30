@@ -23,7 +23,7 @@
     ...
 或者干脆用 CUDA_VISIBLE_DEVICES 隔离 + LOCAL_RANK 标 rank。ONNX Runtime 单个
 session 只用一张卡（device_id），没有跨卡并行；多卡的加速来自把集合成员 /
-起报次数分到不同卡上，不是单次 rollout 变快。
+起报次数分到不同卡上，不是单次 run 变快。
 
 推理是 step 外层、member 内层：每算完一个 step 的全体成员就异步丢给后台线程
 落盘，GPU 不等磁盘写；netCDF4/HDF5 非线程安全，所以只用一个 writer 线程串行写。
@@ -31,6 +31,7 @@ session 只用一张卡（device_id），没有跨卡并行；多卡的加速来
 import argparse
 import gc
 import importlib
+import json
 import os
 import queue
 import threading
@@ -42,7 +43,7 @@ import xarray as xr
 
 from build_input import build_input, load_spec, grid_coords
 from loaders import create_loader
-from models import create_model
+from models import BACKEND_REGISTRY, MODEL_REGISTRY, create_backend, create_model
 
 
 # 推理后端（BaseInferModel / Onnx / Pt2 / 各模型子类）已拆到 models/ 包，见顶部 import。
@@ -51,26 +52,6 @@ from models import create_model
 # ---------------------------------------------------------------------------
 # 输出（后端无关）
 # ---------------------------------------------------------------------------
-def _out_name(spec, channel):
-    """输出变量名（大写）：Z50/T50/.../TP。"""
-    var, level = spec["_parse"][channel]
-    if level is not None:
-        return f"{var.upper()}{level}"
-    return var.upper()
-
-
-# tp: 模型规范单位 -> mm（clamp>=0）；q: g/kg -> kg/kg（×0.001）。
-# tp 的换算倍数看 spec 声明的规范单位：fuxi_ens 用 m（×1000），fuxi-2.1 用 mm（×1）。
-def _transform(var, data, spec=None):
-    if var == "tp":
-        unit = spec["variables"]["tp"]["unit"] if spec is not None else "m"
-        scale = 1000.0 if unit == "m" else 1.0
-        return np.maximum(data, 0.0) * scale
-    if var == "q":
-        return data * 0.001
-    return data
-
-
 def _resolve_output_indices(spec, requested):
     """把要保存的变量名（z500/u200/v200/msl/tp）映射成通道下标。
 
@@ -90,25 +71,6 @@ def _resolve_output_indices(spec, requested):
     if not idxs:
         raise SystemExit("没有有效的输出变量可保存（检查 --vars 是否写对）")
     return idxs
-
-
-def _member_step_dataset(step_buf, m_local, spec, lat, lon, save_indices):
-    """一个成员一个 step 的输出：只挑要保存的通道，合并成 2D(lat,lon) Dataset。
-
-    变量名沿用大写（Z500/T2M/.../TP），层级编码在名字里；输出保持模型自身的
-    北->南方向，lat 坐标也是降序（90->-90），与参考实现 fuxi2.1 一致（不翻转）。
-    tp 转 mm、q 转 kg/kg。
-    """
-    channels = spec["_channels"]
-    parse = spec["_parse"]
-    data_vars = {}
-    for ci in save_indices:
-        channel = channels[ci]
-        var = parse[channel][0]
-        arr = step_buf[m_local, ci]                       # (H, W)，北->南
-        arr = _transform(var, arr, spec)
-        data_vars[_out_name(spec, channel)] = (("lat", "lon"), arr)
-    return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
 
 
 def _select_netcdf_engine():
@@ -227,9 +189,10 @@ def _create_loader(args, spec):
 
 def main():
     p = argparse.ArgumentParser(description="气象模型自回归推理（后端可插拔）")
-    p.add_argument("--model", required=True, help="模型路径（.onnx/.pt2，后端默认按扩展名识别）")
+    p.add_argument("--model", required=True, help="模型文件路径（.onnx/.pt2/.ckpt；后端由 spec 的 model.class 决定）")
     p.add_argument("--backend", default=None,
-                   help="推理后端或模型名：onnx/pt2 或 fuxi_ens_onnx/fuxi21_pt2（默认按模型扩展名自动识别）")
+                   help="逃生舱：覆盖 spec 的 model.class，可传模型名(fuxi_ens_onnx/fuxi21_pt2/"
+                        "aifs11_ckpt)或引擎名(onnx/pt2/ckpt，裸后端无模型钩子)")
     p.add_argument("--time", default=None, help="单次起报时间 YYYYMMDDHH（与 --start/--end 二选一）")
     p.add_argument("--start", default=None, help="起始起报时间 YYYYMMDDHH")
     p.add_argument("--end", default=None, help="结束起报时间 YYYYMMDDHH（含，默认=--start）")
@@ -262,7 +225,27 @@ def main():
     # 单进程想指定别的卡仍可用 --device 覆盖。
     device_id = args.device if args.device is not None else 0
 
-    spec = load_spec(args.spec)
+    # 先读原始 JSON 确定 model.class（--backend 可覆盖），据此判断状态表示：
+    # ckpt 后端走 field 字典（AIFS，N320 节点），onnx/pt2 走通道张量。
+    with open(args.spec, encoding="utf-8") as _fh:
+        raw_spec = json.load(_fh)
+    sel = args.backend or raw_spec.get("model", {}).get("class")
+    if sel is None:
+        raise SystemExit("spec 的 model 块没写 \"class\"，也没给 --backend，无法确定用哪个模型类")
+    cls = MODEL_REGISTRY.get(sel) or BACKEND_REGISTRY.get(sel)
+    if cls is None:
+        raise SystemExit(f"未知模型/后端 {sel!r}（模型: {', '.join(MODEL_REGISTRY)}；"
+                         f"后端: {', '.join(BACKEND_REGISTRY)}）")
+    is_field = getattr(cls, "backend", "") == "ckpt"
+
+    # 按表示加载 spec：FuXi 走 build_input.load_spec（补 _channels/_parse/单位等），
+    # AIFS 走 build_input_aifs 的 plain json.load。
+    if is_field:
+        from build_input_aifs import load_spec as load_spec_aifs, build_aifs_fields
+        spec = load_spec_aifs(args.spec)
+    else:
+        spec = load_spec(args.spec)
+
     interval = args.interval or spec["model"].get("hour_interval", 6)
     history = args.history or spec["model"].get("history_steps", 2)
     # 集合/确定性显式化：members 缺省从 spec 读；类型与成员数不一致时告警（不报错）
@@ -274,8 +257,8 @@ def main():
     elif forecast_type == "ensemble" and members <= 1:
         print(f"[警告] spec 声明集合模型（{spec.get('name')}），但 --members={members}；"
               f"集合成员数应 >1，请检查 --members / spec")
-    # 一个进程内复用同一个 loader，让多个起报时间命中读文件缓存（只读一次数据源）
-    loader = _create_loader(args, spec)
+    # 一个进程内复用同一个 loader（只给 FuXi 用；AIFS 的 build_aifs_fields 内部自建 loader）
+    loader = None if is_field else _create_loader(args, spec)
 
     init_times = _init_times(args, interval)
 
@@ -304,50 +287,75 @@ def main():
 
     if args.out is None:
         init = init_times[0]
-        x = build_input(init.strftime("%Y%m%d%H"), spec=spec,
-                        history_steps=history, hour_interval=interval, loader=loader)
-        _print_input_summary(x, spec)
+        if is_field:
+            build_aifs_fields(init.strftime("%Y%m%d%H"), spec=spec,
+                              history_steps=history, hour_interval=interval, do_interp=True)
+        else:
+            x = build_input(init.strftime("%Y%m%d%H"), spec=spec,
+                            history_steps=history, hour_interval=interval, loader=loader)
+            _print_input_summary(x, spec)
         print("未指定 --out，仅做输入构建校验（只校验首个起报时间）。")
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    model = create_model(args.model, device_id=device_id,
-                         gpu_mem_fraction=args.gpu_mem, backend=args.backend)
+    # 模型选择：sel 已在上面从原始 spec 解析并校验过（∈ MODEL_REGISTRY ∪ BACKEND_REGISTRY）
+    if sel in MODEL_REGISTRY:
+        model = create_model(sel, device_id=device_id, gpu_mem_fraction=args.gpu_mem)
+    else:
+        model = create_backend(sel, device_id=device_id, gpu_mem_fraction=args.gpu_mem)
+        print(f"[警告] 使用裸后端 {sel!r}（无模型钩子/归一化）；正规用法是 spec 写 model.class")
     print(f"[rank {local_rank}/{world_size}] 加载模型 (backend={model.backend}, device={device_id}, "
           f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}) ...")
     model.load(args.model)
     print(model.describe())
 
-    # 输出变量选择：--vars 指定则用，否则保存全部通道（spec 只描述"有哪些通道"，不再管"存哪些"）
+    # 输出变量选择：--vars 指定则用，否则保存全部（FuXi 走通道解析，AIFS 走 field 名）
     requested = [v for v in args.vars.split(",") if v.strip()] if args.vars else None
-    save_indices = _resolve_output_indices(spec, requested)
-    save_names = [spec["_channels"][ci] for ci in save_indices]
-    print(f"[rank {local_rank}/{world_size}] 输出变量 ({len(save_names)}): {', '.join(save_names)}")
+    if is_field:
+        save_names = requested                       # AIFS：field 名，None=全部字段
+        names_desc = ", ".join(save_names) if save_names else "(全部字段)"
+    else:
+        save_indices = _resolve_output_indices(spec, requested)
+        save_names = [spec["_channels"][ci] for ci in save_indices]
+        names_desc = ", ".join(save_names)
+    print(f"[rank {local_rank}/{world_size}] 输出变量: {names_desc}")
 
-    lat, lon = grid_coords(spec)
+    # FuXi 输出网格坐标来自 spec；AIFS 的 N320 经纬度由输出 state 自带（to_dataset 里读）
+    lat, lon = (None, None) if is_field else grid_coords(spec)
     writer = _AsyncWriter(args.out)
 
     total_t0 = perf_counter()
     for i, init in enumerate(init_times):
         t0 = perf_counter()
-        x = build_input(init.strftime("%Y%m%d%H"), spec=spec,
-                        history_steps=history, hour_interval=interval, loader=loader)
-        if args.verbose:
-            _print_input_summary(x, spec)
+        if is_field:
+            state = build_aifs_fields(init.strftime("%Y%m%d%H"), spec=spec,
+                                      history_steps=history, hour_interval=interval,
+                                      do_interp=True)
+        else:
+            state = build_input(init.strftime("%Y%m%d%H"), spec=spec,
+                                history_steps=history, hour_interval=interval, loader=loader)
+            if args.verbose:
+                _print_input_summary(state, spec)
 
-        def on_step(s, step_buf, init=init):
+        def on_step(s, step_state, init=init):
             step_idx = s + 1                        # 预测步序号，1-based
-            multi_member = members > 1
-            for m_local, m_id in enumerate(member_indices):
-                ds = _member_step_dataset(step_buf, m_local, spec, lat, lon, save_indices)
-                # 确定性（单成员）不套 member_xxx 目录，直接 {起报日}/{step}.nc
-                if multi_member:
-                    fname = f"{init:%Y%m%d}/member_{m_id:03d}/{step_idx:03d}.nc"
-                else:
-                    fname = f"{init:%Y%m%d}/{step_idx:03d}.nc"
-                writer.put(fname, ds, raw=(step_buf, s, init))
+            if is_field:
+                # AIFS：单成员，一步一个 field 字典，直接转 Dataset 落盘（N320 节点）
+                ds = model.to_dataset(step_state, spec, save_names=save_names)
+                writer.put(f"{init:%Y%m%d}/{step_idx:03d}.nc", ds)
+            else:
+                multi_member = members > 1
+                for m_local, m_id in enumerate(member_indices):
+                    ds = model.to_dataset(step_state[m_local], spec,
+                                          save_names=save_names, lat=lat, lon=lon)
+                    # 确定性（单成员）不套 member_xxx 目录，直接 {起报日}/{step}.nc
+                    if multi_member:
+                        fname = f"{init:%Y%m%d}/member_{m_id:03d}/{step_idx:03d}.nc"
+                    else:
+                        fname = f"{init:%Y%m%d}/{step_idx:03d}.nc"
+                    writer.put(fname, ds, raw=(step_state, s, init))
 
-        model.rollout(x, steps=args.steps, members=members,
+        model.run(state, steps=args.steps, members=members,
                       hour_interval=interval, init_time=init,
                       member_start=member_start, member_stride=member_stride,
                       on_step=on_step, log_step=args.verbose,
@@ -356,8 +364,8 @@ def main():
         # 等本起报的输出全部写完，再读下一个起报的输入——避免写线程与主线程
         # 并发访问 HDF5 触发段错误（netCDF4 非线程安全，见 onnx_infer_dfens.py 注释）
         writer.flush()
-        # 释放本次起报的输入张量：多卡连续起报若不及时回收，大数组会累积顶爆系统内存
-        del x
+        # 释放本次起报的输入（张量或 field 字典）：多卡连续起报若不及时回收会顶爆系统内存
+        del state
         gc.collect()
         pct = (i + 1) / len(init_times) * 100
         print(f"[rank {local_rank}/{world_size}] 起报 {i + 1}/{len(init_times)} "

@@ -1,6 +1,7 @@
 {
   "name": "fuxi-2.1",
   "model": {
+    "class": "fuxi21_pt2",
     "history_steps": 2,
     "hour_interval": 6,
     "forecast_type": "deterministic"

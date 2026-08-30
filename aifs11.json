@@ -1,6 +1,7 @@
 {
   "name": "aifs-single-1.1",
   "model": {
+    "class": "aifs11_ckpt",
     "history_steps": 2,
     "hour_interval": 6,
     "checkpoint": "aifs_single_v1.1.ckpt",

@@ -16,7 +16,9 @@ set -euo pipefail
 # 可配置参数（都能用环境变量覆盖）
 # ---------------------------------------------------------------------------
 MODEL="${MODEL:-/workspace/szwCode/xmetai-inference/fuxi_onnx/fuxi_ens.onnx}"        # ONNX 模型路径
-BACKEND="${BACKEND:-onnx}"         # 推理后端：onnx/pt/pt2/chpt 或模型名（fuxi_ens_onnx/fuxi21_pt2 等）
+# 模型类由 spec 的 model.class 决定（fuxi_ens.json -> fuxi_ens_onnx）；BACKEND 是逃生舱，
+# 默认留空不传 --backend，设了才覆盖（可传模型名或引擎名 onnx/pt2）。
+BACKEND="${BACKEND:-}"
 START="${START:-2025010600}"       # 起始起报时间 YYYYMMDDHH（默认一周：2025-01-06 00 时）
 END="${END:-2025011200}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-01-12 00 时）
 FREQ="${FREQ:-24}"                 # 起报间隔小时（默认每天 1 次，一周共 7 个起报）
@@ -41,7 +43,7 @@ LOADER="${LOADER:-era5_store}"
 # ---------------------------------------------------------------------------
 # 打印本次运行配置
 # ---------------------------------------------------------------------------
-echo "== 模型=$MODEL | 后端=$BACKEND | 数据源=$LOADER | 卡=$GPUS (CUDA $CUDA_DEVICES) =="
+echo "== 模型=$MODEL | 数据源=$LOADER | 卡=$GPUS (CUDA $CUDA_DEVICES) =="
 if [ -n "$START" ]; then
   echo "起报 $START .. ${END:-$START} (间隔 ${FREQ:-步长}h) | $STEPS 步 x $MEMBERS 成员"
 else
@@ -66,6 +68,10 @@ if [ "$LOADER" = "zarr" ]; then
   LOADER_ARGS="$LOADER_ARGS --zarr ${ZARR:?zarr loader 需要设 ZARR（store 路径）}"
 fi
 
+# 后端逃生舱：默认不传（spec 决定模型类）；设了 BACKEND 才传
+BACKEND_ARGS=""
+[ -n "$BACKEND" ] && BACKEND_ARGS="--backend $BACKEND"
+
 # ---------------------------------------------------------------------------
 # 每个 rank 一个进程并行推理；等所有卡跑完，任一失败则退出非零
 # ---------------------------------------------------------------------------
@@ -75,11 +81,11 @@ for r in $(seq 0 $((GPUS - 1))); do
   # device 恒为 0；LOCAL_RANK 只负责把起报时间连续切块分给各卡。
   gpu=$(echo "$CUDA_DEVICES" | tr ',' '\n' | sed -n "$((r + 1))p")
   echo "启动 rank $r/$GPUS (GPU $gpu) ..."
-  # shellcheck disable=SC2086  # TIME_ARGS / LOADER_ARGS 需要按空格拆分
+  # shellcheck disable=SC2086  # TIME_ARGS / LOADER_ARGS / BACKEND_ARGS 需要按空格拆分
   CUDA_VISIBLE_DEVICES="$gpu" LOCAL_RANK=$r WORLD_SIZE=$GPUS \
     python -u /workspace/szwCode/xmetai-inference/infer.py \
       --model "$MODEL" \
-      --backend "$BACKEND" \
+      $BACKEND_ARGS \
       $TIME_ARGS \
       --spec "$SPEC" \
       $LOADER_ARGS \

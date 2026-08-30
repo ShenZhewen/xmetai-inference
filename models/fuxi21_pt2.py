@@ -12,7 +12,7 @@ import xarray as xr
 
 from .pt2_backend import Pt2InferModel
 
-# 诊断通道（官方 README "How It Works" 第 3 步：回填前清零）。这 5 个场是
+# 诊断通道（fuxiens README "How It Works" 第 3 步：回填前清零）。这 5 个场是
 # decoder 的诊断输出（辐射通量 + 降水），不是预报量；回填下一拍输入前必须清零，
 # 否则 6h 累积场会滚进下一拍。与 variables.py 的 ACCUMULATED_CHANNELS 一致。
 _DIAGNOSTIC_CHANNELS = ("ssr", "ssrd", "fdir", "ttr", "tp")
@@ -46,7 +46,7 @@ class Fuxi21Pt2Model(Pt2InferModel):
         return self
 
     def zero_recurrent(self, state):
-        """官方 README：辐射/降水是诊断输出，回填前在 recurrent state 里清零。"""
+        """fuxiens README：辐射/降水是诊断输出，回填前在 recurrent state 里清零。"""
         if self._diag_indices:
             state[..., self._diag_indices, :, :] = 0.0
         return state

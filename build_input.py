@@ -224,7 +224,7 @@ def _inventory(ds):
     fields = {}
     units = {}
 
-    # 1) 打包的 channel 变量（官方 input.nc 这种）
+    # 1) 打包的 channel 变量（fuxiens input.nc 这种）
     for name in ds.data_vars:
         da = ds[name]
         cc = _find_coord(da, CHANNEL_NAMES)
@@ -374,7 +374,7 @@ def build_input(init_time, spec, history_steps=None, hour_interval=None,
                 continue
             scale, offset = conversion[(var, level)]
             arr = arr * scale + offset
-            # 官方 fuxi_ens / fuxi2.1 的 input.nc 里，sst 通道陆地就是 NaN（共 703752 个，
+            # fuxiens fuxi_ens / fuxi2.1 的 input.nc 里，sst 通道陆地就是 NaN（共 703752 个，
             # 且是唯一含 NaN 的通道），模型自带 land-sea mask 门控，官方不填充、直接喂 NaN。
             # 这里保持一致：不填、不替换，NaN 原样透传。
             bad = ~np.isfinite(arr)

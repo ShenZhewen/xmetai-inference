@@ -1,6 +1,7 @@
 {
   "name": "fuxi-ens",
   "model": {
+    "class": "fuxi_ens_onnx",
     "history_steps": 2,
     "hour_interval": 6,
     "forecast_type": "ensemble",

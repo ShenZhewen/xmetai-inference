@@ -79,7 +79,7 @@ class Pt2InferModel(BaseInferModel):
                 args.append(feats[name])
         with torch.no_grad():
             result = self._module(*args)
-        # 完整输出 (1,in_frames,C,H,W) → numpy float32；保持归一化供 rollout 回填。
+        # 完整输出 (1,in_frames,C,H,W) → numpy float32；保持归一化供 run 回填。
         # 末帧是本步预报，完整 state 用于 state=result 回填（与官方一致）。
         return result.float().cpu().numpy()
 

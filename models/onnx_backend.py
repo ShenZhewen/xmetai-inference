@@ -84,7 +84,7 @@ class OnnxInferModel(BaseInferModel):
                 if k in self._input_names:
                     feeds[k] = v
         # 输出完整滑动窗口 (1, in_frames, C, H, W)：输入 [t-1,t] → 输出 [t,t+1]，
-        # 末帧才是本步预报。基类 rollout 会取 state[:, -1] 当预报、用完整 state
+        # 末帧才是本步预报。基类 run 会取 state[:, -1] 当预报、用完整 state
         # 回填（state = result），与官方 inference.py 的 `new_input = model.run(...)`
         # 一致。这里原样返回完整输出，不再只切末帧。
         return self.session.run([self._pred_name], feeds)[0]

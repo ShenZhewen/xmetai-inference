@@ -12,7 +12,7 @@
 
 ```
 .
-├── infer.py            # 主入口：后端加载 → 自回归 rollout → 单位换算 → 异步落盘
+├── infer.py            # 主入口：后端加载 → 自回归 run → 单位换算 → 异步落盘
 ├── build_input.py      # 数据 → 模型输入（单位推断 / 网格对齐 / 张量装配）
 ├── evaluate.py         # 评测：预测 vs era5_store 实况，算 CRPS/RMSE/Spread/BSS/AROC
 ├── run_fuxi_ens.sh     # FuXi-Ens 集合推理（多卡）
@@ -25,7 +25,7 @@
 │   ├── zarr.py         #   打包好的 zarr store（通用，无默认地址）
 │   └── era5_store.py   #   ERA5 基础库（多组 zarr，默认地址内置）
 ├── models/             # 推理后端 + 各模型子类 + 注册表
-│   ├── base.py         #   BaseInferModel：rollout 主循环（含进度条）
+│   ├── base.py         #   BaseInferModel：run 主循环（含进度条）
 │   ├── onnx_backend.py #   ONNX Runtime 后端（CUDAExecutionProvider）
 │   ├── pt2_backend.py  #   TorchScript/PT2 后端
 │   ├── fuxi_ens_onnx.py#   FuXi-Ens（归一化已烘焙进图）
@@ -184,7 +184,7 @@ loader 不认识模型。
 
 ## 多卡
 
-单次 rollout 是 ONNX session 独占一张卡，没有跨卡并行；多卡加速来自**把起报时间 /
+单次 run 是 ONNX session 独占一张卡，没有跨卡并行；多卡加速来自**把起报时间 /
 成员分到不同卡**。`run_fuxi_ens.sh` 已经封装好：给每个 rank 一个进程，`CUDA_VISIBLE_DEVICES`
 单独隔离一张卡（进程内 device 恒为 0），`LOCAL_RANK`/`WORLD_SIZE` 用来切分：
 起报时间多于 1 个就按起报时间连续切块，只有单个起报才按成员拆。
@@ -193,7 +193,7 @@ loader 不认识模型。
 
 ## 进度条
 
-推理的 rollout 循环**默认就有一条进度条**（不用 `--verbose`）：
+推理的 run 循环**默认就有一条进度条**（不用 `--verbose`）：
 
 ```
 [rank 0/4] 0106 [████████░░░░░░░░░░░░░░░░] 20/61 步 ( 32.8%) 平均0.82s/步 ETA  33.6s
