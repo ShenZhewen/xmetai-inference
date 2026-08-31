@@ -35,10 +35,11 @@
 │   ├── run_fuxi_pt2.sh #   FuXi-2.1 确定性推理（单卡）
 │   ├── run_eval.sh     #   评测的 bash 封装
 │   └── run_aifs_minimal.sh # AIFS 最小闭环冒烟
-└── specs/              # 模型 spec JSON（换模型 = 换一份 spec，见 specs/README.md）
-    ├── fuxi_ens.json   #   FuXi-Ens 模型 spec（通道、单位、量程、网格）
-    ├── fuxi21.json     #   FuXi-2.1 模型 spec
-    └── aifs11.json     #   AIFS 1.1 模型 spec
+├── specs/              # 模型 spec JSON（换模型 = 换一份 spec，见 specs/README.md）
+│   ├── fuxi_ens.json   #   FuXi-Ens 模型 spec（通道、单位、量程、网格）
+│   ├── fuxi21.json     #   FuXi-2.1 模型 spec
+│   └── aifs11.json     #   AIFS 1.1 模型 spec
+└── weights/            # 模型权重（.onnx/.pt2/.ckpt + mean/std，gitignore 不提交）
 ```
 
 ---
