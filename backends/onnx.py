@@ -49,8 +49,8 @@ class OnnxInferModel(BaseInferModel):
         options.enable_cpu_mem_arena = True
         options.enable_mem_reuse = True
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-        options.add_session_config_entry("cudnn_conv_algo_search", "HEURISTIC")
+        # ALL 在 EXTENDED 基础上再加 layout（NHWC）优化与更多算子融合，数值等价、零精度损失。
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         if self.use_cpu_initializers:
             # 模型权重留在主机内存，按需送显存 —— 大模型省显存的关键
             options.add_session_config_entry("session.use_device_allocator_for_initializers", "0")
@@ -62,6 +62,9 @@ class OnnxInferModel(BaseInferModel):
             "arena_extend_strategy": "kSameAsRequested",
             "cudnn_conv_use_max_workspace": "0",
             "do_copy_in_default_stream": "1",
+            # 卷积算法穷举搜索：首次推理慢一点，换来每层最优 kernel（之后缓存）。零精度损失。
+            # 注意这是 CUDA EP 的 provider option，之前误放成 session config entry 是无效的。
+            "cudnn_conv_algo_search": "EXHAUSTIVE",
         }
         # 只在能拿到真实显存上限时才限制；拿不到（无 torch / 无 CUDA）就干脆不写 gpu_mem_limit。
         # 否则 fallback 成 "0.7" 这种非法值会被 ORT 当成 0 字节上限，把 CUDA 分配器直接压崩。
@@ -75,7 +78,11 @@ class OnnxInferModel(BaseInferModel):
         providers.append(("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}))
         self.session = ort.InferenceSession(path, sess_options=options, providers=providers)
         self._pred_name = self.session.get_outputs()[0].name
+        self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())
+        # 输出 OrtValue 复用池：forward_gpu 把用完的输入 state 回收为下一个输出 buffer，
+        # 避免每步 ortvalue_from_shape_and_type 分配/释放 618MB 显存。首个调用时才新建。
+        self._spare = None
 
     def forward(self, x, step, valid_time):
         feeds = {"input": x}
@@ -88,6 +95,37 @@ class OnnxInferModel(BaseInferModel):
         # 回填（state = result），与官方 inference.py 的 `new_input = model.run(...)`
         # 一致。这里原样返回完整输出，不再只切末帧。
         return self.session.run([self._pred_name], feeds)[0]
+
+    # ---- GPU 常驻（IOBinding）：state 全程待在 GPU，只在落盘时搬回 CPU ----
+    # 相比 forward（每步 numpy H2D + D2H），forward_gpu 用 OrtValue 绑定输入/输出到
+    # 显存，省掉每步的 H2D/D2H 与 ORT 反复分配显存的开销。仅当模型前后处理/回填都
+    # 是恒等（如 FuXi-Ens）时启用，见 gpu_state。
+    def to_gpu(self, x):
+        return ort.OrtValue.ortvalue_from_numpy(
+            np.ascontiguousarray(x), "cuda", self.device_id)
+
+    def forward_gpu(self, state, step, valid_time):
+        # 输出 buffer 复用：上一步 run 用完的输入 state 已在 _spare 里，直接拿它当输出。
+        # 输入 state 与本步输出是不同 OrtValue（spare 是上一拍回收的另一个 buffer），
+        # run 读输入、写输出不会重叠。shape 与 _out_shape 一致（模型输入输出同形）。
+        out = self._spare if self._spare is not None else \
+            ort.OrtValue.ortvalue_from_shape_and_type(
+                self._out_shape, np.float32, "cuda", self.device_id)
+        self._spare = None
+        binding = self.session.io_binding()
+        binding.bind_ortvalue_input("input", state)
+        if valid_time is not None:
+            for k, v in _scalar_feeds(valid_time, step).items():
+                if k in self._input_names:
+                    binding.bind_cpu_input(k, v)
+        binding.bind_ortvalue_output(self._pred_name, out)
+        self.session.run_with_iobinding(binding)
+        # 输入 state 已被 run 读完，回收为下一个输出 buffer。
+        self._spare = state
+        return out
+
+    def to_numpy(self, state):
+        return state.numpy()
 
     def describe(self):
         return f"providers={self.session.get_providers()}"

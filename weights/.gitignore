@@ -1,4 +1,0 @@
-# 模型权重是大文件，一律不进 git；只保留本 .gitignore 和 README.md 占位
-*
-!README.md
-!.gitignore

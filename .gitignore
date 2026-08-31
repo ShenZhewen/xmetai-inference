@@ -9,6 +9,10 @@
 *.bin
 *.whl
 
+# ===== 模型权重目录（weights/：只提交 README 占位，二进制一律不传）=====
+weights/*
+!weights/README.md
+
 # ===== 数据文件（多为数百 MB）=====
 *.nc
 *.npy

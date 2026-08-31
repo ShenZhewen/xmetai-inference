@@ -12,18 +12,19 @@
 #
 set -euo pipefail
 
+# 仓库根目录（绝对路径）。本脚本所有路径一律写绝对，不依赖 cwd。
+ROOT="/workspace/szwCode/xmetai-inference"
+cd "$ROOT"
+
 # ---------------------------------------------------------------------------
 # 可配置参数（都能用环境变量覆盖）
 # ---------------------------------------------------------------------------
-MODEL="${MODEL:-/workspace/szwCode/xmetai-inference/fuxi_onnx/fuxi_ens.onnx}"        # ONNX 模型路径
-# 模型类由 spec 的 model.class 决定（fuxi_ens.json -> fuxi_ens_onnx）；BACKEND 是逃生舱，
-# 默认留空不传 --backend，设了才覆盖（可传模型名或引擎名 onnx/pt2）。
-BACKEND="${BACKEND:-}"
+MODEL="${MODEL:-$ROOT/weights/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx}"        # ONNX 模型路径（绝对）
 START="${START:-2025010600}"       # 起始起报时间 YYYYMMDDHH（默认一周：2025-01-06 00 时）
 END="${END:-2025011200}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-01-12 00 时）
 FREQ="${FREQ:-24}"                 # 起报间隔小时（默认每天 1 次，一周共 7 个起报）
-TIME="${TIME:-2024010200}"         # 单次起报时间 YYYYMMDDHH（未设 START 时用）
-SPEC="${SPEC:-/workspace/szwCode/xmetai-inference/specs/fuxi_ens.json}"      # 模型 spec JSON
+TIME="${TIME:-}"                   # 单次起报时间 YYYYMMDDHH（未设 START 时用）
+SPEC="${SPEC:-$ROOT/specs/fuxi_ens.json}"      # 模型 spec JSON（绝对）
 STEPS="${STEPS:-61}"               # 预报步数（61×6h ≈ 15 天）
 MEMBERS="${MEMBERS:-51}"           # 集合成员总数
 OUT="${OUT:-/workspace/szwCode/xmetai-inference/output}"             # 输出目录
@@ -68,10 +69,6 @@ if [ "$LOADER" = "zarr" ]; then
   LOADER_ARGS="$LOADER_ARGS --zarr ${ZARR:?zarr loader 需要设 ZARR（store 路径）}"
 fi
 
-# 后端逃生舱：默认不传（spec 决定模型类）；设了 BACKEND 才传
-BACKEND_ARGS=""
-[ -n "$BACKEND" ] && BACKEND_ARGS="--backend $BACKEND"
-
 # ---------------------------------------------------------------------------
 # 每个 rank 一个进程并行推理；等所有卡跑完，任一失败则退出非零
 # ---------------------------------------------------------------------------
@@ -81,11 +78,10 @@ for r in $(seq 0 $((GPUS - 1))); do
   # device 恒为 0；LOCAL_RANK 只负责把起报时间连续切块分给各卡。
   gpu=$(echo "$CUDA_DEVICES" | tr ',' '\n' | sed -n "$((r + 1))p")
   echo "启动 rank $r/$GPUS (GPU $gpu) ..."
-  # shellcheck disable=SC2086  # TIME_ARGS / LOADER_ARGS / BACKEND_ARGS 需要按空格拆分
+  # shellcheck disable=SC2086  # TIME_ARGS / LOADER_ARGS 需要按空格拆分
   CUDA_VISIBLE_DEVICES="$gpu" LOCAL_RANK=$r WORLD_SIZE=$GPUS \
-    python -u /workspace/szwCode/xmetai-inference/runner.py \
+    python -u "$ROOT/runner.py" \
       --model "$MODEL" \
-      $BACKEND_ARGS \
       $TIME_ARGS \
       --spec "$SPEC" \
       $LOADER_ARGS \

@@ -44,6 +44,7 @@ import xarray as xr
 from adapters.build_input import build_input, load_spec, grid_coords
 from loaders import create_loader
 from backends import BACKEND_REGISTRY, create_backend
+from backends.base import _fmt_dur
 from models import MODEL_REGISTRY, create_model
 
 
@@ -263,11 +264,19 @@ def main():
 
     init_times = _init_times(args, interval)
 
-    # 多卡分工：有多个起报时间就把所有起报时间连续切块分给各卡（互不重叠，
-    # 如 rank0 报 1-4 月、rank1 报 4-8 月），每卡跑全部成员；只有单个起报则按成员拆。
-    if len(init_times) > 1:
-        n = len(init_times)
-        base, rem = divmod(n, world_size)
+    # 多卡分工：把「起报时间 × 成员」的任务摊给各卡，有两种切法——
+    #   按起报切：每个 rank 跑一部分起报、全部成员；
+    #   按成员切：每个 rank 跑一部分成员、全部起报。
+    # 选单卡最大任务数更小的那一种（更均衡）。集合成员多、起报少时按成员切更均衡
+    # （如 7 起报 × 51 成员：按起报切最忙卡 102 任务 vs 按成员切 91）；确定性
+    # 1 成员、起报多时按起报切更均衡。
+    n_init = len(init_times)
+    per_rank_init = (n_init + world_size - 1) // world_size
+    per_rank_member = (members + world_size - 1) // world_size
+    cost_by_init = per_rank_init * members
+    cost_by_member = n_init * per_rank_member
+    if cost_by_init <= cost_by_member:
+        base, rem = divmod(n_init, world_size)
         start_i = local_rank * base + min(local_rank, rem)
         span = base + (1 if local_rank < rem else 0)
         init_times = init_times[start_i:start_i + span]
@@ -307,8 +316,10 @@ def main():
         print(f"[警告] 使用裸后端 {sel!r}（无模型钩子/归一化）；正规用法是 spec 写 model.class")
     print(f"[rank {local_rank}/{world_size}] 加载模型 (backend={model.backend}, device={device_id}, "
           f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}) ...")
+    t_load_model = perf_counter()
     model.load(args.model)
     print(model.describe())
+    print(f"[rank {local_rank}/{world_size}] 模型加载完成，耗时 {_fmt_dur(perf_counter() - t_load_model)}")
 
     # 输出变量选择：--vars 指定则用，否则保存全部（FuXi 走通道解析，AIFS 走 field 名）
     requested = [v for v in args.vars.split(",") if v.strip()] if args.vars else None
@@ -325,18 +336,41 @@ def main():
     lat, lon = (None, None) if is_field else grid_coords(spec)
     writer = _AsyncWriter(args.out)
 
+    def _load_state(init):
+        if is_field:
+            return build_aifs_fields(init.strftime("%Y%m%d%H"), spec=spec,
+                                     history_steps=history, hour_interval=interval,
+                                     do_interp=True)
+        return build_input(init.strftime("%Y%m%d%H"), spec=spec,
+                           history_steps=history, hour_interval=interval, loader=loader)
+
+    # 数据 prefetch：后台线程提前读下一个起报的输入，与当前起报的推理重叠，让 GPU
+    # 别在「读数据」这一步空转。输入走 zarr（era5_store）/ .nc（era），输出走
+    # netCDF4/HDF5（writer 线程），不同 IO 后端、不同文件，不共享 HDF5 句柄，故不会
+    # 触发 writer.flush() 注释里的线程安全冲突。只预取 1 个（maxsize=1）避免跑太远。
+    prefetch_q = queue.Queue(maxsize=1) if len(init_times) > 1 else None
+    if prefetch_q is not None:
+        def _prefetch_worker(init_list):
+            for it in init_list[1:]:
+                prefetch_q.put((it, _load_state(it)))
+            prefetch_q.put(None)
+        threading.Thread(target=_prefetch_worker, args=(init_times,), daemon=True).start()
+
     total_t0 = perf_counter()
     for i, init in enumerate(init_times):
         t0 = perf_counter()
-        if is_field:
-            state = build_aifs_fields(init.strftime("%Y%m%d%H"), spec=spec,
-                                      history_steps=history, hour_interval=interval,
-                                      do_interp=True)
+        t_load = perf_counter()
+        prefetched = prefetch_q is not None and i > 0
+        if prefetched:
+            _, state = prefetch_q.get()
         else:
-            state = build_input(init.strftime("%Y%m%d%H"), spec=spec,
-                                history_steps=history, hour_interval=interval, loader=loader)
-            if args.verbose:
-                _print_input_summary(state, spec)
+            state = _load_state(init)
+        if args.verbose and not is_field:
+            _print_input_summary(state, spec)
+        if prefetched:
+            print(f"[rank {local_rank}/{world_size}] {init:%m%d%H} 数据已预取就绪")
+        else:
+            print(f"[rank {local_rank}/{world_size}] {init:%m%d%H} 数据加载完成，耗时 {_fmt_dur(perf_counter() - t_load)}")
 
         def on_step(s, step_state, init=init):
             step_idx = s + 1                        # 预测步序号，1-based
@@ -369,8 +403,12 @@ def main():
         del state
         gc.collect()
         pct = (i + 1) / len(init_times) * 100
+        elapsed_init = perf_counter() - t0
+        remain = len(init_times) - (i + 1)
+        eta_total = (perf_counter() - total_t0) / (i + 1) * remain
         print(f"[rank {local_rank}/{world_size}] 起报 {i + 1}/{len(init_times)} "
-              f"({pct:3.0f}%) 完成，耗时 {perf_counter() - t0:.1f}s")
+              f"({pct:3.0f}%) 完成，耗时 {_fmt_dur(elapsed_init)}"
+              f"（剩 {remain} 个起报，总预计还要 ~{_fmt_dur(eta_total)}）")
 
     errors = writer.close()
     if errors:

@@ -14,7 +14,17 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 
-_BAR_WIDTH = 24  # 进度条宽度（字符数）
+_PROGRESS_INTERVAL = 5  # 默认进度：每隔多少步打印一条完整行（多卡时逐步 \r 会互相覆盖）
+
+
+def _fmt_dur(sec):
+    """秒 -> 人类可读时长（'45s' / '12m34s' / '1h02m'）。"""
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
 
 
 def _default_gpu_mem_limit(device_id, fraction):
@@ -109,6 +119,30 @@ class BaseInferModel(ABC):
         """
         return state
 
+    # ------------------------------------------------------------------
+    # GPU 常驻（state 全程待在 GPU，只在落盘时搬回 CPU，省每步 H2D/D2H）
+    # ------------------------------------------------------------------
+    # 子类置 gpu_state=True 并实现 to_gpu / forward_gpu / to_numpy 后，run 循环
+    # 就走 GPU 常驻分支。zero_recurrent_gpu 是回填清零的 GPU 版（默认恒等）。只有
+    # 前后处理/回填都是恒等（或已实现 GPU 版）的模型才安全启用，否则别开。
+    gpu_state = False
+
+    def to_gpu(self, x):
+        """numpy 初始 state -> GPU 载体（gpu_state=True 时实现）。"""
+        raise NotImplementedError
+
+    def forward_gpu(self, state, step, valid_time):
+        """GPU -> GPU 一步前向，返回新 state 的 GPU 载体（gpu_state=True 时实现）。"""
+        raise NotImplementedError
+
+    def to_numpy(self, state):
+        """GPU 载体 -> numpy（落盘/取预测帧用，gpu_state=True 时实现）。"""
+        raise NotImplementedError
+
+    def zero_recurrent_gpu(self, state):
+        """GPU 载体上的回填清零钩子（默认恒等）。"""
+        return state
+
     def to_dataset(self, step_state, spec, save_names=None, lat=None, lon=None):
         """一步 × 一成员的输出 → xarray Dataset（落盘前最后一步，后端无关入口）。
 
@@ -169,7 +203,12 @@ class BaseInferModel(ABC):
         streaming = on_step is not None
         outs = None if streaming else np.empty((n_my, steps, C, H, W), dtype=np.float32)
 
-        member_inputs = [base_input.copy() for _ in member_indices]
+        use_gpu = self.gpu_state
+        if use_gpu:
+            # 每个成员一份独立的 GPU state（初始都是同一份 base_input，扰动在图内随机）
+            member_inputs = [self.to_gpu(base_input) for _ in member_indices]
+        else:
+            member_inputs = [base_input.copy() for _ in member_indices]
         step_times = []
         for s in range(steps):
             t0 = perf_counter()
@@ -179,21 +218,30 @@ class BaseInferModel(ABC):
             # onnx_infer_dfens.py 都用 t*interval，这里对齐；step 标量仍用 s（0-based）。
             valid = init + pd.Timedelta(hours=s * hour_interval) if init is not None else None
             for mi in range(n_my):
-                buf = member_inputs[mi]                       # 完整状态 (1,in_frames,C,H,W)
-                state = self.forward(buf, s, valid)           # (1,in_frames,C,H,W) 完整输出
-                if state.shape[1] != in_frames:
-                    raise ValueError(
-                        f"模型输出 {state.shape[1]} 帧，与输入 {in_frames} 帧不一致，"
-                        f"无法做 state=result 回填")
-                pred = state[:, -1]                           # 末帧 = 本步预报 (1,C,H,W)
-                step_buf[mi] = pred[0]
-                if not streaming:
-                    outs[mi, s] = pred[0]
-                # state = result：把模型完整输出（含第 0 帧回显）原样回填成下一拍
-                # 输入，与官方 inference.py 的 `new_input = model.run(...)` 一致。
-                # 滚动窗口 [上一末帧, 新预测] 只在第 0 帧是直通时才等价；回显帧更忠实。
-                # 回填前先做诊断通道清零（FuXi-2.1 的辐射/降水不反馈；恒等实现则不清）。
-                member_inputs[mi] = self.zero_recurrent(state)
+                if use_gpu:
+                    # GPU 常驻：state 全程待在 GPU，forward GPU→GPU；落盘前才
+                    # to_numpy 取预测帧。zero_recurrent_gpu 是回填清零的 GPU 版（恒等）。
+                    state = self.forward_gpu(member_inputs[mi], s, valid)
+                    member_inputs[mi] = self.zero_recurrent_gpu(state)
+                    step_buf[mi] = self.to_numpy(state)[0, -1]
+                    if not streaming:
+                        outs[mi, s] = step_buf[mi]
+                else:
+                    buf = member_inputs[mi]                   # 完整状态 (1,in_frames,C,H,W)
+                    state = self.forward(buf, s, valid)       # (1,in_frames,C,H,W) 完整输出
+                    if state.shape[1] != in_frames:
+                        raise ValueError(
+                            f"模型输出 {state.shape[1]} 帧，与输入 {in_frames} 帧不一致，"
+                            f"无法做 state=result 回填")
+                    pred = state[:, -1]                       # 末帧 = 本步预报 (1,C,H,W)
+                    step_buf[mi] = pred[0]
+                    if not streaming:
+                        outs[mi, s] = pred[0]
+                    # state = result：把模型完整输出（含第 0 帧回显）原样回填成下一拍
+                    # 输入，与官方 inference.py 的 `new_input = model.run(...)` 一致。
+                    # 滚动窗口 [上一末帧, 新预测] 只在第 0 帧是直通时才等价；回显帧更忠实。
+                    # 回填前先做诊断通道清零（FuXi-2.1 的辐射/降水不反馈；恒等实现则不清）。
+                    member_inputs[mi] = self.zero_recurrent(state)
             dt = perf_counter() - t0
             step_times.append(dt)
             if log_step:
@@ -202,23 +250,23 @@ class BaseInferModel(ABC):
                 print(f"  [step {s + 1}/{steps}] {n_my} members 耗时 {dt:.3f}s "
                       f"(累计 {elapsed:.1f}s, 预计剩余 {eta:.1f}s)")
             elif progress:
-                # 默认进度条：单行刷新（\r），不刷屏。多卡时各 rank 的进度条会各自
-                # 刷新自己那一行，靠 progress_label 前缀区分。
+                # 默认进度：每隔 _PROGRESS_INTERVAL 步打一条**完整行**（带换行）。
+                # 逐步 \r 进度条在四卡并发时会互相覆盖刷屏，改成稀疏的完整行就不会乱。
+                # 行内只放关键信息：已预报几天 / 剩余几天 / 预计还要多久。
                 done = s + 1
-                ratio = done / steps
-                fill = int(_BAR_WIDTH * ratio)
-                bar = "█" * fill + "░" * (_BAR_WIDTH - fill)
-                eta = sum(step_times) / done * (steps - done)
-                label = f"{progress_label} " if progress_label else ""
-                print(f"\r{label}[{bar}] {done}/{steps} 步 ({ratio:5.1%}) "
-                      f"平均{sum(step_times)/done:4.2f}s/步 ETA {eta:6.1f}s",
-                      end="", flush=True)
+                if done == steps or done % _PROGRESS_INTERVAL == 0:
+                    avg = sum(step_times) / done
+                    eta = avg * (steps - done)
+                    fdays = done * hour_interval / 24.0
+                    tdays = steps * hour_interval / 24.0
+                    rdays = (steps - done) * hour_interval / 24.0
+                    label = f"{progress_label} " if progress_label else ""
+                    print(f"{label}预报 {fdays:.1f}/{tdays:.1f} 天 · "
+                          f"剩 {rdays:.1f} 天 · 还要 {_fmt_dur(eta)}",
+                          flush=True)
             if streaming:
                 on_step(s, self.post_process(step_buf))
 
-        if progress and not log_step:
-            # 进度条结束后补个换行，避免下一行日志接在同一行上
-            print(flush=True)
         if log_step and step_times:
             total = sum(step_times)
             print(f"  推理循环: {steps} steps x {n_my} members 合计 {total:.1f}s, "

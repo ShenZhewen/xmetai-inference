@@ -242,6 +242,18 @@ def _setup_logging(out_dir, verbose):
     log.addHandler(fh)
 
 
+_PROGRESS_INTERVAL = 5  # 评测进度：每隔多少步打一条完整行（逐步单行覆盖在多起报/日志下会堆叠）
+
+def _fmt_dur(sec):
+    """秒 -> 人类可读时长（'45s' / '12m34s' / '1h02m'）。"""
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
 def _progress_bar(frac, label, eta_s=None):
     """单行进度条（stdout，\\r 覆盖）。"""
     n = 24
@@ -258,6 +270,7 @@ def _eval_init(fcst_root, rows, init, init_dir, steps, interval, members, multi,
                vars_, loader, lat, china_mask, forecast_type):
     """评估一个起报的所有 step × 变量，逐行 append 到 rows。"""
     is_ensemble = forecast_type == "ensemble" and members > 1
+    step_times = []
     for step_idx in range(1, steps + 1):
         t0 = perf_counter()
         lead = step_idx * interval
@@ -310,10 +323,14 @@ def _eval_init(fcst_root, rows, init, init_dir, steps, interval, members, multi,
             log.debug("  %-5s lead %3dh valid %s  RMSE=%.4f MAE=%.4f CRPS=%s SSR=%s",
                       var, lead, valid.strftime("%Y%m%d%H"), rmse, mae, crps_s, ssr_s)
 
-        frac = step_idx / steps
-        eta = (perf_counter() - t0) * (steps - step_idx)
-        _progress_bar(frac, f"{init:%Y%m%d%H} step {step_idx}/{steps}", eta)
-    print()  # 换行，结束该起报的进度条
+        dt = perf_counter() - t0
+        step_times.append(dt)
+        if step_idx == steps or step_idx % _PROGRESS_INTERVAL == 0:
+            # 完整行 + 换行（逐步 \r 在日志文件/多起报下会堆叠刷屏），用平均耗时外推 ETA。
+            avg = sum(step_times) / step_idx
+            eta = avg * (steps - step_idx)
+            print(f"  {init:%Y%m%d%H} 已评 {step_idx}/{steps} 步 · 还要 {_fmt_dur(eta)}",
+                  flush=True)
 
 
 # ---------------------------------------------------------------------------
