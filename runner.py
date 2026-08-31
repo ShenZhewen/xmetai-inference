@@ -217,7 +217,6 @@ def main():
     p.add_argument("--out", default=None, help="输出目录；不写则只做输入校验")
     p.add_argument("--vars", default=None,
                    help="要保存的输出变量，逗号分隔（如 z500,u200,v200,msl,tp）；不传则保存全部通道")
-    p.add_argument("--verbose", action="store_true", help="打印详细日志（每步耗时、输入通道统计）")
     args = p.parse_args()
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -359,18 +358,11 @@ def main():
     total_t0 = perf_counter()
     for i, init in enumerate(init_times):
         t0 = perf_counter()
-        t_load = perf_counter()
         prefetched = prefetch_q is not None and i > 0
         if prefetched:
             _, state = prefetch_q.get()
         else:
             state = _load_state(init)
-        if args.verbose and not is_field:
-            _print_input_summary(state, spec)
-        if prefetched:
-            print(f"[rank {local_rank}/{world_size}] {init:%m%d%H} 数据已预取就绪")
-        else:
-            print(f"[rank {local_rank}/{world_size}] {init:%m%d%H} 数据加载完成，耗时 {_fmt_dur(perf_counter() - t_load)}")
 
         def on_step(s, step_state, init=init):
             step_idx = s + 1                        # 预测步序号，1-based
@@ -393,8 +385,8 @@ def main():
         model.run(state, steps=args.steps, members=members,
                       hour_interval=interval, init_time=init,
                       member_start=member_start, member_stride=member_stride,
-                      on_step=on_step, log_step=args.verbose,
-                      progress=True,
+                      on_step=on_step, log_step=False,
+                      progress=False,
                       progress_label=f"[rank {local_rank}/{world_size}] {init:%m%d%H}")
         # 等本起报的输出全部写完，再读下一个起报的输入——避免写线程与主线程
         # 并发访问 HDF5 触发段错误（netCDF4 非线程安全，见 onnx_infer_dfens.py 注释）
@@ -402,13 +394,10 @@ def main():
         # 释放本次起报的输入（张量或 field 字典）：多卡连续起报若不及时回收会顶爆系统内存
         del state
         gc.collect()
-        pct = (i + 1) / len(init_times) * 100
         elapsed_init = perf_counter() - t0
         remain = len(init_times) - (i + 1)
-        eta_total = (perf_counter() - total_t0) / (i + 1) * remain
-        print(f"[rank {local_rank}/{world_size}] 起报 {i + 1}/{len(init_times)} "
-              f"({pct:3.0f}%) 完成，耗时 {_fmt_dur(elapsed_init)}"
-              f"（剩 {remain} 个起报，总预计还要 ~{_fmt_dur(eta_total)}）")
+        print(f"[rank {local_rank}/{world_size}] 起报 {i + 1}/{len(init_times)} 完成"
+              f"（还剩 {remain} 个起报，本起报耗时 {_fmt_dur(elapsed_init)}）")
 
     errors = writer.close()
     if errors:

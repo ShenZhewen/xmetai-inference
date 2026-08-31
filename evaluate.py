@@ -226,14 +226,14 @@ def _parse_init_token(token):
     raise SystemExit(f"无法解析起报时间 {token!r}（应为 YYYYMMDD 或 YYYYMMDDHH）")
 
 
-def _setup_logging(out_dir, verbose):
-    """日志：控制台(stderr，INFO/--verbose 升 DEBUG) + 文件({out}/evaluate.log，全量 DEBUG)。"""
+def _setup_logging(out_dir):
+    """日志：控制台(stderr，INFO) + 文件({out}/evaluate.log，全量 DEBUG)。"""
     log.setLevel(logging.DEBUG)
     log.propagate = False
     log.handlers.clear()
     fmt = logging.Formatter("[%(asctime)s] %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
     sh = logging.StreamHandler()
-    sh.setLevel(logging.DEBUG if verbose else logging.INFO)
+    sh.setLevel(logging.INFO)
     sh.setFormatter(fmt)
     log.addHandler(sh)
     fh = logging.FileHandler(os.path.join(out_dir, "evaluate.log"), encoding="utf-8")
@@ -243,6 +243,7 @@ def _setup_logging(out_dir, verbose):
 
 
 _PROGRESS_INTERVAL = 5  # 评测进度：每隔多少步打一条完整行（逐步单行覆盖在多起报/日志下会堆叠）
+_SUMMARY_INTERVAL = 10  # 每评多少个起报打印一次累计平均（避免逐起报刷屏）
 
 def _fmt_dur(sec):
     """秒 -> 人类可读时长（'45s' / '12m34s' / '1h02m'）。"""
@@ -261,6 +262,31 @@ def _progress_bar(frac, label, eta_s=None):
     bar = "#" * filled + "-" * (n - filled)
     eta = f"  ETA {eta_s:.0f}s" if eta_s is not None else ""
     print(f"\r  {label}  [{bar}] {frac * 100:5.1f}%{eta}", end="", flush=True)
+
+
+def _print_summary(rows, vars_, forecast_type):
+    """打印当前累计的每个变量平均 RMSE/MAE（跨所有起报与 lead）。
+
+    这是给「想看整体平均」的汇总视图；逐起报×逐 lead 的明细仍在 CSV 里。
+    集合模型多打一列 CRPS（tp 降水走 BSS/AROC，无 CRPS，显示 '-'）。
+    """
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    is_ensemble = forecast_type == "ensemble"
+    hdr = f"  {'var':<6} {'RMSE':>10} {'MAE':>10}"
+    if is_ensemble:
+        hdr += f" {'CRPS':>10}"
+    print(hdr)
+    for var in vars_:
+        sub = df[df["var"] == var]
+        if sub.empty:
+            continue
+        line = f"  {var:<6} {sub['rmse'].mean():>10.4f} {sub['mae'].mean():>10.4f}"
+        if is_ensemble:
+            crps = sub["crps"].dropna()
+            line += f" {crps.mean():>10.4f}" if len(crps) else f" {'-':>10}"
+        print(line)
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +352,11 @@ def _eval_init(fcst_root, rows, init, init_dir, steps, interval, members, multi,
         dt = perf_counter() - t0
         step_times.append(dt)
         if step_idx == steps or step_idx % _PROGRESS_INTERVAL == 0:
-            # 完整行 + 换行（逐步 \r 在日志文件/多起报下会堆叠刷屏），用平均耗时外推 ETA。
+            # 逐步进度：只进 evaluate.log（避免 220 起报 × 每 5 步把控制台刷屏），用平均耗时外推 ETA。
             avg = sum(step_times) / step_idx
             eta = avg * (steps - step_idx)
-            print(f"  {init:%Y%m%d%H} 已评 {step_idx}/{steps} 步 · 还要 {_fmt_dur(eta)}",
-                  flush=True)
+            log.debug("  %s 已评 %d/%d 步 · 还要 %s", init.strftime("%Y%m%d%H"),
+                      step_idx, steps, _fmt_dur(eta))
 
 
 # ---------------------------------------------------------------------------
@@ -354,11 +380,10 @@ def main():
     p.add_argument("--loader", default="era5_store", help="实况数据源（地址在 loader 里内置）")
     p.add_argument("--spec", default="specs/fuxi_ens.json", help="模型 spec JSON")
     p.add_argument("--out", default="./eval_results", help="CSV 输出目录")
-    p.add_argument("--verbose", action="store_true", help="打印每个变量每步的明细")
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    _setup_logging(args.out, args.verbose)
+    _setup_logging(args.out)
 
     spec = load_spec(args.spec)
     forecast_type, members = _resolve_members(args, spec)
@@ -393,16 +418,14 @@ def main():
     rows = []
     t_total0 = perf_counter()
     for ii, (init, init_dir) in enumerate(inits):
-        t_i0 = perf_counter()
-        n_before = len(rows)
-        log.info("=== 起报 %s（%d/%d）===", init.strftime("%Y%m%d%H"), ii + 1, len(inits))
+        log.debug("=== 起报 %s（%d/%d）===", init.strftime("%Y%m%d%H"), ii + 1, len(inits))
         _eval_init(args.fcst, rows, init, init_dir, args.steps, interval, members, multi,
                    vars_, loader, lat, china_mask, forecast_type)
-        dt_i = perf_counter() - t_i0
-        elapsed = perf_counter() - t_total0
-        eta = elapsed / (ii + 1) * (len(inits) - ii - 1)
-        log.info("起报 %s 完成：%d 行指标，耗时 %.1fs（累计 %.1fs, ETA %.1fs）",
-                 init.strftime("%Y%m%d%H"), len(rows) - n_before, dt_i, elapsed, eta)
+        done = ii + 1
+        # 每 _SUMMARY_INTERVAL 个起报打一次累计平均（最后那个留到末尾统一出最终汇总）
+        if done % _SUMMARY_INTERVAL == 0 and done != len(inits):
+            print(f"已评 {done}/{len(inits)} 个起报 · 还剩 {len(inits) - done} 个起报", flush=True)
+            _print_summary(rows, vars_, forecast_type)
 
     df = pd.DataFrame(rows)
     csv_name = {"single": f"eval_{args.init}.csv", "list": "eval_selected.csv",
@@ -410,6 +433,10 @@ def main():
     csv_path = os.path.join(args.out, csv_name)
     df.to_csv(csv_path, index=False, float_format="%.6g")
     log.info("完成：%d 行写入 %s，总耗时 %.1fs", len(df), csv_path, perf_counter() - t_total0)
+
+    # 最终汇总：所有起报的平均 RMSE/MAE（明细在 CSV，此处只给每个变量的整体平均）
+    print(f"\n== 全部 {len(inits)} 个起报平均（{len(df)} 行）==", flush=True)
+    _print_summary(rows, vars_, forecast_type)
 
 
 if __name__ == "__main__":

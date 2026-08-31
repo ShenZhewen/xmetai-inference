@@ -400,7 +400,7 @@ def build_input(init_time, spec, history_steps=None, hour_interval=None,
 
     if nan_filled:
         detail = ", ".join(f"{var}{level or ''}:{n}" for (var, level), n in sorted(nan_filled.items()))
-        print(f"[build_input] NaN 保留未填充（与官方一致）-> {detail}")
+        log(f"[build_input] NaN 保留未填充（与官方一致）-> {detail}")
 
     result = out[np.newaxis, ...]     # (1, history_steps, N_channel, nlat, nlon)
     log(f"输出 shape: {result.shape} dtype={result.dtype}")
