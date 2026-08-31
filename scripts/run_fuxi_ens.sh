@@ -4,11 +4,11 @@
 # 支持多卡并行（默认 4 卡）：每个 rank 一个进程，按起报时间跳着分摊到各卡。
 #
 # 用法：
-#   ./run_fuxi_ens.sh                                            # 全部用默认值（4 卡）
-#   START=2024010200 END=2024010500 FREQ=6 ./run_fuxi_ens.sh     # 一段时期，间隔起报
-#   GPUS=4 MEMBERS=21 ./run_fuxi_ens.sh                          # 4 卡并行
-#   GPUS=1 ./run_fuxi_ens.sh                                     # 单卡
-#   ERA5_STORE_ROOT=/别的/路径 ./run_fuxi_ens.sh                # 临时换 era5_store 数据目录
+#   ./scripts/run_fuxi_ens.sh                                            # 全部用默认值（4 卡）
+#   START=2024010200 END=2024010500 FREQ=6 ./scripts/run_fuxi_ens.sh     # 一段时期，间隔起报
+#   GPUS=4 MEMBERS=21 ./scripts/run_fuxi_ens.sh                          # 4 卡并行
+#   GPUS=1 ./scripts/run_fuxi_ens.sh                                     # 单卡
+#   ERA5_STORE_ROOT=/别的/路径 ./scripts/run_fuxi_ens.sh                # 临时换 era5_store 数据目录
 #
 set -euo pipefail
 
@@ -23,7 +23,7 @@ START="${START:-2025010600}"       # 起始起报时间 YYYYMMDDHH（默认一�
 END="${END:-2025011200}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-01-12 00 时）
 FREQ="${FREQ:-24}"                 # 起报间隔小时（默认每天 1 次，一周共 7 个起报）
 TIME="${TIME:-2024010200}"         # 单次起报时间 YYYYMMDDHH（未设 START 时用）
-SPEC="${SPEC:-/workspace/szwCode/xmetai-inference/fuxi_ens.json}"      # 模型 spec JSON
+SPEC="${SPEC:-/workspace/szwCode/xmetai-inference/specs/fuxi_ens.json}"      # 模型 spec JSON
 STEPS="${STEPS:-61}"               # 预报步数（61×6h ≈ 15 天）
 MEMBERS="${MEMBERS:-51}"           # 集合成员总数
 OUT="${OUT:-/workspace/szwCode/xmetai-inference/output}"             # 输出目录
@@ -83,7 +83,7 @@ for r in $(seq 0 $((GPUS - 1))); do
   echo "启动 rank $r/$GPUS (GPU $gpu) ..."
   # shellcheck disable=SC2086  # TIME_ARGS / LOADER_ARGS / BACKEND_ARGS 需要按空格拆分
   CUDA_VISIBLE_DEVICES="$gpu" LOCAL_RANK=$r WORLD_SIZE=$GPUS \
-    python -u /workspace/szwCode/xmetai-inference/infer.py \
+    python -u /workspace/szwCode/xmetai-inference/runner.py \
       --model "$MODEL" \
       $BACKEND_ARGS \
       $TIME_ARGS \

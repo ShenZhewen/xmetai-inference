@@ -5,7 +5,7 @@
 换后端（ONNX / PT2 / checkpoint）只需实现 load + forward 两个方法，框架用默认
 run 循环把它们串起来；后端若自带循环（如 ckpt/anemoi 的 SimpleRunner）可整体
 覆盖 run()。模型层需要个性化处理（如 z-score 归一化、扰动）时覆盖
-normalize / denormalize / zero_recurrent 钩子即可。
+pre_process / post_process / zero_recurrent 钩子即可。
 """
 import gc
 from abc import ABC, abstractmethod
@@ -81,19 +81,21 @@ class BaseInferModel(ABC):
         """返回后端/设备描述（加载后打印用）。子类可覆盖。"""
         return self.backend
 
-    def denormalize(self, y):
-        """输出反归一化（默认恒等）。子类如 Fuxi21Pt2Model 覆盖为 ×std+mean。
+    def post_process(self, y):
+        """输出后处理（默认恒等）。子类如 Fuxi21Pt2Model 覆盖为「×std+mean + expm1」。
 
-        注意：只在输出/落盘前调用，不参与自回归回填——回填必须保持模型自身的
-        工作空间（归一化），denormalize 只把"要给别人看的预测"变回物理量。
+        与 pre_process 对称：模型工作空间 -> 物理量。只在输出/落盘前调用，不参与
+        自回归回填——回填必须保持模型自身的工作空间，post_process 只把"要给别人
+        看的预测"变回物理量。tp→mm / q→kg/kg 这类单位换算留在 to_dataset 的
+        _transform（spec 驱动、所有模型统一），不在这里做。
         """
         return y
 
-    def normalize(self, x):
-        """输入归一化（默认恒等）。子类如 Fuxi21Pt2Model 覆盖为 (x-mean)/std。
+    def pre_process(self, x):
+        """输入前处理（默认恒等）。子类如 Fuxi21Pt2Model 覆盖为 z-score（tp 先 log1p）。
 
-        与 denormalize 对称：build_input 产出物理量，模型进入工作空间前归一化一次。
-        不需要归一化的模型（如 ONNX 已融合进图）直接继承恒等实现，零成本。
+        与 post_process 对称：build_input 产出物理量，模型进入工作空间前处理一次。
+        不需要前处理的模型（如 ONNX 已融合进图）直接继承恒等实现，零成本。
         """
         return x
 
@@ -112,7 +114,7 @@ class BaseInferModel(ABC):
 
         默认实现按 onnx/pt2 通道张量语义：step_state 形状 (C,H,W)，用 spec 的
         _channels/_parse 解码变量名、套 lat/lon 坐标、挑 save_names（None=全部通道）。
-        ckpt 后端覆盖为 field dict → N320 节点 Dataset。落盘统一走这里，infer.py
+        ckpt 后端覆盖为 field dict → N320 节点 Dataset。落盘统一走这里，runner.py
         不再关心状态表示（Step 4 接入）。
         """
         import xarray as xr
@@ -155,9 +157,9 @@ class BaseInferModel(ABC):
         init = pd.to_datetime(init_time, format="%Y%m%d%H") if isinstance(init_time, str) \
             else (pd.to_datetime(init_time) if init_time is not None else None)
 
-        # 进入模型工作空间：build_input 产物理量，这里归一化一次；之后全程在该空间
-        # 自回归，输出侧再用 denormalize 变回物理量。恒等实现则等价于物理量直进直出。
-        base_input = self.normalize(base_input)
+        # 进入模型工作空间：build_input 产物理量，这里前处理一次；之后全程在该空间
+        # 自回归，输出侧再用 post_process 变回物理量。恒等实现则等价于物理量直进直出。
+        base_input = self.pre_process(base_input)
 
         in_frames = base_input.shape[1]
         member_indices = list(range(member_start, members, member_stride))
@@ -212,7 +214,7 @@ class BaseInferModel(ABC):
                       f"平均{sum(step_times)/done:4.2f}s/步 ETA {eta:6.1f}s",
                       end="", flush=True)
             if streaming:
-                on_step(s, self.denormalize(step_buf))
+                on_step(s, self.post_process(step_buf))
 
         if progress and not log_step:
             # 进度条结束后补个换行，避免下一行日志接在同一行上
@@ -226,5 +228,5 @@ class BaseInferModel(ABC):
         del member_inputs
         gc.collect()
         if not streaming:
-            outs = self.denormalize(outs)
+            outs = self.post_process(outs)
         return outs, member_indices

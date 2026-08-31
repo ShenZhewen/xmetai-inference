@@ -7,10 +7,10 @@
 编排。加新模型、新数据源只需在对应注册表登记，无需改动本文件。
 
 用法（单次起报）：
-    python infer.py --model fuxi.onnx --time 2024010200 --steps 10 --out ./output
+    python runner.py --model fuxi.onnx --time 2024010200 --steps 10 --out ./output
 
 用法（一段时期，逐个起报）：
-    python infer.py --model fuxi.onnx --start 2024010200 --end 2024010500 \
+    python runner.py --model fuxi.onnx --start 2024010200 --end 2024010500 \
         --freq 6 --steps 10 --out ./output
 
 输出目录（集合 members>1）：{out}/{起报日 yyyymmdd}/member_{成员3位}/{预测步序号3位}.nc
@@ -19,7 +19,7 @@
 不写 --out 时只做一次输入构建校验（不跑模型）。
 
 多卡（数据并行，按成员拆分）：每张卡一个进程，用环境变量选卡、拆成员：
-    LOCAL_RANK=0 WORLD_SIZE=4 python infer.py ... --members 21
+    LOCAL_RANK=0 WORLD_SIZE=4 python runner.py ... --members 21
     ...
 或者干脆用 CUDA_VISIBLE_DEVICES 隔离 + LOCAL_RANK 标 rank。ONNX Runtime 单个
 session 只用一张卡（device_id），没有跨卡并行；多卡的加速来自把集合成员 /
@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from build_input import build_input, load_spec, grid_coords
+from adapters.build_input import build_input, load_spec, grid_coords
 from loaders import create_loader
 from backends import BACKEND_REGISTRY, create_backend
 from models import MODEL_REGISTRY, create_model
@@ -198,7 +198,7 @@ def main():
     p.add_argument("--start", default=None, help="起始起报时间 YYYYMMDDHH")
     p.add_argument("--end", default=None, help="结束起报时间 YYYYMMDDHH（含，默认=--start）")
     p.add_argument("--freq", type=int, default=None, help="相邻起报间隔小时（默认=步长 interval）")
-    p.add_argument("--spec", default="fuxi_ens.json", help="模型 spec JSON 路径")
+    p.add_argument("--spec", default="specs/fuxi_ens.json", help="模型 spec JSON 路径")
     p.add_argument("--loader", default="era", choices=["era", "zarr", "era5_store"],
                    help="输入数据源：era=ERA 逐变量文件，zarr=打包好的 zarr store，"
                         "era5_store=新 ERA5 基础库（多组 zarr，根目录由 --zarr 指定）")
@@ -242,7 +242,7 @@ def main():
     # 按表示加载 spec：FuXi 走 build_input.load_spec（补 _channels/_parse/单位等），
     # AIFS 走 build_input_aifs 的 plain json.load。
     if is_field:
-        from build_input_aifs import load_spec as load_spec_aifs, build_aifs_fields
+        from adapters.build_input_aifs import load_spec as load_spec_aifs, build_aifs_fields
         spec = load_spec_aifs(args.spec)
     else:
         spec = load_spec(args.spec)

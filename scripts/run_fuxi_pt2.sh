@@ -4,12 +4,15 @@
 # 确定性模型（无集合，members=1）；默认 4 卡，多个起报时间分摊到各卡。
 #
 # 用法：
-#   ./run_fuxi_pt2.sh                                           # 全部用默认值（4 卡）
-#   START=2024010200 END=2024010500 FREQ=6 ./run_fuxi_pt2.sh    # 一段时期，间隔起报
-#   GPUS=1 ./run_fuxi_pt2.sh                                    # 单卡
-#   ERA5_STORE_ROOT=/别的/路径 ./run_fuxi_pt2.sh               # 临时换 era5_store 数据目录
+#   ./scripts/run_fuxi_pt2.sh                                           # 全部用默认值（4 卡）
+#   START=2024010200 END=2024010500 FREQ=6 ./scripts/run_fuxi_pt2.sh    # 一段时期，间隔起报
+#   GPUS=1 ./scripts/run_fuxi_pt2.sh                                    # 单卡
+#   ERA5_STORE_ROOT=/别的/路径 ./scripts/run_fuxi_pt2.sh               # 临时换 era5_store 数据目录
 #
 set -euo pipefail
+
+# 切到仓库根目录（脚本在 scripts/ 下，向上退一级），保证 ./runner.py 等相对路径一致。
+cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------------------
 # 可配置参数（都能用环境变量覆盖）
@@ -18,14 +21,14 @@ MODEL="${MODEL:-/workspace/szwCode/xmetai-inference/fuxi2.1/fuxi-2.1.pt2}"      
 # 模型类由 spec 的 model.class 决定（fuxi21.json -> fuxi21_pt2）；BACKEND 是逃生舱，
 # 默认留空不传 --backend，设了才覆盖（可传模型名或引擎名 onnx/pt2）。
 BACKEND="${BACKEND:-}"
-START="${START:-2025010600}"       # 起始起报时间 YYYYMMDDHH（默认一周：2025-01-06 00 时）
-END="${END:-2025011200}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-01-12 00 时）
-FREQ="${FREQ:-24}"                 # 起报间隔小时（默认每天 1 次，一周共 7 个起报）
+START="${START:-2025010200}"       # 起始起报时间 YYYYMMDDHH（默认 2025-01-02 00 时）
+END="${END:-2025122500}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-12-25 00 时）
+FREQ="${FREQ:-24}"                 # 起报间隔小时（默认每天 1 次，约一年 358 个起报）
 TIME="${TIME:-2024010200}"         # 单次起报时间 YYYYMMDDHH（未设 START 时用）
-SPEC="${SPEC:-/workspace/szwCode/xmetai-inference/fuxi21.json}"     # 模型 spec JSON
-STEPS="${STEPS:-61}"               # 预报步数（61×6h ≈ 15 天）
+SPEC="${SPEC:-/workspace/szwCode/xmetai-inference/specs/fuxi21.json}"     # 模型 spec JSON
+STEPS="${STEPS:-60}"               # 预报步数（60×6h = 15 天）
 MEMBERS="${MEMBERS:-1}"            # 确定性模型：1 个成员（不是集合）
-OUT="${OUT:-/workspace/szwCode/xmetai-inference/output_pt2}"        # 输出目录（确定性：{date}/{step}.nc，无 member_ 目录）
+OUT="${OUT:-/workspace/data/szw_output_pt2}"        # 输出目录（确定性：{date}/{step}.nc，无 member_ 目录）
 VARS="${VARS:-z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,d2m,msl,tp}"   # 要保存的输出变量（fuxi2.1 还可加 tcw,ssr,ssrd,fdir,ttr,tcc,lcc,mcc,hcc）
 GPU_MEM="${GPU_MEM:-0.7}"          # 显存占用比例
 GPUS="${GPUS:-4}"                  # 用几张卡并行（确定性按起报时间分摊到各卡）
@@ -82,7 +85,7 @@ for r in $(seq 0 $((GPUS - 1))); do
   echo "启动 rank $r/$GPUS (GPU $gpu) ..."
   # shellcheck disable=SC2086  # TIME_ARGS / LOADER_ARGS / BACKEND_ARGS 需要按空格拆分
   CUDA_VISIBLE_DEVICES="$gpu" LOCAL_RANK=$r WORLD_SIZE=$GPUS \
-    python -u /workspace/szwCode/xmetai-inference/infer.py \
+    python -u ./runner.py \
       --model "$MODEL" \
       $BACKEND_ARGS \
       $TIME_ARGS \

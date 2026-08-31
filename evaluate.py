@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""评测：预测 (infer.py 输出 NetCDF) vs 实况 (era5_store)，算 RMSE/MAE/CRPS/Spread/BSS/AROC。
+"""评测：预测 (runner.py 输出 NetCDF) vs 实况 (era5_store)，算 RMSE/MAE/CRPS/Spread/BSS/AROC。
 
 指标算法移植自 D:\\weather_test_bash\\ensemble_verifier.py（CRPS 排序系数法、
 Spread-Error Ratio、BSS、AROC），数据读取换成框架自己的：
-  预测 = infer.py 落盘的 {out}/{起报}/member_{成员}/step.nc
+  预测 = runner.py 落盘的 {out}/{起报}/member_{成员}/step.nc
   实况 = era5_store（与输入同一数据源，用同一 loader 读「有效时间」真值）
 
 两种模式：
@@ -20,9 +20,9 @@ Spread-Error Ratio、BSS、AROC），数据读取换成框架自己的：
 用法：
   python evaluate.py --fcst /path/output --init 2025010600 \
       --steps 61 --vars z500,u200,v200,msl,tp \
-      --loader era5_store --spec fuxi_ens.json --out ./eval_results
+      --loader era5_store --spec specs/fuxi_ens.json --out ./eval_results
   python evaluate.py --fcst /path/output --steps 61 \
-      --vars z500,u200,v200,msl,tp --spec fuxi_ens.json --out ./eval_results
+      --vars z500,u200,v200,msl,tp --spec specs/fuxi_ens.json --out ./eval_results
 """
 import argparse
 import logging
@@ -35,7 +35,7 @@ import pandas as pd
 import xarray as xr
 
 from loaders import create_loader
-from build_input import load_spec
+from adapters.build_input import load_spec
 
 PRECIP_THRESHOLDS = [0.1, 4.0, 13.0, 25.0]
 CHINA_LAT_RANGE = (15.0, 55.0)
@@ -188,7 +188,7 @@ def _resolve_members(args, spec):
 def _scan_inits(fcst_root, init_hour):
     """扫描 --fcst 下的起报目录，返回 [(init_ts, dirname), ...]（按时间排序）。
 
-    infer.py 落盘是「日期目录」YYYYMMDD（无小时），缺的起报小时用 --init-hour 补；
+    runner.py 落盘是「日期目录」YYYYMMDD（无小时），缺的起报小时用 --init-hour 补；
     若目录是 YYYYMMDDHH（带小时）则直接用自己的小时。
     """
     if not os.path.isdir(fcst_root):
@@ -210,6 +210,20 @@ def _scan_inits(fcst_root, init_hour):
         raise SystemExit(f"{fcst_root} 下没有 YYYYMMDD 或 YYYYMMDDHH 起报目录")
     found.sort(key=lambda t: t[0])
     return found
+
+
+def _parse_init_token(token):
+    """把 --inits 里的一个 token 解析成 (init_ts, dirname)。
+
+    支持两种写法：YYYYMMDD（起报小时取 0，目录就是这 8 位）和
+    YYYYMMDDHH（带小时，目录保持 10 位，与 runner.py 落盘命名一致）。
+    """
+    token = token.strip()
+    if re.fullmatch(r"\d{8}", token):
+        return pd.to_datetime(token, format="%Y%m%d"), token
+    if re.fullmatch(r"\d{10}", token):
+        return pd.to_datetime(token, format="%Y%m%d%H"), token
+    raise SystemExit(f"无法解析起报时间 {token!r}（应为 YYYYMMDD 或 YYYYMMDDHH）")
 
 
 def _setup_logging(out_dir, verbose):
@@ -308,9 +322,12 @@ def _eval_init(fcst_root, rows, init, init_dir, steps, interval, members, multi,
 def main():
     p = argparse.ArgumentParser(description="预测 vs era5_store 实况的集合检验")
     p.add_argument("--fcst", default="/workspace/szwCode/xmetai-inference/output",
-                   help="预测输出根目录（infer.py 的 --out）")
+                   help="预测输出根目录（runner.py 的 --out）")
     p.add_argument("--init", default=None,
-                   help="起报时间 YYYYMMDDHH；不写则扫描 --fcst 下所有起报目录逐个评估")
+                   help="起报时间 YYYYMMDDHH；只评这一个起报")
+    p.add_argument("--inits", default=None,
+                   help="起报时间列表，逗号/空格分隔（YYYYMMDD 或 YYYYMMDDHH）；"
+                        "只评列出的这几个起报，不扫描全部")
     p.add_argument("--init-hour", type=int, default=0,
                    help="扫描模式下，日期目录(YYYYMMDD)缺的起报小时（默认 0=00UTC）")
     p.add_argument("--steps", type=int, default=61, help="预报步数")
@@ -318,7 +335,7 @@ def main():
                    help="集合成员数（缺省读 spec 的 model.members；确定性=1）")
     p.add_argument("--vars", default="z500,u200,v200,msl,tp", help="要检验的变量，逗号分隔")
     p.add_argument("--loader", default="era5_store", help="实况数据源（地址在 loader 里内置）")
-    p.add_argument("--spec", default="fuxi_ens.json", help="模型 spec JSON")
+    p.add_argument("--spec", default="specs/fuxi_ens.json", help="模型 spec JSON")
     p.add_argument("--out", default="./eval_results", help="CSV 输出目录")
     p.add_argument("--verbose", action="store_true", help="打印每个变量每步的明细")
     args = p.parse_args()
@@ -337,6 +354,9 @@ def main():
         init = pd.to_datetime(args.init, format="%Y%m%d%H")
         inits = [(init, init.strftime("%Y%m%d"))]
         mode = "single"
+    elif args.inits:
+        inits = [_parse_init_token(t) for t in re.split(r"[,\s]+", args.inits) if t]
+        mode = "list"
     else:
         inits = _scan_inits(args.fcst, args.init_hour)
         mode = "folder"
@@ -368,7 +388,9 @@ def main():
                  init.strftime("%Y%m%d%H"), len(rows) - n_before, dt_i, elapsed, eta)
 
     df = pd.DataFrame(rows)
-    csv_path = os.path.join(args.out, f"eval_{args.init}.csv" if mode == "single" else "eval_all.csv")
+    csv_name = {"single": f"eval_{args.init}.csv", "list": "eval_selected.csv",
+                "folder": "eval_all.csv"}[mode]
+    csv_path = os.path.join(args.out, csv_name)
     df.to_csv(csv_path, index=False, float_format="%.6g")
     log.info("完成：%d 行写入 %s，总耗时 %.1fs", len(df), csv_path, perf_counter() - t_total0)
 

@@ -14,10 +14,18 @@
 分辨率对不上直接报错（不做插值）。
 """
 import json
+import os
 import re
+import sys
 
 import numpy as np
 import pandas as pd
+
+# 直接 `python adapters/build_input.py` 跑时，脚本目录是 adapters/、仓库根目录不在
+# sys.path，下面的 `from loaders.era import ...` 会 ImportError。作为脚本运行时把
+# 根目录补进 sys.path；作为包模块被 runner.py 导入时 __package__ 非空，这行跳过。
+if __package__ is None:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loaders.era import EraDataLoader
 

@@ -8,7 +8,7 @@ forward：forward 留成显式 raise（框架约定见 base.py：自带循环的
 不碰 forward）。
 
 与 onnx/pt2 后端的关键差异是**状态表示**：ckpt 用「命名 field 字典（N320 非结构化
-节点）」，onnx/pt2 用通道张量 (C,H,W)。run() 的入参/出参鸭子类型，infer.py 在统一
+节点）」，onnx/pt2 用通道张量 (C,H,W)。run() 的入参/出参鸭子类型，runner.py 在统一
 调用时按后端分派（Step 4 用 to_dataset 钩子把两者对齐到 Dataset）。
 """
 import inspect

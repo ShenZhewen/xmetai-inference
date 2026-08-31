@@ -5,13 +5,13 @@
   * backends.BACKEND_REGISTRY：引擎名 → 执行引擎类。引擎只负责 load + 跑
     （onnx/pt2 用 forward 一步，ckpt 自带循环则整体覆盖 run），不含模型语义。
   * MODEL_REGISTRY：模型名 → 具体模型类。模型继承某个引擎，按需覆盖
-    normalize/denormalize/zero_recurrent 钩子，补上「跑之前/之后」的
+    pre_process/post_process/zero_recurrent 钩子，补上「跑之前/之后」的
     模型专属处理（z-score 反归一化、诊断通道清零等）。
 
 加新模型三步：
   1) 新建 models/<name>.py，继承对应引擎（backends.onnx.OnnxInferModel /
      backends.pt2.Pt2InferModel / backends.ckpt.CkptInferModel / …），按需覆盖
-     normalize/denormalize/zero_recurrent 钩子。
+     pre_process/post_process/zero_recurrent 钩子。
   2) 在 MODEL_REGISTRY 里加一行 {模型名: 类}。
   3) 对应 spec JSON 的 model 块写 "class": "<模型名>"。
 

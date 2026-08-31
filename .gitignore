@@ -19,10 +19,6 @@
 *.h5
 *.hdf5
 
-# 保留 fuxi2.1 反归一化所需的统计量（~8KB，非大文件）
-!fuxi2.1/mean.nc
-!fuxi2.1/std.nc
-
 # ===== 运行日志 =====
 *.log
 infer_log.txt

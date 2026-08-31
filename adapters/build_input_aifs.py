@@ -34,10 +34,17 @@ AIFS 不走 build_input 的张量装配：它是「命名 field 字典 + N320 �
 import glob
 import json
 import os
+import sys
 
 import numpy as np
 import pandas as pd
 import xarray as xr
+
+# 直接 `python adapters/build_input_aifs.py` 跑时，脚本目录是 adapters/、仓库根目录
+# 不在 sys.path，下面的 `from loaders.era5_store import ...` 会 ImportError。作为脚本
+# 运行时把根目录补进 sys.path；作为包模块被 runner.py 导入时 __package__ 非空，跳过。
+if __package__ is None:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from loaders.era5_store import Era5StoreLoader
 
@@ -45,7 +52,7 @@ from loaders.era5_store import Era5StoreLoader
 # ---------------------------------------------------------------------------
 # spec 加载 + 字段映射生成
 # ---------------------------------------------------------------------------
-def load_spec(path="aifs11.json"):
+def load_spec(path="specs/aifs11.json"):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
@@ -116,7 +123,7 @@ def _check_magnitude(name, arr):
     mx = float(np.max(v))
 
     if name == "z_500":
-        # 500hPa 位势 ~54000 m²/s²（fuxi21.json 量程 43149~60311）；位势高度才 ~5500 m
+        # 500hPa 位势 ~54000 m²/s²（specs/fuxi21.json 量程 43149~60311）；位势高度才 ~5500 m
         if med < 20000:
             raise ValueError(
                 f"[单位错误] z_500 中位数 {med:.0f}，像是位势高度(m)不是位势(m²/s²)。"
@@ -155,7 +162,7 @@ def build_aifs_fields(init_time, spec=None, root=None, history_steps=None,
                       hour_interval=None, do_interp=True, verbose=True):
     """构建 AIFS 输入 state，返回 {"date": datetime, "fields": {aifs名: (2, …)}}。
 
-    init_time: 'YYYYMMDDHH' 字符串或 datetime。spec 缺省读 aifs11.json。
+    init_time: 'YYYYMMDDHH' 字符串或 datetime。spec 缺省读 specs/aifs11.json。
     do_interp=True  → 字段为 (2, N320)（喂模型）；
     do_interp=False → 字段为 (2, 721, 1440)，只做装配+量级自检，不依赖 earthkit/GPU。
     """
@@ -228,5 +235,5 @@ def _report(fields, ref_shape, do_interp):
 
 if __name__ == "__main__":
     # 只做字段映射自检（本地可跑，不碰数据、不依赖 earthkit/GPU）
-    spec = load_spec("aifs11.json")
+    spec = load_spec("specs/aifs11.json")
     self_check(spec)

@@ -3,7 +3,7 @@
 
 通用 PT2 加载 + 一步前向。这里只做后端机制（export 加载、dtype/输入名推断、跑 module），
 **不含任何模型特定归一化**——mean/std、tp 的 log1p/expm1 等全部由模型子类（如
-Fuxi21Pt2Model）通过 normalize/denormalize 钩子覆盖。
+Fuxi21Pt2Model）通过 pre_process/post_process 钩子覆盖。
 """
 import os
 

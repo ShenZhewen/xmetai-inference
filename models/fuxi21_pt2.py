@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """FuXi-2.1 PT2 模型。
 
-输入/输出都在 z-score 空间：normalize 把物理量转 z-score（tp 末通道先 log1p），
-denormalize 把预测反算回物理量（×std+mean，tp 通道 expm1）。mean.nc / std.nc
+输入/输出都在 z-score 空间：pre_process 把物理量转 z-score（tp 末通道先 log1p），
+post_process 把预测反算回物理量（×std+mean，tp 通道 expm1）。mean.nc / std.nc
 从模型同目录读取。
 """
 import os
@@ -51,7 +51,7 @@ class Fuxi21Pt2Model(Pt2InferModel):
             state[..., self._diag_indices, :, :] = 0.0
         return state
 
-    def denormalize(self, y):
+    def post_process(self, y):
         if self._mean is None or self._std is None:
             return y
         shape = [1] * (y.ndim - 3) + [self._mean.size, 1, 1]
@@ -62,7 +62,7 @@ class Fuxi21Pt2Model(Pt2InferModel):
         np.clip(ch, 0, None, out=ch)
         return out
 
-    def normalize(self, x):
+    def pre_process(self, x):
         if self._mean is None or self._std is None:
             return x
         x = np.array(x, dtype=np.float32, copy=True)

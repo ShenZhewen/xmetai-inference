@@ -5,7 +5,7 @@
   * backends/  —— 执行引擎。onnx/pt2 暴露单步 forward（循环归框架），ckpt 自带
     SimpleRunner 自回归循环则整体覆盖 run()。引擎不含归一化/反归一化/诊断清零
     等模型语义，那些由 models/ 层通过钩子覆盖。
-  * models/    —— 具体模型。继承某个引擎，按需覆盖 normalize/denormalize/
+  * models/    —— 具体模型。继承某个引擎，按需覆盖 pre_process/post_process/
     zero_recurrent 钩子。
 
 加新引擎三步：

@@ -39,7 +39,7 @@ DEFAULT_GROUPS = ("pl", "sfc", "cldrad")
 
 # 默认根目录：地址写死在这里，日常 `--loader era5_store` 一条命令就能跑；
 # 需临时换目录时用 ERA5_STORE_ROOT 环境变量覆盖，不必改代码。
-DEFAULT_ROOT = "/workspace/data/liujunjie/era5_foundation_store"
+DEFAULT_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 # ERA5 累积场：本 store 把这些场按「1h 累积」采样，但 time step 是 6h；读取时 ×6
 # 归一化成每步(6h)累积。哪些场是累积场是 ERA5 数据的固有约定，与具体模型无关；
