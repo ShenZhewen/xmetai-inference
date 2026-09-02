@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xmetai-inference"
+version = "0.1.0"
+description = "Configuration-driven weather model inference and evaluation"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "xarray",
+]
+
+[project.optional-dependencies]
+netcdf = [
+    "h5netcdf",
+    "netCDF4",
+]
+zarr = [
+    "zarr",
+]
+onnx = [
+    "onnxruntime",
+]
+pt2 = [
+    "torch",
+]
+aifs = [
+    "anemoi-inference",
+    "torch",
+]
+
+[project.scripts]
+xmetai = "xmetai.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["xmetai*"]
+
+[tool.setuptools.package-data]
+xmetai = [
+    "util/README.md",
+    "weights/README.md",
+]

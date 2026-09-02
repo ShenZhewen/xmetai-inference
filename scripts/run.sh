@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 #
-# 统一启动薄壳：setup_onnxruntime + python run.py --config <配置文件>。
-# 配置进 configs/，跑法只靠传一个配置文件；环境准备（onnxruntime 软链/LD_LIBRARY_PATH）
+# 统一启动薄壳：setup_onnxruntime + python -m xmetai infer --model <模型>。
+# 配置进包内 configs/，跑法只靠传一个配置名；环境准备（onnxruntime 软链/LD_LIBRARY_PATH）
 # 收敛到这一处，不再散在各 run_*.sh 里。
 #
 # 用法：
-#   bash scripts/run.sh configs/dzs_single.py                          # 推理（卡数由 config.gpus）
-#   bash scripts/run.sh configs/dzs_single.py --start 2025010700 --gpus 1   # 临时覆盖
-#   bash scripts/run.sh configs/dzs_eval.py                            # 评测
+#   bash scripts/run.sh fgvp                          # 推理（卡数由 config.gpus）
+#   bash scripts/run.sh fgvp --times 2025010700 --gpus 1   # 临时覆盖
 #
 # K8s Job 里：
-#   command: ["bash", "/workspace/szwCode/xmetai-inference/scripts/run.sh", "configs/dzs_single.py"]
+#   command: ["bash", "/workspace/szwCode/xmetai-inference/scripts/run.sh", "fgvp"]
 #
 set -euo pipefail
 
@@ -42,4 +41,4 @@ setup_onnxruntime() {
 }
 setup_onnxruntime
 
-exec python -u run.py --config "$@"
+exec python -u -m xmetai infer --model "$@"
