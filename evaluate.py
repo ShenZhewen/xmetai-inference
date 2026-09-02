@@ -65,11 +65,20 @@ def crps_field(ensemble, obs):
 
 
 def weighted_mean(field, lats):
-    """cos(lat) 加权平均。field (lat, lon)。"""
+    """cos(lat) 加权平均。field (lat, lon)。
+
+    只对有限值求加权平均；全 NaN（或一个有限值都没有）返回 NaN，而不是 0——
+    否则 (pred-obs) 全 NaN 时会算出 RMSE=0.0000，把「缺测/坏数据」伪装成「完美预报」。
+    """
     w = _lat_weights(lats)
     w2d = np.broadcast_to(w[:, np.newaxis], field.shape)
-    wsum = float(np.nansum(w2d))
-    return float(np.nansum(w2d * field) / wsum) if wsum > 0 else float("nan")
+    finite = np.isfinite(field)
+    if not finite.any():
+        return float("nan")
+    wsum = float(np.nansum(np.where(finite, w2d, 0.0)))
+    if wsum <= 0:
+        return float("nan")
+    return float(np.nansum(np.where(finite, w2d * field, 0.0)) / wsum)
 
 
 def spread_rmse_ratio(ensemble, obs, lats):
@@ -84,8 +93,13 @@ def spread_rmse_ratio(ensemble, obs, lats):
         spread = float(np.sqrt(sv / (wsum * (M - 1)))) if wsum > 0 else float("nan")
     else:
         spread = float("nan")
-    rv = np.nansum(w2d * (emean - obs) ** 2)
-    rmse = float(np.sqrt(rv / wsum)) if wsum > 0 else float("nan")
+    # 全 NaN 的误差场不能算出 RMSE=0（0 会被当成「完美」），与 weighted_mean 同口径返回 NaN
+    diff = (emean - obs) ** 2
+    if not np.isfinite(diff).any():
+        rmse = float("nan")
+    else:
+        rv = np.nansum(w2d * diff)
+        rmse = float(np.sqrt(rv / wsum)) if wsum > 0 else float("nan")
     ratio = spread / rmse if (M > 1 and rmse and rmse > 0 and not np.isnan(rmse)) else float("nan")
     return spread, rmse, ratio
 
@@ -188,8 +202,8 @@ def _resolve_members(args, spec):
 def _scan_inits(fcst_root, init_hour):
     """扫描 --fcst 下的起报目录，返回 [(init_ts, dirname), ...]（按时间排序）。
 
-    runner.py 落盘是「日期目录」YYYYMMDD（无小时），缺的起报小时用 --init-hour 补；
-    若目录是 YYYYMMDDHH（带小时）则直接用自己的小时。
+    runner.py 落盘是「起报目录」YYYYMMDDHH（带小时）；旧数据可能是 YYYYMMDD（无小时），
+    那种情况缺的起报小时用 --init-hour 补。
     """
     if not os.path.isdir(fcst_root):
         raise SystemExit(f"预测目录不存在：{fcst_root}")
@@ -264,28 +278,48 @@ def _progress_bar(frac, label, eta_s=None):
     print(f"\r  {label}  [{bar}] {frac * 100:5.1f}%{eta}", end="", flush=True)
 
 
-def _print_summary(rows, vars_, forecast_type):
-    """打印当前累计的每个变量平均 RMSE/MAE（跨所有起报与 lead）。
+def _summary_df(rows, vars_):
+    """把明细 rows 聚成「每变量一行」的平均指标表（跨所有起报与 lead 取平均）。
 
-    这是给「想看整体平均」的汇总视图；逐起报×逐 lead 的明细仍在 CSV 里。
-    集合模型多打一列 CRPS（tp 降水走 BSS/AROC，无 CRPS，显示 '-'）。
+    rmse/mae 全模型都有；crps/spread/ssr 仅集合模型的连续场（tp 降水不设，留 NaN）；
+    bss/aroc 仅集合模型的 tp；确定性模型这些集合列全 NaN。平均时先 dropna 再 mean，
+    所以「某些 lead 没值」的列只对有值的行平均，不会把 NaN 算进去。
     """
     if not rows:
-        return
+        return pd.DataFrame()
     df = pd.DataFrame(rows)
+    cols = ["rmse", "mae", "crps", "spread", "ssr", "bss", "aroc"]
+    recs = []
+    for var in vars_:
+        sub = df[df["var"] == var]
+        if sub.empty:
+            continue
+        rec = {"var": var}
+        for c in cols:
+            s = sub[c].dropna()
+            rec[c] = float(s.mean()) if len(s) else float("nan")
+        recs.append(rec)
+    return pd.DataFrame(recs)
+
+
+def _print_summary(rows, vars_, forecast_type):
+    """打印当前累计的每个变量平均 RMSE/MAE/CRPS（跨所有起报与 lead）。
+
+    这是给「只想看整体平均」的汇总视图；逐起报×逐 lead 的明细仍在 detail CSV 里。
+    集合模型多打一列 CRPS（tp 降水走 BSS/AROC，无 CRPS，显示 '-'）。
+    """
+    summary = _summary_df(rows, vars_)
+    if summary.empty:
+        return
     is_ensemble = forecast_type == "ensemble"
     hdr = f"  {'var':<6} {'RMSE':>10} {'MAE':>10}"
     if is_ensemble:
         hdr += f" {'CRPS':>10}"
     print(hdr)
-    for var in vars_:
-        sub = df[df["var"] == var]
-        if sub.empty:
-            continue
-        line = f"  {var:<6} {sub['rmse'].mean():>10.4f} {sub['mae'].mean():>10.4f}"
+    for _, r in summary.iterrows():
+        line = f"  {r['var']:<6} {r['rmse']:>10.4f} {r['mae']:>10.4f}"
         if is_ensemble:
-            crps = sub["crps"].dropna()
-            line += f" {crps.mean():>10.4f}" if len(crps) else f" {'-':>10}"
+            line += f" {r['crps']:>10.4f}" if np.isfinite(r["crps"]) else f" {'-':>10}"
         print(line)
 
 
@@ -314,6 +348,14 @@ def _eval_init(fcst_root, rows, init, init_dir, steps, interval, members, multi,
             obs = _apply_unit(var, obs, is_obs=True)
             pred = _read_pred(fcst_root, init_dir, step_idx, var, members, multi)
             pred = _apply_unit(var, pred, is_obs=False)
+
+            # 诊断：预测/实况一旦出现非有限值，会污染下面所有指标。显式点名是哪一边，
+            # 别让 NaN 静默地变成 RMSE=0（那是「完美预报」的假象）。
+            n_pred_bad = int((~np.isfinite(pred)).sum())
+            n_obs_bad = int((~np.isfinite(obs)).sum())
+            if n_pred_bad or n_obs_bad:
+                log.warning("  %-5s lead %3dh valid %s 预测非有限=%d 实况非有限=%d",
+                            var, lead, valid.strftime("%Y%m%d%H"), n_pred_bad, n_obs_bad)
 
             emean = pred.mean(axis=0)
             rmse = float(np.sqrt(weighted_mean((emean - obs) ** 2, lat)))
@@ -394,7 +436,7 @@ def main():
 
     if args.init is not None:
         init = pd.to_datetime(args.init, format="%Y%m%d%H")
-        inits = [(init, init.strftime("%Y%m%d"))]
+        inits = [(init, init.strftime("%Y%m%d%H"))]
         mode = "single"
     elif args.inits:
         inits = [_parse_init_token(t) for t in re.split(r"[,\s]+", args.inits) if t]
@@ -432,10 +474,16 @@ def main():
                 "folder": "eval_all.csv"}[mode]
     csv_path = os.path.join(args.out, csv_name)
     df.to_csv(csv_path, index=False, float_format="%.6g")
-    log.info("完成：%d 行写入 %s，总耗时 %.1fs", len(df), csv_path, perf_counter() - t_total0)
+    log.info("完成：%d 行明细写入 %s，总耗时 %.1fs", len(df), csv_path, perf_counter() - t_total0)
 
-    # 最终汇总：所有起报的平均 RMSE/MAE（明细在 CSV，此处只给每个变量的整体平均）
-    print(f"\n== 全部 {len(inits)} 个起报平均（{len(df)} 行）==", flush=True)
+    # 汇总 CSV：每变量一行平均（跨所有起报与 lead）——「只要平均」看这个文件就行
+    summary = _summary_df(rows, vars_)
+    summary_csv = os.path.join(args.out, "eval_summary.csv")
+    summary.to_csv(summary_csv, index=False, float_format="%.6g")
+    log.info("汇总：%d 行（每变量平均）写入 %s", len(summary), summary_csv)
+
+    # 最终汇总：控制台打印每个变量的整体平均（与 eval_summary.csv 同口径）
+    print(f"\n== 全部 {len(inits)} 个起报平均（{len(df)} 行明细 → {len(summary)} 行平均）==", flush=True)
     _print_summary(rows, vars_, forecast_type)
 
 

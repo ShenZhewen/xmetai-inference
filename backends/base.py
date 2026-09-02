@@ -51,13 +51,11 @@ def _out_name(spec, channel):
 
 
 def _transform(var, data, spec=None):
-    """tp: 模型规范单位 -> mm（clamp>=0）；q: g/kg -> kg/kg（×0.001）。"""
+    """tp: 模型规范单位 -> mm（clamp>=0）；q 保持 g/kg（官方输出即 g/kg，不再转 kg/kg）。"""
     if var == "tp":
         unit = spec["variables"]["tp"]["unit"] if spec is not None else "m"
         scale = 1000.0 if unit == "m" else 1.0
         return np.maximum(data, 0.0) * scale
-    if var == "q":
-        return data * 0.001
     return data
 
 
@@ -96,8 +94,9 @@ class BaseInferModel(ABC):
 
         与 pre_process 对称：模型工作空间 -> 物理量。只在输出/落盘前调用，不参与
         自回归回填——回填必须保持模型自身的工作空间，post_process 只把"要给别人
-        看的预测"变回物理量。tp→mm / q→kg/kg 这类单位换算留在 to_dataset 的
-        _transform（spec 驱动、所有模型统一），不在这里做。
+        看的预测"变回物理量。tp→mm 这类单位换算留在 to_dataset 的
+        _transform（spec 驱动、所有模型统一），不在这里做；q 官方输出即 g/kg，
+        不做二次换算。
         """
         return y
 

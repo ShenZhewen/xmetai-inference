@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# 统一启动薄壳：setup_onnxruntime + python run.py --config <配置文件>。
+# 配置进 configs/，跑法只靠传一个配置文件；环境准备（onnxruntime 软链/LD_LIBRARY_PATH）
+# 收敛到这一处，不再散在各 run_*.sh 里。
+#
+# 用法：
+#   bash scripts/run.sh configs/dzs_single.py                          # 推理（卡数由 config.gpus）
+#   bash scripts/run.sh configs/dzs_single.py --start 2025010700 --gpus 1   # 临时覆盖
+#   bash scripts/run.sh configs/dzs_eval.py                            # 评测
+#
+# K8s Job 里：
+#   command: ["bash", "/workspace/szwCode/xmetai-inference/scripts/run.sh", "configs/dzs_single.py"]
+#
+set -euo pipefail
+
+# 仓库根目录（绝对）。所有路径一律写绝对，不依赖 cwd。
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+# ---------------------------------------------------------------------------
+# 参考 xmetai-core 的 train.bash：自定义算子库 xmetai_onnx_plugins.so 编译时依赖
+# libonnxruntime.so.1，但 pip 装的 onnxruntime 只有版本化的 libonnxruntime.so.1.xx，
+# 没有 libonnxruntime.so.1 软链、也不在 LD_LIBRARY_PATH 上。这里补软链 + 把 capi
+# 目录加进 LD_LIBRARY_PATH，否则 register_custom_ops_library 会报
+# 「libonnxruntime.so.1: cannot open shared object file」。
+# ---------------------------------------------------------------------------
+setup_onnxruntime() {
+    local pkg_dir ort_dir ort_so ort_real_so
+    pkg_dir=$(python -c "import onnxruntime, os; print(os.path.dirname(onnxruntime.__file__))" 2>/dev/null || true)
+    [ -n "$pkg_dir" ] || { echo "[warn] 找不到 onnxruntime 包，跳过"; return 0; }
+    ort_dir="${pkg_dir}/capi"
+    ort_so="${ort_dir}/libonnxruntime.so.1"
+    ort_real_so=$(find "$ort_dir" -maxdepth 1 -type f -name 'libonnxruntime.so.1.*' -print -quit 2>/dev/null || true)
+    [ -n "$ort_real_so" ] || { echo "[warn] $ort_dir 下没有 libonnxruntime.so.1.*，跳过"; return 0; }
+    [ -e "$ort_so" ] || (cd "$ort_dir" && ln -sf "$(basename "$ort_real_so")" "$(basename "$ort_so")")
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":${ort_dir}:"*) ;;
+        *) export LD_LIBRARY_PATH="${ort_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+    esac
+    echo "已设置 ONNX Runtime 库路径: $ort_dir"
+}
+setup_onnxruntime
+
+exec python -u run.py --config "$@"

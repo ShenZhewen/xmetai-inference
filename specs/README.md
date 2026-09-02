@@ -57,7 +57,7 @@ SPEC=/path/to/specs/fuxi21.json bash scripts/run_fuxi_pt2.sh
 ## 关键约定（和官方对齐，别乱改）
 
 - `z` 规范单位 `m2 s-2`（位势，不是 gpm；`gh→z` 是 ×9.80665）；
-- `q` 规范单位 `g kg-1`（输出侧 `_transform` ×0.001 → kg/kg）；
+- `q` 规范单位 `g kg-1`（输入侧 store 的 kg/kg ×1000 换到 g/kg；输出侧保持 g/kg，与官方一致，不再转 kg/kg）；
 - `tp` 规范单位 `mm`（输入侧数据若是 `m`，build_input 按 `accepts` ×1000 换到 mm）；
 - 辐射 `ssr/ssrd/fdir/ttr` 单位 `Wh m-2`（6h 累积；era5_store 的 1h 累积 ×6 在 loader 里做）；
 - lat 北→南、lon 0→360。

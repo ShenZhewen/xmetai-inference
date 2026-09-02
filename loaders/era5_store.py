@@ -58,6 +58,17 @@ def _normalize_channel(name):
 class Era5StoreLoader:
     """从 era5_foundation_store 根目录读输入状态（模型无关，读整组通道）。"""
 
+    # 各通道「源单位 -> 模型规范单位（spec unit）」的换算系数，直接写死，不做字符串
+    # 匹配。era5_store 源单位：q=kg/kg、辐射=J/m²、tp=m；模型要 g/kg、Wh/m²、mm，
+    # 故 q×1000、辐射×1/3600、tp×1000；其余通道源单位即规范单位，默认 ×1。
+    # 1h→6h 的 ×6 是累积窗口换算，仍在 _open 里做（与这里的单位换算无关）。
+    SCALE = {
+        "q": 1000.0,
+        "ssr": 1.0 / 3600.0, "ssrd": 1.0 / 3600.0,
+        "fdir": 1.0 / 3600.0, "ttr": 1.0 / 3600.0,
+        "tp": 1000.0,
+    }
+
     def __init__(self, root=None, groups=DEFAULT_GROUPS, data_var="data", tol="12h"):
         self.root = root or os.environ.get("ERA5_STORE_ROOT", DEFAULT_ROOT)
         self.groups = list(groups)
@@ -107,8 +118,8 @@ class Era5StoreLoader:
         if not parts:
             raise ValueError(f"{self.root} 下没有可用的 era5_* store（group={self.groups}）")
         merged = xr.concat(parts, dim="channel")
-        # group 级 GRIB units 只描述该组首个通道，对多通道没有意义；清掉，让
-        # build_input 按 spec 量程做数值单位推断（否则 z 的 m2/s2 会污染 t/q/u/v…）
+        # group 级 GRIB units 只描述该组首个通道，对多通道没有意义；清掉。真正的
+        # 换算系数由本类的 SCALE 表写死，build_input 据此直接定死系数（不再做字符串查表）。
         data = merged[self.data_var].copy()
         data.attrs = {}
         # 辐射/降水是 1h 累积、time step 是 6h：×6 归一化成每步(6h)累积（见 _ACCUMULATED_1H）

@@ -2,16 +2,17 @@
 """第①步：把数据变成模型输入。
 
 你只需要提供一个「有 `load(time) -> xr.Dataset` 方法」的对象（缺省用 ERA 数据源
-`EraDataLoader`），剩下的事情这里全做了：单位推断、层级/网格适配、翻转滚动，
+`EraDataLoader`），剩下的事情这里全做了：单位换算、层级/网格适配、翻转滚动，
 最后输出模型要的 (1, 历史步数, 通道数, lat, lon) float32。
 
 **模型的通道排列、单位、物理量程全部在 spec JSON 里**（路径由调用方传入），
 不写死在代码里 —— 换一个模型就换一份 JSON，代码不用动。本文件只做"规则引擎"：
-读 JSON，拿它的规则去推断你的数据单位、对齐层级、装配成张量。
+读 JSON，拿它的规则做单位换算、对齐层级、装配成张量。
 
-不信任 `units` 属性，也不瞎猜：每个通道的数值都拿物理量程做假设检验，
-单位标错会被拦住而不是被悄悄写坏。只会自动做单位换算、纬度翻转、经度滚动；
-分辨率对不上直接报错（不做插值）。
+单位换算**不猜**：写死单位的 loader（如 era5_store）直接在 `SCALE` 表里给出每个
+通道的换算系数（q×1000、辐射×1/3600、tp×1000，其余 ×1，无 offset）；没有 `SCALE`
+的 loader（era 等，单位来自文件 attrs）才回退 spec 的 accepts 查表。都不做数值量程猜测。
+只做单位换算、纬度翻转、经度滚动；分辨率对不上直接报错（不做插值）。
 """
 import json
 import os
@@ -59,30 +60,12 @@ def _parse_name(name):
 # ---------------------------------------------------------------------------
 # 单位名称规范化（字符串层面的，和具体模型无关）
 # ---------------------------------------------------------------------------
-UNIT_ALIASES = {
-    "m2 s-2": "m2 s-2", "m2/s2": "m2 s-2", "m2s-2": "m2 s-2",
-    "gpm": "gpm", "k": "K", "kelvin": "K",
-    "degc": "degC", "c": "degC", "celsius": "degC",
-    "m s-1": "m s-1", "m/s": "m s-1", "ms-1": "m s-1",
-    "kg kg-1": "kg kg-1", "kg/kg": "kg kg-1",
-    "g kg-1": "g kg-1", "g/kg": "g kg-1",
-    "pa": "Pa", "hpa": "hPa", "mb": "hPa",
-    "j m-2": "J m-2", "j/m2": "J m-2", "w m-2": "W m-2", "w/m2": "W m-2",
-    "wh m-2": "Wh m-2", "wh/m2": "Wh m-2",
-    "m": "m", "mm": "mm",
-}
-
-
 def _normalize_unit(text):
+    """把单位字符串规范化：小写、去 **/^/_、压空白，便于静态查表时精确比较。"""
     if text is None:
         return None
     s = str(text).strip().lower().replace("**", "").replace("^", "").replace("_", " ")
     return re.sub(r"\s+", " ", s)
-
-
-def _declared_unit(raw):
-    key = _normalize_unit(raw)
-    return UNIT_ALIASES.get(key) if key else None
 
 
 # ---------------------------------------------------------------------------
@@ -117,80 +100,28 @@ def load_spec(path):
     return spec
 
 
-def _expand_range(lo, hi, margin=0.25):
-    span = abs(hi - lo)
-    pad = max(span * margin, 1e-12)
-    return lo - pad, hi + pad
-
-
-def _range_for(spec, var, level):
-    """取 spec 里声明的该变量量程（规范单位下），返回 (lo, hi) 或 None。"""
-    r = spec["variables"][var]["range"]
-    if isinstance(r, dict) and "per_level" in r:
-        b = r["per_level"].get(str(level))
-        return None if b is None else _expand_range(b[0], b[1])
-    return _expand_range(r[0], r[1])
-
-
 # ---------------------------------------------------------------------------
-# 单位推断
+# 单位换算（静态查表，不做数值猜测）
 # ---------------------------------------------------------------------------
-def infer_unit(spec, var, level, values, raw_units=None):
-    """用数值推断通道的真实单位，返回 (status, unit, scale, offset)。"""
-    vspec = spec["variables"][var]
-    canonical = vspec["unit"]
-    # 候选单位 = 规范单位本身 + 它 accepts 的单位
-    options = [(canonical, 1.0, 0.0)]
-    for u, d in vspec.get("accepts", {}).items():
-        options.append((u, d.get("scale", 1.0), d.get("offset", 0.0)))
+def _resolve_conversion(spec, var, source_unit):
+    """源单位 → 模型单位的换算系数，查 spec 的 unit/accepts 声明，返回 (scale, offset)。
 
-    bounds = _range_for(spec, var, level)
-    vals = np.asarray(values, dtype=np.float64)
-    finite = np.isfinite(vals)
-    if not finite.any():
-        return "NO_DATA", None, None, None
-    good = vals[finite]
-    vmin, vmax = float(good.min()), float(good.max())
-    if bounds is None:
-        return "NO_REFERENCE", _declared_unit(raw_units), None, None
-    if vmin == vmax:
-        # 常数场（如干日 tp=0）：数值本身无法区分单位，回退用文件声明的单位。
-        declared = _declared_unit(raw_units)
-        for u, s, o in options:
-            if u == declared:
-                status = "OK" if (s == 1.0 and o == 0.0) else "CONVERT"
-                return status, u, s, o
-        return "CONSTANT", None, None, None
-
-    lo, hi = bounds
-    magnitude = max(abs(lo), abs(hi))
-    two_sided = vspec.get("signed", False)
-    matches = []
-    for unit, scale, offset in options:
-        cmin, cmax = vmin * scale + offset, vmax * scale + offset
-        contained = cmin >= lo and cmax <= hi
-        big_enough = two_sided or max(abs(cmin), abs(cmax)) >= 0.05 * magnitude
-        if contained and big_enough:
-            matches.append((unit, scale, offset))
-
-    if len(matches) == 1:
-        unit, scale, offset = matches[0]
-        status = "OK" if (scale == 1.0 and offset == 0.0) else "CONVERT"
-    elif len(matches) > 1:
-        status, unit, scale, offset = "AMBIGUOUS", None, None, None
-    else:
-        status, unit, scale, offset = "OUT_OF_RANGE", None, None, None
-
-    declared = _declared_unit(raw_units)
-    if declared and unit and declared != unit:
-        status = "CONFLICT"
-    elif declared and status in ("AMBIGUOUS", "OUT_OF_RANGE"):
-        for u, s, o in options:
-            if u == declared:
-                unit, scale, offset = u, s, o
-                status = "OK" if (s == 1.0 and o == 0.0) else "CONVERT"
-                break
-    return status, unit, scale, offset
+    source_unit 为 None 或等于 spec 的 unit（规范单位）时，直接 (1.0, 0.0)；
+    否则必须命中 accepts 里声明的某个源单位，否则报错（说明数据源单位或 spec 有误）。
+    单位名只做字符串规范化（_normalize_unit），不做任何数值量程猜测。
+    """
+    v = spec["variables"][var]
+    target = v["unit"]
+    su = _normalize_unit(source_unit)
+    if su is None or su == _normalize_unit(target):
+        return 1.0, 0.0
+    for au, d in v.get("accepts", {}).items():
+        if _normalize_unit(au) == su:
+            return d.get("scale", 1.0), d.get("offset", 0.0)
+    raise ValueError(
+        f"通道 {var} 源单位 {source_unit!r} 既不是规范单位 {target!r}，"
+        f"也不在 accepts {list(v.get('accepts', {}))} 里；"
+        f"请检查 loader 的 SCALE 表或数据 attrs 单位、spec 的 accepts 声明")
 
 
 # EraDataLoader 已移到 loaders/era.py（见本文件顶部 import）。
@@ -341,28 +272,31 @@ def build_input(init_time, spec, history_steps=None, hour_interval=None,
     flip, roll = _geometry(datasets[-1], nlat, nlon)
     log(f"网格: lat 翻转={'是' if flip else '否'}, lon 滚动={roll}")
 
-    # 用最后一个时刻的 Dataset 推断每个通道的单位换算
+    # 每个通道的换算系数：loader 写死 SCALE（era5_store）或回退 accepts 查表（era），
+    # 不做数值猜测。数据源可能带 spec 用不到的通道（era5_store 的 w/10hPa/土壤/波浪），
+    # 只对 spec 声明的通道换算，其余字段直接跳过。
     last_fields, units = _inventory(datasets[-1])
     log(f"字段数: {len(last_fields)} (spec 需要 {spec['_n_channels']})")
-    # 数据源可能带 spec 用不到的通道（如 era5_store 里的 w/10hPa/土壤/波浪）；
-    # 只对 spec 声明的通道做单位推断，其余字段直接跳过，避免 infer_unit 查无此变量。
     needed = set(spec["_parse"].values())
+    # 换算系数：era5_store 等「已写死单位」的 loader 直接用它的 SCALE 表（源→模型单位，
+    # 无 offset）；没有 SCALE 的 loader（era 等，单位来自文件 attrs）回退 accepts 查表。
+    scale_map = getattr(loader, "SCALE", None)
     conversion = {}
     n_ok = n_convert = 0
-    for (var, level), arr in sorted(last_fields.items()):
+    for (var, level) in sorted(last_fields):
         if (var, level) not in needed:
             continue
-        status, unit, scale, offset = infer_unit(spec, var, level, arr, units.get((var, level)))
-        if status not in ("OK", "CONVERT"):
-            raise ValueError(f"通道 {var}{level or ''} 单位无法确定（{status}），请检查数据")
-        s, o = (scale if scale is not None else 1.0), (offset if offset is not None else 0.0)
+        if scale_map is not None:
+            s, o = scale_map.get(var, 1.0), 0.0
+        else:
+            s, o = _resolve_conversion(spec, var, units.get((var, level)))
         conversion[(var, level)] = (s, o)
-        if status == "CONVERT":
+        if s != 1.0 or o != 0.0:
             n_convert += 1
-            log(f"  换算 {var}{level or '':<4}: {units.get((var,level))} -> {unit} (×{s} +{o})")
+            log(f"  换算 {var}{level or '':<4}: ×{s}" + (f" +{o}" if o else ""))
         else:
             n_ok += 1
-    log(f"单位推断: {n_ok} 个原样通过, {n_convert} 个需要换算")
+    log(f"单位换算: {n_ok} 个原样通过, {n_convert} 个需要换算")
 
     # 换算系数已拿到，units 这张元信息表不再需要，先释放再装配输出。
     # last_fields 还要在装配时复用（最后一帧不再重复 _inventory）。

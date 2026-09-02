@@ -20,14 +20,14 @@ cd "$ROOT"
 # 可配置参数（都能用环境变量覆盖）
 # ---------------------------------------------------------------------------
 MODEL="${MODEL:-$ROOT/weights/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx}"        # ONNX 模型路径（绝对）
-START="${START:-2025010600}"       # 起始起报时间 YYYYMMDDHH（默认一周：2025-01-06 00 时）
-END="${END:-2025011200}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-01-12 00 时）
+START="${START:-2025071800}"       # 起始起报时间 YYYYMMDDHH（默认一周：2025-01-06 00 时）
+END="${END:-2025092800}"           # 结束起报时间 YYYYMMDDHH（含，默认 2025-01-12 00 时）
 FREQ="${FREQ:-24}"                 # 起报间隔小时（默认每天 1 次，一周共 7 个起报）
 TIME="${TIME:-}"                   # 单次起报时间 YYYYMMDDHH（未设 START 时用）
 SPEC="${SPEC:-$ROOT/specs/fuxi_ens.json}"      # 模型 spec JSON（绝对）
-STEPS="${STEPS:-61}"               # 预报步数（61×6h ≈ 15 天）
+STEPS="${STEPS:-60}"               # 预报步数（61×6h ≈ 15 天）
 MEMBERS="${MEMBERS:-51}"           # 集合成员总数
-OUT="${OUT:-/workspace/szwCode/xmetai-inference/output}"             # 输出目录
+OUT="${OUT:-/workspace/data/shenzw/fuxi_ens_output}"             # 输出目录
 VARS="${VARS:-z500,u200,v200,msl,tp}"   # 要保存的输出变量（逗号分隔）
 GPU_MEM="${GPU_MEM:-0.7}"          # 显存占用比例
 GPUS="${GPUS:-4}"                  # 用几张卡并行（1=单卡）

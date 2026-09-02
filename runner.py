@@ -13,8 +13,8 @@
     python runner.py --model fuxi.onnx --start 2024010200 --end 2024010500 \
         --freq 6 --steps 10 --out ./output
 
-输出目录（集合 members>1）：{out}/{起报日 yyyymmdd}/member_{成员3位}/{预测步序号3位}.nc
-输出目录（确定性 members=1）：{out}/{起报日 yyyymmdd}/{预测步序号3位}.nc
+输出目录（集合 members>1）：{out}/{起报 yyyymmddhh}/member_{成员3位}/{预测步序号3位}.nc
+输出目录（确定性 members=1）：{out}/{起报 yyyymmddhh}/{预测步序号3位}.nc
 
 不写 --out 时只做一次输入构建校验（不跑模型）。
 
@@ -34,6 +34,7 @@ import importlib
 import json
 import os
 import queue
+import re
 import threading
 from time import perf_counter
 
@@ -163,7 +164,13 @@ def _print_input_summary(x, spec):
 
 
 def _init_times(args, interval):
-    """把 --start/--end/--freq（或 --time）展开成起报时间列表。"""
+    """把 --inits（列表）/ --start/--end/--freq（区间）/ --time（单次）展开成起报时间列表。"""
+    if args.inits is not None:
+        toks = [t for t in re.split(r"[,\s]+", args.inits) if t]
+        if not toks:
+            raise SystemExit("--inits 为空")
+        return [pd.to_datetime(t, format="%Y%m%d" if len(t) == 8 else "%Y%m%d%H")
+                for t in toks]
     freq = args.freq if args.freq is not None else interval
     if freq <= 0:
         raise SystemExit("--freq 必须 > 0")
@@ -180,7 +187,7 @@ def _init_times(args, interval):
         return times
     if args.time is not None:
         return [pd.to_datetime(args.time, format="%Y%m%d%H")]
-    raise SystemExit("必须提供 --time 或 --start")
+    raise SystemExit("必须提供 --time / --start / --inits 之一")
 
 
 def _create_loader(args, spec):
@@ -199,6 +206,9 @@ def main():
     p.add_argument("--start", default=None, help="起始起报时间 YYYYMMDDHH")
     p.add_argument("--end", default=None, help="结束起报时间 YYYYMMDDHH（含，默认=--start）")
     p.add_argument("--freq", type=int, default=None, help="相邻起报间隔小时（默认=步长 interval）")
+    p.add_argument("--inits", default=None,
+                   help="起报时间列表，逗号/空格分隔（YYYYMMDD 或 YYYYMMDDHH）；"
+                        "只跑这几个起报，与 --time/--start 互斥")
     p.add_argument("--spec", default="specs/fuxi_ens.json", help="模型 spec JSON 路径")
     p.add_argument("--loader", default="era", choices=["era", "zarr", "era5_store"],
                    help="输入数据源：era=ERA 逐变量文件，zarr=打包好的 zarr store，"
@@ -375,11 +385,11 @@ def main():
                 for m_local, m_id in enumerate(member_indices):
                     ds = model.to_dataset(step_state[m_local], spec,
                                           save_names=save_names, lat=lat, lon=lon)
-                    # 确定性（单成员）不套 member_xxx 目录，直接 {起报日}/{step}.nc
+                    # 确定性（单成员）不套 member_xxx 目录，直接 {起报时间}/{step}.nc
                     if multi_member:
-                        fname = f"{init:%Y%m%d}/member_{m_id:03d}/{step_idx:03d}.nc"
+                        fname = f"{init:%Y%m%d%H}/member_{m_id:03d}/{step_idx:03d}.nc"
                     else:
-                        fname = f"{init:%Y%m%d}/{step_idx:03d}.nc"
+                        fname = f"{init:%Y%m%d%H}/{step_idx:03d}.nc"
                     writer.put(fname, ds, raw=(step_state, s, init))
 
         model.run(state, steps=args.steps, members=members,
@@ -396,8 +406,10 @@ def main():
         gc.collect()
         elapsed_init = perf_counter() - t0
         remain = len(init_times) - (i + 1)
+        avg_init = (perf_counter() - total_t0) / (i + 1)   # 累计均值，避免首起报波动
         print(f"[rank {local_rank}/{world_size}] 起报 {i + 1}/{len(init_times)} 完成"
-              f"（还剩 {remain} 个起报，本起报耗时 {_fmt_dur(elapsed_init)}）")
+              f"（还剩 {remain} 个起报，本起报 {_fmt_dur(elapsed_init)}，"
+              f"预计还需 {_fmt_dur(avg_init * remain)}）")
 
     errors = writer.close()
     if errors:

@@ -22,12 +22,14 @@
 from .fuxi_ens_onnx import FuxiEnsOnnxModel
 from .fuxi21_pt2 import Fuxi21Pt2Model
 from .aifs11_ckpt import Aifs11CkptModel
+from .iwc_fgvp_gdn2 import IwcFgvpGdn2Model
 
 # 模型层：名字 → 具体模型类（继承某引擎 + 覆盖钩子）
 MODEL_REGISTRY = {
     "fuxi_ens_onnx": FuxiEnsOnnxModel,   # backend="onnx"
     "fuxi21_pt2": Fuxi21Pt2Model,        # backend="pt2"
     "aifs11_ckpt": Aifs11CkptModel,      # backend="ckpt"
+    "iwc_fgvp_gdn2_onnx": IwcFgvpGdn2Model,  # backend="onnx"（自定义算子 GatedDeltaNet）
 }
 
 

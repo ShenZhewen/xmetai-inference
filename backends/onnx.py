@@ -25,6 +25,9 @@ class OnnxInferModel(BaseInferModel):
     """ONNX Runtime 后端（CUDAExecutionProvider）。"""
     backend = "onnx"
     use_cpu_initializers = True
+    # 自定义算子库路径（.so）。某些模型（如 GatedDeltaNet 骨干）用了非标准算子，
+    # 必须在建 session 前注册对应 plugin；None = 标准模型无需注册。子类覆盖此属性。
+    ops_library = None
 
     def load(self, path):
         """加载 ONNX 会话，绑定到 self.device_id 这张卡，并做显存/性能调优。"""
@@ -76,6 +79,12 @@ class OnnxInferModel(BaseInferModel):
         if "CUDAExecutionProvider" in ort.get_available_providers():
             providers.append(("CUDAExecutionProvider", cuda_opts))
         providers.append(("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}))
+        # 自定义算子：注册 .so 后才能建 session（否则报「is not a registered function/op」）。
+        # .so 必须与当前 onnxruntime 版本 ABI 匹配，跨环境（尤其容器）运行要先确认。
+        if self.ops_library:
+            if not os.path.exists(self.ops_library):
+                raise FileNotFoundError(f"自定义算子库不存在：{self.ops_library}")
+            options.register_custom_ops_library(self.ops_library)
         self.session = ort.InferenceSession(path, sess_options=options, providers=providers)
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape

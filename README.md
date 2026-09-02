@@ -83,9 +83,9 @@ loader        build_input     model.run     to_dataset
 | `pre_process` | 模型 | 物理量 → 模型工作空间；FuXi-2.1 做 z-score（tp 先 log1p），FuXi-Ens / AIFS 恒等直通 |
 | `forward` 自回归 | `run()` 主循环 | `state = result` 回填；回填前 `zero_recurrent` 清零诊断通道（辐射/降水不反馈） |
 | `post_process` | 模型 | 工作空间 → 物理量；FuXi-2.1 做反 z-score（tp expm1） |
-| `to_dataset` / `_transform` | 保存层 | 物理量 → 用户单位 + 落盘；tp→mm、q g/kg→kg/kg 等统一在此处理 |
+| `to_dataset` / `_transform` | 保存层 | 物理量 → 用户单位 + 落盘；tp→mm 统一在此处理（q 保持 g/kg） |
 
-> 边界：`pre_process` / `post_process` 是模型自己的变换（z-score 等）；单位换算（tp→mm、q→kg/kg）是 spec 驱动的数据适配，统一留在 `to_dataset` 的 `_transform`，不在模型里重复实现。
+> 边界：`pre_process` / `post_process` 是模型自己的变换（z-score 等）；单位换算（tp→mm）是 spec 驱动的数据适配，统一留在 `to_dataset` 的 `_transform`，不在模型里重复实现；q 官方输出即 g/kg，不做二次换算。
 
 ## 快速开始
 

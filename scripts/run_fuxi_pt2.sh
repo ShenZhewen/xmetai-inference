@@ -24,13 +24,13 @@ cd "$ROOT"
 # ---------------------------------------------------------------------------
 MODEL="${MODEL:-$ROOT/weights/fuxi2.1/fuxi-2.1.pt2}"       # PT2 模型路径（绝对；mean.nc/std.nc 同目录）
 START="${START:-2025010300}"       # 起始起报时间 YYYYMMDDHH（2025 全年，跳过年初 1/1、1/2 两天）
-END="${END:-2025122900}"           # 结束起报时间 YYYYMMDDHH（含；跳过年末 12/30、12/31 两天）
+END="${END:-2025022600}"           # 结束起报时间 YYYYMMDDHH（含；跳过年末 12/30、12/31 两天）
 FREQ="${FREQ:-24}"                 # 连续起报间隔小时（每天 1 次）
 TIME="${TIME:-}"                   # 单次起报时间 YYYYMMDDHH（未设 START 时用；默认走 START/END 全年）
 SPEC="${SPEC:-$ROOT/specs/fuxi21.json}"     # 模型 spec JSON（绝对）
 STEPS="${STEPS:-60}"               # 预报步数（60×6h=15 天）
 MEMBERS="${MEMBERS:-1}"            # 确定性模型：1 个成员（不是集合）
-OUT="${OUT:-/workspace/data/szw_output_pt2_test}"   # 输出目录（确定性：{date}/{step}.nc）
+OUT="${OUT:-//workspace/data/shenzw/fuxi_single_output}"   # 输出目录（确定性：{date}/{step}.nc）
 VARS="${VARS:-z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,d2m,msl,tp}"   # 输出变量（fuxi2.1 还可加 tcw,ssr,ssrd,fdir,ttr,tcc,lcc,mcc,hcc）
 GPU_MEM="${GPU_MEM:-0.7}"          # 显存占用比例
 GPUS="${GPUS:-4}"                  # 用几张卡并行（确定性按起报时间分摊到各卡）
