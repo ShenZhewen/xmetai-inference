@@ -7,9 +7,9 @@ xmetai.models 包，数据源拆到 xmetai.loaders 包；本文件负责
 读取配置、启动多卡 worker，并完成输出选择、异步写盘和主流程编排。
 
 用法：
-    xmetai infer --model fuxi_ens --data era5_store
-    xmetai infer --model fgvp --data era5_store --times 2025010700..2025020500:24
-    python -m xmetai infer --model fgvp --out /tmp/output --gpus 1
+    xmetai-infer --model fuxi_ens --data era5_store
+    xmetai-infer --model fgvp --data era5_store --times 2025010700..2025020500:24
+    python -m xmetai --model fgvp --out /tmp/output --gpus 1
 
 输出目录（集合 members>1）：{out}/{起报目录}/member_{成员3位}/{预测步序号3位}.nc
 输出目录（确定性 members=1）：{out}/{起报目录}/{预测步序号3位}.nc
@@ -25,7 +25,6 @@ CUDA_VISIBLE_DEVICES 隔离单卡。ONNX Runtime 单个 session 只使用一张�
 import argparse
 import gc
 import importlib
-import json
 import logging
 import os
 import queue
@@ -40,7 +39,7 @@ import pandas as pd
 import xarray as xr
 
 from xmetai.configs.base import load_config, parse_times
-from xmetai.util.logging_util import configure_logging
+from xmetai.logging_util import configure_logging
 
 
 # 推理后端和具体模型在 worker 启动后按需导入，配置帮助不依赖可选模型运行环境。
@@ -217,28 +216,16 @@ def _init_times(args, interval):
     raise SystemExit("必须提供 --time / --start / --inits 之一")
 
 
-def _create_loader(args, model_cls):
-    """按 --loader 选择输入数据源。era 需要 model_cls（从 input_channels 推导变量/层级）。"""
+def _create_loader(args, model_cls, loader_spec):
+    """从内置名称或外部 config 提供的类/工厂构造 Loader。"""
     from xmetai.loaders import create_loader
 
     return create_loader(
-        args.loader,
+        loader_spec,
         model_cls=model_cls,
         path=args.zarr,
         groups=getattr(model_cls, "loader_groups", None),
     )
-
-
-def _parse_processors(raw):
-    """解析逗号名称列表或 JSON 结构化 Processor 配置。"""
-    if not raw:
-        return None
-    if raw.lstrip().startswith("["):
-        value = json.loads(raw)
-        if not isinstance(value, list):
-            raise ValueError("Processor JSON 必须是列表")
-        return value
-    return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def _pick(overrides, key, default):
@@ -248,27 +235,20 @@ def _pick(overrides, key, default):
 
 
 def _build_infer_argv(cfg, overrides):
-    """将 InferConfig 转为内部 worker 参数。"""
+    """将运行范围覆盖转为 worker 参数；组件由 worker 重新加载 config 获得。"""
+    model_path = _pick(overrides, "model_path", cfg.model_path)
     argv = [
-        "--model", cfg.model_path_abs(),
-        "--model-class", cfg.model_class,
-        "--loader", cfg.loader,
+        "--config-source", cfg._source_path,
+        "--model", cfg.model_path_abs(model_path),
     ]
-
-    def add_processors(option, value):
-        if value is None:
-            return
-        if not isinstance(value, str):
-            value = json.dumps(value, ensure_ascii=True)
-        argv.extend([option, value])
-
-    add_processors("--pre-processors", cfg.pre_processors)
-    add_processors("--recurrent-processors", cfg.recurrent_processors)
-    add_processors("--output-processors", cfg.output_processors)
-    if cfg.data_root:
-        argv += ["--zarr", cfg.data_root]
+    loader_override = overrides.get("data")
+    if loader_override is not None:
+        argv += ["--loader-override", loader_override]
+    data_root = _pick(overrides, "data_root", cfg.data_root)
+    if data_root:
+        argv += ["--zarr", cfg.data_root_abs(data_root)]
     argv += ["--gpu-mem", str(cfg.gpu_mem)]
-    argv += ["--log-level", str(cfg.log_level)]
+    argv += ["--log-level", str(_pick(overrides, "log_level", cfg.log_level))]
 
     inits = parse_times(_pick(overrides, "times", cfg.times))
     if not inits:
@@ -304,7 +284,7 @@ def _run_infer(cfg, overrides):
 
     env = dict(os.environ)
     if cfg.ops_library:
-        env["XMETAI_OPS_LIBRARY"] = cfg.ops_library
+        env["XMETAI_OPS_LIBRARY"] = cfg.ops_library_abs()
 
     command = [
         sys.executable,
@@ -367,7 +347,12 @@ def _run_infer(cfg, overrides):
 def _config_main(argv=None):
     parser = argparse.ArgumentParser(
         description="统一推理入口：读取内置配置名或外部配置文件并执行推理")
-    source = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "config_path",
+        nargs="?",
+        help="外部 config.py；等价于 --config config.py",
+    )
+    source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--model",
         help="注册模型配方名，如 fuxi21、fuxi_ens、fgvp、aifs11",
@@ -384,8 +369,7 @@ def _config_main(argv=None):
     parser.add_argument(
         "--data",
         default=None,
-        choices=["era", "zarr", "zarr_normalized", "era5_store"],
-        help="覆盖模型配方中的数据 Loader",
+        help="覆盖 config 中的内置 Loader 名称",
     )
     parser.add_argument(
         "--data-root",
@@ -410,53 +394,51 @@ def _config_main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    recipe = args.config or args.model
+    selected = [
+        value for value in (args.config_path, args.config, args.model)
+        if value is not None
+    ]
+    if len(selected) != 1:
+        parser.error(
+            "必须且只能指定一个 config.py、--config 或 --model")
+    recipe = selected[0]
     cfg = load_config(recipe)
-    if args.model_path is not None:
-        cfg.model_path = args.model_path
-    if args.data is not None:
-        cfg.loader = args.data
-    if args.data_root is not None:
-        cfg.data_root = args.data_root
-    if args.log_level is not None:
-        cfg.log_level = args.log_level
-    configure_logging(level=cfg.log_level)
+    log_level = args.log_level or cfg.log_level
+    configure_logging(level=log_level)
     overrides = {
         key: getattr(args, key)
         for key in (
             "times", "members", "steps", "vars",
-            "out", "gpus", "cuda_devices",
+            "out", "gpus", "cuda_devices", "model_path",
+            "data", "data_root", "log_level",
         )
     }
     log.info(
         "加载推理配方 %s：model=%s loader=%s",
         cfg.name,
-        cfg.model_path,
-        cfg.loader,
+        args.model_path or cfg.model_path,
+        args.data or getattr(cfg.loader, "__name__", cfg.loader),
     )
     return _run_infer(cfg, overrides)
 
 
 def _worker_main(argv=None):
     from xmetai.backends import _fmt_dur
-    from xmetai.models import (
-        MODEL_REGISTRY,
-        create_model,
-        get_model_class,
-        grid_coords,
-    )
+    from xmetai.models import create_model, get_model_class, grid_coords
     from xmetai.processing.pipeline import build_model_input, build_pipeline
 
     p = argparse.ArgumentParser(description="气象模型自回归推理（后端可插拔）")
+    p.add_argument(
+        "--config-source",
+        required=True,
+        help="主进程解析后的 config 文件绝对路径",
+    )
     p.add_argument("--model", required=True, help="模型文件路径（.onnx/.pt2/.ckpt）")
-    p.add_argument("--model-class", required=True,
-                   help="模型类名（models/MODEL_REGISTRY 的键）")
-    p.add_argument("--pre-processors", default=None,
-                   help="输入处理器：逗号名称列表或 JSON 列表；缺省使用通用三件套")
-    p.add_argument("--recurrent-processors", default=None,
-                   help="自回归回填处理器 JSON 列表；缺省为空")
-    p.add_argument("--output-processors", default=None,
-                   help="输出处理器 JSON 列表；缺省为空")
+    p.add_argument(
+        "--loader-override",
+        default=None,
+        help="可选：覆盖 config 中的内置 Loader 名称",
+    )
     p.add_argument("--time", default=None, help="单次起报时间 YYYYMMDDHH（与 --start/--end 二选一）")
     p.add_argument("--start", default=None, help="起始起报时间 YYYYMMDDHH")
     p.add_argument("--end", default=None, help="结束起报时间 YYYYMMDDHH（含，默认=--start）")
@@ -464,11 +446,6 @@ def _worker_main(argv=None):
     p.add_argument("--inits", default=None,
                    help="起报时间列表，逗号/空格分隔（YYYYMMDD 或 YYYYMMDDHH）；"
                         "只跑这几个起报，与 --time/--start 互斥")
-    p.add_argument("--loader", required=True,
-                   choices=["era", "zarr", "zarr_normalized", "era5_store"],
-                   help="输入数据源：era=ERA 逐变量文件，zarr=打包好的 zarr store，"
-                        "zarr_normalized=带 mean.npy/std.npy 的标准化 Zarr，"
-                        "era5_store=新 ERA5 基础库（多组 zarr，根目录由 --zarr 指定）")
     p.add_argument("--zarr", default=None,
                    help="可选：覆盖数据源默认地址（--loader zarr 必传单 store 路径；"
                         "--loader era/era5_store 不传则用各自 loader 内置默认地址）")
@@ -502,12 +479,17 @@ def _worker_main(argv=None):
     # 单进程想指定别的卡仍可用 --device 覆盖。
     device_id = args.device if args.device is not None else 0
 
-    # 模型类声明输入/输出状态表示；不再根据 backend 推断 adapter。
-    sel = args.model_class
+    # 每个 worker 重新加载同一 config，确保外部 Model/Loader 在多进程中可用。
+    worker_cfg = load_config(args.config_source)
+    model_spec = worker_cfg.model_class
     try:
-        cls = get_model_class(sel)
-    except ValueError:
-        raise SystemExit(f"未知模型类 {sel!r}（可选 {', '.join(MODEL_REGISTRY)}）")
+        cls = get_model_class(model_spec)
+    except (TypeError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    model_name = (
+        model_spec if isinstance(model_spec, str) else
+        f"{model_spec.__module__}.{model_spec.__name__}"
+    )
     state_representation = getattr(cls, "state_representation", "tensor")
     uses_field_state = state_representation == "field_dict"
 
@@ -522,14 +504,15 @@ def _worker_main(argv=None):
     elif forecast_type == "ensemble" and members <= 1:
         log.warning("模型类 %s 声明集合，但 members=%d；集合成员数应大于 1",
                     cls.__name__, members)
-    loader = _create_loader(args, cls)
+    loader_spec = args.loader_override or worker_cfg.loader
+    loader = _create_loader(args, cls, loader_spec)
     processors = build_pipeline(
-        _parse_processors(args.pre_processors),
+        worker_cfg.pre_processors,
         cls,
         loader,
         model_path=args.model,
-        recurrent_specs=_parse_processors(args.recurrent_processors),
-        output_specs=_parse_processors(args.output_processors),
+        recurrent_specs=worker_cfg.recurrent_processors,
+        output_specs=worker_cfg.output_processors,
     )
 
     init_times = _init_times(args, interval)
@@ -585,9 +568,14 @@ def _worker_main(argv=None):
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    model = create_model(sel, device_id=device_id, gpu_mem_fraction=args.gpu_mem)
+    model = create_model(
+        model_spec,
+        device_id=device_id,
+        gpu_mem_fraction=args.gpu_mem,
+    )
     log.info("加载模型：class=%s backend=%s device=%d CUDA_VISIBLE_DEVICES=%s path=%s",
-             sel, model.backend, device_id, os.environ.get("CUDA_VISIBLE_DEVICES"), args.model)
+             model_name, model.backend, device_id,
+             os.environ.get("CUDA_VISIBLE_DEVICES"), args.model)
     t_load_model = perf_counter()
     model.load(args.model)
     log.info("模型加载完成：%s，耗时 %s",

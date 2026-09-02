@@ -4,9 +4,10 @@ __version__ = "0.1.0"
 
 
 def infer(
-    model,
+    model=None,
     data=None,
     *,
+    config=None,
     model_path=None,
     data_root=None,
     times=None,
@@ -24,6 +25,7 @@ def infer(
     return _infer(
         model,
         data,
+        config=config,
         model_path=model_path,
         data_root=data_root,
         times=times,

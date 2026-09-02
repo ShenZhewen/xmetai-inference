@@ -89,7 +89,14 @@ MODEL_REGISTRY = {
 
 
 def get_model_class(model_name):
-    """按模型名导入并返回具体模型类。"""
+    """按注册名解析内置模型，或验证外部 config 直接提供的模型类。"""
+    if not isinstance(model_name, str):
+        from xmetai.backends import BaseInferModel
+
+        if not isinstance(model_name, type) or not issubclass(model_name, BaseInferModel):
+            raise TypeError(
+                "model_class 必须是内置模型注册名或 BaseInferModel 子类")
+        return model_name
     target = MODEL_REGISTRY.get(model_name)
     if target is None:
         raise ValueError(f"未知模型 {model_name!r}（可选 {', '.join(MODEL_REGISTRY)}）")

@@ -9,11 +9,11 @@ import sys
 
 import pandas as pd
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from xmetai.util.eval_common import (
+from util.eval_common import (
     add_common_arguments,
     available_steps,
     build_context,

@@ -14,7 +14,7 @@ import pandas as pd
 import xarray as xr
 
 from xmetai.loaders import create_loader
-from xmetai.util.logging_util import configure_logging
+from xmetai.logging_util import configure_logging
 
 
 log = logging.getLogger(__name__)

@@ -1,7 +1,7 @@
 # util
 
-`util` 提供推理日志配置以及独立的确定性、集合预报评测工具。评测工具不依赖推理
-config，只需要指定实况 Loader 和预测结果目录。
+`util` 是源码仓库附带的内部评测工具，不属于公开的 `xmetai-inference` 推理包，
+不会进入 PyPI wheel，也不会安装命令行入口。下载源码后可直接通过 Python 使用。
 
 请在项目根目录运行下面的命令：
 
@@ -19,7 +19,6 @@ pip install -e ".[netcdf,zarr]"
 | `eval_single_util.py` | 确定性预报评测 |
 | `eval_ens_util.py` | 集合预报评测 |
 | `eval_common.py` | 两种评测共用的数据发现、读取、网格对齐、指标和 CSV 汇总 |
-| `logging_util.py` | 推理和评测共用的日志配置，不需要单独运行 |
 
 ## 预测目录格式
 
@@ -58,7 +57,7 @@ pip install -e ".[netcdf,zarr]"
 评测预测目录中自动发现的全部起报、步骤和变量：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_single_output_new
 ```
@@ -66,7 +65,7 @@ xmetai eval-single \
 只评测指定的多个起报日期：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_single_output_new \
   --inits 20250102,20250105,20250108
@@ -75,7 +74,7 @@ xmetai eval-single \
 只评测前 10 步和部分变量：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_single_output_new \
   --steps 10 \
@@ -93,7 +92,7 @@ xmetai eval-single \
 自动发现全部共同成员：
 
 ```bash
-xmetai eval-ens \
+python util/eval_ens_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_ens_output
 ```
@@ -101,7 +100,7 @@ xmetai eval-ens \
 只使用前 20 个成员，并选择多个起报日期：
 
 ```bash
-xmetai eval-ens \
+python util/eval_ens_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_ens_output \
   --members 20 \
@@ -136,7 +135,7 @@ xmetai eval-ens \
 普通 Zarr 示例：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader zarr \
   --data-root /workspace/data/example.zarr \
   --forecast /workspace/data/shenzw/fuxi_single_output_new
@@ -163,7 +162,7 @@ xmetai eval-single \
 例如预测结果为逐 3 小时输出时：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader era5_store \
   --forecast /workspace/data/example_output \
   --interval 3
@@ -208,7 +207,7 @@ eval_ens.log
 可以使用 `--out` 指定其他输出目录：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_single_output_new \
   --out /workspace/data/shenzw/evaluation/fuxi21
@@ -225,13 +224,6 @@ xmetai eval-single \
 6. 查看完整命令参数可运行：
 
 ```bash
-xmetai eval-single --help
-xmetai eval-ens --help
-```
-
-未安装 CLI 时，也可以从项目根目录使用模块形式：
-
-```bash
-python -m xmetai eval-single --help
-python -m xmetai eval-ens --help
+python util/eval_single_util.py --help
+python util/eval_ens_util.py --help
 ```

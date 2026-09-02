@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
 #
-# 统一启动薄壳：setup_onnxruntime + python -m xmetai infer --model <模型>。
+# 统一启动薄壳：setup_onnxruntime + python -m xmetai.inference。
 # 配置进包内 configs/，跑法只靠传一个配置名；环境准备（onnxruntime 软链/LD_LIBRARY_PATH）
 # 收敛到这一处，不再散在各 run_*.sh 里。
 #
 # 用法：
-#   bash scripts/run.sh fgvp                          # 推理（卡数由 config.gpus）
+#   bash scripts/run.sh fgvp                          # 内置模型
+#   bash scripts/run.sh /workspace/my_project/config.py     # 外部模型和 Loader
 #   bash scripts/run.sh fgvp --times 2025010700 --gpus 1   # 临时覆盖
 #
 # K8s Job 里：
 #   command: ["bash", "/workspace/szwCode/xmetai-inference/scripts/run.sh", "fgvp"]
 #
 set -euo pipefail
+
+CALLER_DIR="$PWD"
+TARGET="${1:?用法: bash scripts/run.sh <模型名|config.py> [覆盖参数]}"
+shift
+
+# 外部 config 的相对路径按调用脚本时的工作目录解析，而不是按仓库根解析。
+if [[ "$TARGET" == *.py && "$TARGET" != /* ]]; then
+    TARGET="${CALLER_DIR}/${TARGET}"
+fi
 
 # 仓库根目录（绝对）。所有路径一律写绝对，不依赖 cwd。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,4 +51,8 @@ setup_onnxruntime() {
 }
 setup_onnxruntime
 
-exec python -u -m xmetai infer --model "$@"
+if [[ "$TARGET" == *.py || -f "$TARGET" ]]; then
+    exec python -u -m xmetai.inference "$TARGET" "$@"
+fi
+
+exec python -u -m xmetai.inference --model "$TARGET" "$@"

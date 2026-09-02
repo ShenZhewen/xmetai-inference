@@ -52,9 +52,10 @@
 │   ├── backends/             # ONNX / PT2 / checkpoint 执行引擎
 │   ├── models/               # 具体模型及按需加载注册表
 │   ├── configs/              # 内置完整运行配方
-│   ├── util/                 # 日志与独立评测工具
+│   ├── logging_util.py       # 推理日志配置
 │   └── weights/README.md     # 模型权重与部署产物说明
-├── scripts/             # bash 推理启动与缺失任务补跑脚本
+├── util/                # 源码附带的内部评测工具，不进入 PyPI wheel
+├── scripts/             # Bash 推理启动脚本
 └── model_artifacts/     # 本地模型产物，整个目录不上传 Git
 ```
 
@@ -108,10 +109,10 @@ pip install -e ".[netcdf,zarr,aifs]"  # AIFS
 安装后不需要修改或调用 Bash 脚本，直接选择模型和数据源：
 
 ```bash
-xmetai infer --model fuxi_ens --data era5_store
-xmetai infer --model fuxi21 --data era5_store
-xmetai infer --model fgvp --data era5_store
-xmetai infer --model aifs11 --data era5_store
+xmetai-infer --model fuxi_ens --data era5_store
+xmetai-infer --model fuxi21 --data era5_store
+xmetai-infer --model fgvp --data era5_store
+xmetai-infer --model aifs11 --data era5_store
 ```
 
 起报时间、步数、成员数、GPU 和输出目录都在对应配置文件中声明。
@@ -119,11 +120,11 @@ xmetai infer --model aifs11 --data era5_store
 
 ### 任意路径 / 本地运行
 
-安装后使用统一的 `xmetai` 命令。`--model` 选择注册模型配方，`--data` 选择 Loader，
+安装后使用 `xmetai-infer` 命令。`--model` 选择注册模型配方，`--data` 选择 Loader，
 其他参数只覆盖本次任务：
 
 ```bash
-xmetai infer --model fuxi_ens --data era5_store \
+xmetai-infer --model fuxi_ens --data era5_store \
   --times 2025010600 --steps 10 --members 21 --gpus 1 --out ./output
 ```
 
@@ -132,6 +133,172 @@ xmetai infer --model fuxi_ens --data era5_store \
 - `--data-root` 可以替换 Loader 的默认数据地址。
 - `era5_store` 的数据根目录可用环境变量 `ERA5_STORE_ROOT` 覆盖。
 - 复杂场景仍可使用 `--config /path/to/custom.py` 加载外部配方。
+
+### 扩展自己的模型和数据集
+
+用户只安装主框架，在自己的项目中编写 Model、Loader 和 config 即可，不需要修改
+`xmetai` 源码，也不需要把扩展代码发布到 PyPI。
+
+#### 1. 安装主框架
+
+正式安装：
+
+```bash
+pip install xmetai-inference
+```
+
+从源码开发时：
+
+```bash
+pip install -e .
+```
+
+#### 2. 创建扩展项目
+
+```text
+my_forecast_project/
+├── config.py
+├── weights/
+│   └── my_model.pt2
+├── models/
+│   ├── __init__.py
+│   └── my_model.py
+└── loaders/
+    ├── __init__.py
+    └── my_loader.py
+```
+
+用户的模型代码、Loader、权重和数据都保存在自己的项目中，不需要复制到 Python 的
+`site-packages` 或 `xmetai` 安装目录。
+
+#### 3. 编写 Model
+
+Model 负责声明输入输出通道、网格、历史窗口和时间步长，并继承合适的 Backend。PT2、
+ONNX 和 CKPT 模型分别继承 `Pt2InferModel`、`OnnxInferModel` 和
+`CkptInferModel`；其他执行方式可以继承 `BaseInferModel` 并实现 `load()` 和
+`forward()`。
+
+```python
+# models/my_model.py
+from xmetai.backends.pt2 import Pt2InferModel
+
+
+class MyModel(Pt2InferModel):
+    input_channels = ("t2m", "u10m", "v10m")
+    output_channels = input_channels
+    grid = {
+        "lat": {"start": 90.0, "step": -0.25, "size": 721},
+        "lon": {"start": 0.0, "step": 0.25, "size": 1440},
+    }
+    history_steps = 2
+    hour_interval = 6
+    members = 1
+    forecast_type = "deterministic"
+    input_assembler = "tensor"
+```
+
+#### 4. 编写 Loader
+
+Loader 负责读取用户自己的数据集，并转换成统一 State。必须实现
+`load_state(time, channels=None)`；Loader 类或工厂函数可以按需接收 `path`、
+`model_cls` 和 `groups` 关键字参数。
+
+```python
+# loaders/my_loader.py
+import numpy as np
+
+
+class MyLoader:
+    def __init__(self, path=None, model_cls=None, groups=None):
+        self.path = path
+
+    def load_state(self, time, channels=None):
+        # 实际项目中从 self.path 读取对应时刻和通道。
+        return {
+            "date": time,
+            "fields": {
+                "t2m": np.zeros((721, 1440), dtype=np.float32),
+                "u10m": np.zeros((721, 1440), dtype=np.float32),
+                "v10m": np.zeros((721, 1440), dtype=np.float32),
+            },
+            "latitudes": np.linspace(90.0, -90.0, 721),
+            "longitudes": np.arange(1440) * 0.25,
+        }
+```
+
+`fields` 中每个值是二维 `(lat, lon)` 数组。Loader 返回的字段名、单位和网格必须满足
+Model 及其 Processor 的输入契约。
+
+#### 5. 编写 config
+
+config 直接引用用户自己的 Model 和 Loader，并完整声明三阶段 Processor。相对路径
+按照 `config.py` 所在目录解析。
+
+```python
+# config.py
+from xmetai.configs import InferConfig
+from loaders.my_loader import MyLoader
+from models.my_model import MyModel
+
+
+cfg = InferConfig(
+    name="my_model",
+    model_path="./weights/my_model.pt2",
+    model_class=MyModel,
+    loader=MyLoader,
+    data_root="./data",
+    pre_processors=[],
+    recurrent_processors=[],
+    output_processors=[],
+    times="2025010200",
+    steps=60,
+    members=1,
+    gpus=1,
+    output_dir="./output",
+)
+```
+
+#### 6. 启动推理
+
+进入扩展项目，然后把 config 交给安装好的命令：
+
+```bash
+cd /workspace/my_forecast_project
+xmetai-infer config.py
+```
+
+也可以从任意目录传绝对路径：
+
+```bash
+xmetai-infer /workspace/my_forecast_project/config.py
+```
+
+命令行参数可以临时覆盖 config：
+
+```bash
+xmetai-infer config.py \
+  --times 2025010300 \
+  --steps 10 \
+  --gpus 4 \
+  --out ./other_output
+```
+
+没有安装主框架、直接从 `xmetai-inference` 源码根目录运行时：
+
+```bash
+python -m xmetai /workspace/my_forecast_project/config.py
+```
+
+喜欢使用 Bash 部署脚本时：
+
+```bash
+bash /workspace/szwCode/xmetai-inference/scripts/run.sh \
+  /workspace/my_forecast_project/config.py
+```
+
+多卡模式会让每个 worker 重新加载同一份 `config.py`，因此外部 Model、Loader 以及
+config 导入的自定义 Processor 在各进程中都能正常创建。Python config 会执行代码，
+只应运行可信来源的配置文件。
 
 ### Python API
 
@@ -149,6 +316,16 @@ xmetai.infer(
 )
 ```
 
+外部 config 也可以通过 Python API 启动：
+
+```python
+xmetai.infer(
+    config="/workspace/my_forecast_project/config.py",
+    times="2025010200",
+    steps=10,
+)
+```
+
 使用外部权重或数据目录时：
 
 ```python
@@ -163,7 +340,7 @@ xmetai.infer(
 
 ## 配置参考
 
-### `xmetai infer` 参数
+### `xmetai-infer` 参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
@@ -184,7 +361,7 @@ xmetai.infer(
 ### 临时覆盖配置
 
 ```bash
-xmetai infer --model fuxi_ens --data era5_store \
+xmetai-infer --model fuxi_ens --data era5_store \
   --times 2025010600..2025011200:24 \
   --steps 60 --members 51 --gpus 4 --cuda-devices 0,1,2,3
 ```
@@ -195,40 +372,22 @@ xmetai infer --model fuxi_ens --data era5_store \
 分到不同卡。推理入口为每个 rank 启动独立进程，并通过 `CUDA_VISIBLE_DEVICES`
 隔离物理 GPU。
 
-## 结果评测工具
+## 源码评测工具
 
-评测不依赖推理 config，只需指定实况 Loader 和预测输出地址。`era5_store` 使用
-Loader 内置默认地址；工具会自动扫描起报目录、已有步数、变量以及集合成员。当前
-支持带 `lat/lon` 坐标的规则经纬网格输出。
-
-确定性预报：
+本项目定位为推理库，PyPI 包只安装 `xmetai-infer`，不会安装或暴露评测命令。
+仓库根目录的 `util/` 是开发者内部工具，只有下载源码后才能使用：
 
 ```bash
-xmetai eval-single \
+python util/eval_single_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_single_output_new
-```
 
-输出纬度加权 `RMSE`、`MAE` 和 `Bias`。
-
-集合预报：
-
-```bash
-xmetai eval-ens \
+python util/eval_ens_util.py \
   --loader era5_store \
   --forecast /workspace/data/shenzw/fuxi_ens_output
 ```
 
-所有变量都输出集合平均的 `RMSE`、`MAE` 和 `Bias`。连续变量额外输出 `CRPS`、
-`Spread` 和 `SSR`；降水 `tp` 在中国区域按 0.1/4/13/25 mm 阈值输出 `BSS` 和
-`AROC`。默认评测目录中已经存在的全部结果；可用 `--inits`、`--steps`、`--vars`
-和 `--out` 过滤范围，集合工具还支持 `--members`。
-
-两种工具都会输出三份 CSV：
-
-- `*_detail.csv`：每个起报日、每个 step、每个变量的明细；
-- `*_by_lead.csv`：同一变量、同一 step 在所有起报日之间的平均；
-- `*_summary.csv`：同一变量跨全部起报日和全部 step 的整体平均。
+详细参数、目录格式和输出说明见 `util/README.md`。这些文件不会进入发布 wheel。
 
 ## 模型契约与单位
 

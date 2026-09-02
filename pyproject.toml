@@ -34,13 +34,12 @@ aifs = [
 ]
 
 [project.scripts]
-xmetai = "xmetai.cli:main"
+xmetai-infer = "xmetai.inference:main"
 
 [tool.setuptools.packages.find]
 include = ["xmetai*"]
 
 [tool.setuptools.package-data]
 xmetai = [
-    "util/README.md",
     "weights/README.md",
 ]

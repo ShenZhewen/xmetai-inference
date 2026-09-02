@@ -1,6 +1,6 @@
-"""Run the CLI with ``python -m xmetai``."""
+"""Run inference with ``python -m xmetai``."""
 
-from .cli import main
+from .inference import main
 
 
 if __name__ == "__main__":

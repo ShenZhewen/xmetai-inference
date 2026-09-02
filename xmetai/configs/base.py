@@ -19,7 +19,8 @@
 import importlib.util
 import os
 import re
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -28,13 +29,6 @@ from typing import Any
 # 或在配置中通过模型对应的环境变量指定绝对权重路径。
 ROOT = os.environ.get("XMETAI_INFERENCE_ROOT") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", ".."))
-
-
-def _abs(p):
-    """相对路径 -> 相对 ROOT 的绝对路径；空串 / 已是绝对路径则原样返回。"""
-    if not p:
-        return p
-    return p if os.path.isabs(p) else os.path.join(ROOT, p)
 
 
 def _parse_dt(token):
@@ -88,13 +82,15 @@ class InferConfig:
     """一次推理的完整运行配方（由 inference.py 加载并执行）。"""
     name: str
     model_path: str                          # 模型文件路径（.onnx/.pt2/.ckpt）
-    model_class: str = "fuxi_ens_onnx"       # 模型类名（models/MODEL_REGISTRY 的键）
+    # 内置模型可写注册名；外部 config 可直接传 BaseInferModel 子类。
+    model_class: Any = "fuxi_ens_onnx"
     # 三个阶段共同构成完整处理配方；可写名称列表或 [{"name": "...", ...}]。
     pre_processors: Any = None
     recurrent_processors: Any = None
     output_processors: Any = None
     ops_library: str = ""                    # 自定义算子库 .so（空 = 不注册，标准模型）
-    loader: str = "era5_store"               # 输入数据源 era/zarr/era5_store
+    # 内置 Loader 可写注册名；外部 config 可传 Loader 类、工厂函数或实例。
+    loader: Any = "era5_store"
     data_root: str = ""                      # 可选覆盖数据源根目录（对应 --zarr）
     times: str = ""                          # 起报时间（统一格式，见 parse_times）
     steps: int = 60                          # 预报步数
@@ -107,20 +103,35 @@ class InferConfig:
     output_dir: str = ""                     # 输出目录（空 = 只做输入校验，不跑模型）
     # 仅文档 / K8s Job 用：标明该配置应在哪个镜像里跑（自定义算子 .so 是 ABI 绑定）
     image: str = "registry.bingosoft.net/pytorch/pytorch:2.11.0-cuda12.8-mamba3-20260403"
+    _source_path: str = field(init=False, repr=False, default="")
 
-    def model_path_abs(self):
-        return _abs(self.model_path)
+    def resolve_path(self, value):
+        """相对外部 config 所在目录解析本地路径；URL 和绝对路径保持不变。"""
+        if not value or os.path.isabs(value) or "://" in value:
+            return value
+        base = os.path.dirname(self._source_path) if self._source_path else ROOT
+        return os.path.abspath(os.path.join(base, value))
+
+    def model_path_abs(self, value=None):
+        return self.resolve_path(self.model_path if value is None else value)
+
+    def data_root_abs(self, value=None):
+        return self.resolve_path(self.data_root if value is None else value)
+
+    def ops_library_abs(self):
+        return self.resolve_path(self.ops_library)
 
 
 def _resolve_config_path(value):
     """解析外部配置路径或包内配置名。"""
+    value = os.fspath(value)
     direct = os.path.abspath(value)
     if os.path.isfile(direct):
         return direct
 
     name = value
     if name.startswith("configs/") or name.startswith("configs\\"):
-        name = os.path.basename(name)
+        name = name.replace("\\", "/").rsplit("/", 1)[-1]
     if os.path.sep not in name and (os.path.altsep is None or os.path.altsep not in name):
         if not name.endswith(".py"):
             name += ".py"
@@ -135,8 +146,14 @@ def load_config(path):
     path = _resolve_config_path(path)
     if not os.path.isfile(path):
         raise SystemExit(f"配置文件不存在：{path}")
-    spec = importlib.util.spec_from_file_location("_xmetai_run_config", path)
+    config_dir = os.path.dirname(path)
+    if config_dir not in sys.path:
+        # 保留在 sys.path 中：config 导入的本地模型可能在后续按需加载其他同目录模块。
+        sys.path.insert(0, config_dir)
+    module_name = f"_xmetai_run_config_{abs(hash(path))}"
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     cfg = getattr(module, "cfg", None)
     if cfg is None:
@@ -156,4 +173,5 @@ def load_config(path):
     if missing:
         raise SystemExit(
             f"配置文件 {path} 没有完整声明 Processor：{', '.join(missing)}")
+    cfg._source_path = path
     return cfg
