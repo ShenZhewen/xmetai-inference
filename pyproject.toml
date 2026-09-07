@@ -9,6 +9,7 @@ description = "Configuration-driven weather model inference and evaluation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "xmetai-core>=0.1.0",
     "numpy",
     "pandas",
     "xarray",
@@ -34,12 +35,12 @@ aifs = [
 ]
 
 [project.scripts]
-xmetai-infer = "xmetai.inference:main"
+xmetai-infer = "xmetai_inference.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["xmetai*"]
+include = ["xmetai_inference*"]
 
 [tool.setuptools.package-data]
-xmetai = [
+"xmetai_inference" = [
     "weights/README.md",
 ]

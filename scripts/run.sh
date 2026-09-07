@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 #
-# 统一启动薄壳：setup_onnxruntime + python -m xmetai.inference。
-# 配置进包内 configs/，跑法只靠传一个配置名；环境准备（onnxruntime 软链/LD_LIBRARY_PATH）
-# 收敛到这一处，不再散在各 run_*.sh 里。
+# 统一启动薄壳：setup_onnxruntime + python -m xmetai_inference。
+#
+# 注：backends/onnx.py 里已有 _preload_onnxruntime_lib()（用 ctypes RTLD_GLOBAL 预加载
+# libonnxruntime.so.1），所以直接 python -m xmetai_inference 通常也能跑 fgvp。
+# 本脚本保留作兜底：万一某环境 dlopen 的 SONAME 匹配不奏效，这里改的是
+# LD_LIBRARY_PATH（进程启动前生效，更硬）。
 #
 # 用法：
-#   bash scripts/run.sh fgvp                          # 内置模型
-#   bash scripts/run.sh /workspace/my_project/config.py     # 外部模型和 Loader
-#   bash scripts/run.sh fgvp --times 2025010700 --gpus 1   # 临时覆盖
+#   bash scripts/run.sh fgvp                            # 内置模型配方
+#   bash scripts/run.sh fuxi21 --steps 8 --out /tmp/x   # 临时覆盖
+#   bash scripts/run.sh /workspace/my/config.py         # 外部 config
 #
 # K8s Job 里：
-#   command: ["bash", "/workspace/szwCode/xmetai-inference/scripts/run.sh", "fgvp"]
+#   command: ["bash", "/workspace/szwCode/xmetai-inference2/scripts/run.sh", "fgvp"]
 #
 set -euo pipefail
 
@@ -23,16 +26,17 @@ if [[ "$TARGET" == *.py && "$TARGET" != /* ]]; then
     TARGET="${CALLER_DIR}/${TARGET}"
 fi
 
-# 仓库根目录（绝对）。所有路径一律写绝对，不依赖 cwd。
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # ---------------------------------------------------------------------------
-# 参考 xmetai-core 的 train.bash：自定义算子库 xmetai_onnx_plugins.so 编译时依赖
-# libonnxruntime.so.1，但 pip 装的 onnxruntime 只有版本化的 libonnxruntime.so.1.xx，
-# 没有 libonnxruntime.so.1 软链、也不在 LD_LIBRARY_PATH 上。这里补软链 + 把 capi
-# 目录加进 LD_LIBRARY_PATH，否则 register_custom_ops_library 会报
-# 「libonnxruntime.so.1: cannot open shared object file」。
+# 自定义算子库 xmetai_onnx_plugins.so 编译时链接 SONAME libonnxruntime.so.1，但 pip
+# 装的 onnxruntime 在 capi/ 下只有版本化文件（如 libonnxruntime.so.1.24.4），既没有
+# libonnxruntime.so.1 软链、该目录也不在 LD_LIBRARY_PATH 上。于是
+# register_custom_ops_library 报「libonnxruntime.so.1: cannot open shared object file」。
+#
+# 必须 export：多卡时 cli.py fork 子进程用 dict(os.environ) 继承环境，
+# 只在命令前临时赋值传不下去。
 # ---------------------------------------------------------------------------
 setup_onnxruntime() {
     local pkg_dir ort_dir ort_so ort_real_so
@@ -51,8 +55,9 @@ setup_onnxruntime() {
 }
 setup_onnxruntime
 
+# 外部 config 走位置参数，内置配方走 --model（见 cli.py 的 _config_main）。
 if [[ "$TARGET" == *.py || -f "$TARGET" ]]; then
-    exec python -u -m xmetai.inference "$TARGET" "$@"
+    exec python -u -m xmetai_inference "$TARGET" "$@"
 fi
 
-exec python -u -m xmetai.inference --model "$TARGET" "$@"
+exec python -u -m xmetai_inference --model "$TARGET" "$@"

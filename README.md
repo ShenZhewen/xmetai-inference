@@ -31,7 +31,7 @@
 
 ## 核心特性
 
-- **数据源可插拔**：每个 loader 只实现 `load(time) -> xr.Dataset`，支持 `era`（逐变量 .nc）、`zarr`（通用 store）、`era5_store`（ERA5 基础库多组 zarr）。
+- **数据源可插拔**：每个 loader 实现 `load_state(time, channels=None)`，支持 `era`（逐变量 .nc）、`zarr`（通用 store）、`era5_store`（ERA5 基础库多组 zarr）和 `netcdf_input`（单个预标准化输入文件）。
 - **后端可插拔**：`onnx` / `pt2` / `ckpt` 三种执行引擎与模型语义分离，引擎只负责加载和跑。
 - **模型契约驱动**：通道、网格、历史窗口和状态表示由模型类声明。
 - **完整运行配方**：config 同时声明 loader、`pre_processors`、
@@ -114,6 +114,16 @@ xmetai-infer --model fuxi21 --data era5_store
 xmetai-infer --model fgvp --data era5_store
 xmetai-infer --model aifs11 --data era5_store
 ```
+
+使用 FuXi-2.1 官方格式的预标准化 `input.nc` 进行 40 步推理：
+
+```bash
+xmetai-infer --config fuxi21_input_nc
+```
+
+可通过 `FUXI21_INPUT_NC`、`FUXI21_MODEL_PATH` 和 `FUXI21_OUTPUT_DIR`
+覆盖输入文件、模型文件和输出目录。该输入已经标准化，专用配置不会再次执行
+`normalize` 或单位转换。
 
 起报时间、步数、成员数、GPU 和输出目录都在对应配置文件中声明。
 `scripts/run.sh` 仅保留给需要准备 ONNX Runtime 动态库环境的旧部署方式，不是标准入口。

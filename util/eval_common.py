@@ -13,8 +13,9 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from xmetai.loaders import create_loader
-from xmetai.logging_util import configure_logging
+from xmetai_inference.data import create_dataset_source
+from xmetai_inference.logging_util import configure_logging
+from xmetai_inference.models import GRID_025
 
 
 log = logging.getLogger(__name__)
@@ -25,9 +26,94 @@ CHINA_LAT_RANGE = (15.0, 55.0)
 CHINA_LON_RANGE = (70.0, 140.0)
 
 
+ERA5_ROOT = os.environ.get(
+    "ERA5_STORE_ROOT", "/workspace/data/liujunjie/era5_foundation_store2"
+)
+# 仅当 config 读不到时的兜底 store 名。
+_FALLBACK_STORE_NAMES = [
+    "era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    "era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+]
+
+
+class _TruthModel:
+    """create_dataset_source 的最小 model_cls：只声明网格与通道，不做推理。
+
+    input_channels 在发现评测变量后动态赋值；grid 复用 0.25° 全球网格。
+    """
+
+    grid = GRID_025
+    input_channels: tuple = ()
+
+
+def defaults_from_config(config_name):
+    """读 config 的 output_dir/vars/hour_interval/dataset 作为评测默认值。
+
+    返回 (defaults, error)。error 非 None 时 defaults 是硬编码兜底 —— 调用方应
+    在 configure_logging 之后把它打出来（这里 log 还没配好，warning 会被丢掉）。
+
+    默认值从 config 读而不是在评测脚本里抄一份：抄一份的下场已经踩过 —— config
+    的 output_dir 写 ``fengqing_single_output2``、评测默认值写
+    ``fengqing_single_output``（少个 2），不显式传 --forecast 就静默评到另一个
+    目录里的旧结果，指标看着「没变化」。单位换算抄错更危险：推理按 tp×6000 跑、
+    评测按别的读，预测与实况不在同一单位上，RMSE 全错且不报错。
+    """
+    fallback = {
+        "forecast": None,
+        "vars": None,
+        "interval": 6,
+        "stores": None,
+        "scales": None,
+    }
+    try:
+        from xmetai_inference.configs.base import load_config
+        from xmetai_inference.processing.tensor_processors import (
+            unit_scales_from_specs,
+        )
+
+        cfg = load_config(config_name)
+    except Exception as error:  # noqa: BLE001
+        return fallback, error
+
+    stores = None
+    scales = None
+    dataset_spec = getattr(cfg, "dataset", None)
+    if isinstance(dataset_spec, dict):
+        paths = dataset_spec.get("paths")
+        if paths:
+            stores = [os.fspath(path) for path in paths]
+        specs = dataset_spec.get("processors") or ()
+        found = unit_scales_from_specs(specs)
+        if found:
+            scales = found
+    return {
+        "forecast": cfg.output_dir or None,
+        "vars": cfg.vars or None,
+        "interval": cfg.hour_interval or 6,
+        "stores": stores,
+        "scales": scales,
+    }, None
+
+
+def resolve_stores(args, defaults=None):
+    """优先级：--stores > --data-root > config 的 dataset.paths > 硬编码兜底。"""
+    if getattr(args, "stores", None):
+        return [os.fspath(path) for path in args.stores]
+    if getattr(args, "data_root", None):
+        return [
+            os.path.join(args.data_root, name)
+            for name in _FALLBACK_STORE_NAMES
+        ]
+    from_config = (defaults or {}).get("stores")
+    if from_config:
+        return list(from_config)
+    return [
+        os.path.join(ERA5_ROOT, name) for name in _FALLBACK_STORE_NAMES
+    ]
+
+
 @dataclass
 class EvaluationContext:
-    loader: object
     forecast_root: str
     output_dir: str
     init_dirs: list[tuple[pd.Timestamp, str]]
@@ -37,56 +123,70 @@ class EvaluationContext:
     members: list[int]
 
 
-def add_common_arguments(parser: argparse.ArgumentParser, *, ensemble: bool) -> None:
-    parser.add_argument("--forecast", required=True, help="预测输出根目录")
+def add_common_arguments(parser: argparse.ArgumentParser, *, ensemble: bool, defaults=None) -> None:
+    """Add evaluation arguments; ``defaults`` can pre-fill common values.
+
+    ``defaults`` keys use the argparse destination names, e.g.
+    ``forecast``, ``loader``, ``steps``, ``vars``, ``interval``.
+    """
+    defaults = dict(defaults or {})
+
     parser.add_argument(
-        "--loader",
-        required=True,
-        choices=["era5_store", "zarr", "zarr_normalized"],
-        help="实况数据 Loader",
+        "--forecast",
+        # 按「有没有可用值」判定，不能按「键在不在」——config 读到但 output_dir
+        # 为空时值是 None，argparse 不会要求传参，最后在 os.path.isdir(None) 崩。
+        required=defaults.get("forecast") is None,
+        default=defaults.get("forecast"),
+        help="预测输出根目录（缺省读 config 的 output_dir）",
+    )
+    parser.add_argument(
+        "--stores",
+        nargs="*",
+        default=defaults.get("stores"),
+        help="实况 zarr store 路径（可多个）；缺省用 --data-root 拼默认 pl/sfc",
     )
     parser.add_argument(
         "--data-root",
-        default=None,
-        help="可选：覆盖 Loader 默认数据地址；zarr 类型必须指定",
+        default=defaults.get("data_root"),
+        help="实况 store 根目录（与 --stores 二选一）",
     )
     parser.add_argument(
         "--inits",
-        default=None,
+        default=defaults.get("inits"),
         help="可选：只评指定起报，逗号分隔 YYYYMMDD/ YYYYMMDDHH",
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=None,
+        default=defaults.get("steps"),
         help="可选：最多评前 N 步；缺省评测目录中所有已有步骤",
     )
     parser.add_argument(
         "--vars",
-        default=None,
+        default=defaults.get("vars"),
         help="可选：只评指定变量，逗号分隔；缺省读取预测文件中的全部变量",
     )
     parser.add_argument(
         "--interval",
         type=int,
-        default=6,
+        default=defaults.get("interval", 6),
         help="相邻预测步的小时数（默认 6）",
     )
     parser.add_argument(
         "--out",
-        default=None,
+        default=defaults.get("out"),
         help="CSV 和日志目录；缺省为预测目录下的 evaluation",
     )
     if ensemble:
         parser.add_argument(
             "--members",
             type=int,
-            default=None,
+            default=defaults.get("members"),
             help="可选：只使用前 N 个成员；缺省自动发现全部 member_*",
         )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=defaults.get("log_level", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
 
@@ -232,16 +332,13 @@ def build_context(args, *, ensemble: bool) -> EvaluationContext:
         log_file=os.path.join(
             output_dir, "eval_ens.log" if ensemble else "eval_single.log"),
     )
-    loader = create_loader(args.loader, path=args.data_root)
     log.info(
-        "评测发现：loader=%s 起报=%d 变量=%s%s",
-        args.loader,
+        "评测发现：起报=%d 变量=%s%s",
         len(init_dirs),
         ",".join(variables),
         f" 成员={len(members)}" if ensemble else "",
     )
     return EvaluationContext(
-        loader=loader,
         forecast_root=args.forecast,
         output_dir=output_dir,
         init_dirs=init_dirs,
@@ -272,35 +369,81 @@ def _align_regular_grid(values, latitudes, longitudes):
     )
 
 
-def _base_variable(name):
-    match = re.fullmatch(r"([a-zA-Z]+?)(\d+)", name)
-    return match.group(1).lower() if match else name.lower()
+def read_observations(valid_times, variables, stores, interval, scales):
+    """用 processed_multi_zarr 一次读完所有实况时次（确定性/集合共用）。
 
+    处理链只有 unit_convert + geometry：不 normalize，读出来就是与预测同单位的
+    物理量；geometry 保证北->南、lon 0:360。``scales`` 必须与推理 config 的
+    ``dataset.processors[unit_convert].scales`` 一致 —— 推理把 store 换算成什么
+    单位，评测读实况就得用同一套，否则预测与实况不在同一单位上，RMSE 全错且
+    不报错。
 
-def load_observations(context, valid_time):
-    state = context.loader.load_state(
-        valid_time, channels=context.variables)
-    fields = {str(name).lower(): value for name, value in state["fields"].items()}
-    latitudes = state.get("latitudes")
-    longitudes = state.get("longitudes")
-    if latitudes is None or longitudes is None:
-        raise ValueError("当前评测工具只支持带 lat/lon 坐标的规则网格实况")
-    observations = {}
-    expected_lat = expected_lon = None
-    for variable in context.variables:
-        if variable not in fields:
-            raise KeyError(
-                f"实况在 {valid_time:%Y%m%d%H} 缺少变量 {variable!r}")
-        scale = getattr(context.loader, "SCALE", {}).get(
-            _base_variable(variable), 1.0)
-        values, current_lat, current_lon = _align_regular_grid(
-            np.asarray(fields[variable], dtype=np.float64) * float(scale),
-            latitudes,
-            longitudes,
+    返回 (obs_map, lat, lon)：obs_map 以 pd.Timestamp 为键，值是
+    {变量名: (lat, lon) float64 数组}。
+
+    这里是批量读（一次构造 Dataset 覆盖全部时次），不是逐时次按需读 —— 旧的
+    loader 路径是后者，每个 valid_time 重新开一次 store，慢且与推理不同源。
+    """
+    if not valid_times:
+        raise SystemExit("没有可评测的实况时次")
+    _TruthModel.input_channels = tuple(variables)
+    try:
+        source = create_dataset_source(
+            {
+                "type": "processed_multi_zarr",
+                "paths": list(stores),
+                "processors": [
+                    {"name": "unit_convert", "scales": dict(scales or {})},
+                    {"name": "geometry"},
+                ],
+            },
+            model_cls=_TruthModel,
+            init_times=list(valid_times),
+            history_steps=1,
+            hour_interval=interval,
+            dataloader={"batch_size": 1, "num_workers": 0, "pin_memory": False},
         )
-        observations[variable] = values
-        expected_lat, expected_lon = current_lat, current_lon
-    return observations, expected_lat, expected_lon
+    except Exception as error:  # noqa: BLE001
+        raise SystemExit(
+            f"构建实况数据源失败（检查 --stores/--data-root 与 store 通道命名）：{error}"
+        ) from error
+
+    channels = list(source.channel_names)
+    obs = {}
+    for batch in source:
+        inputs = batch["inputs"]
+        times = batch["times"]
+        if hasattr(inputs, "detach"):
+            inputs = inputs.detach().cpu().numpy()
+        inputs = np.asarray(inputs, dtype=np.float64)
+        times = (
+            times.detach().cpu().numpy()
+            if hasattr(times, "detach")
+            else np.asarray(times)
+        )
+        for index in range(inputs.shape[0]):
+            timestamp = pd.Timestamp(int(times[index]))
+            frame = inputs[index, 0]  # [C, H, W]，history_steps=1 取单帧
+            obs[timestamp] = {
+                channel: frame[c]
+                for c, channel in enumerate(channels)
+            }
+
+    if len(obs) != len(valid_times):
+        log.warning(
+            "实况只读到 %d/%d 个时次（部分有效时次在 store 中缺失）",
+            len(obs), len(valid_times),
+        )
+    log.info(
+        "实况已读取 %d 个时次（store：%s）",
+        len(obs),
+        ", ".join(os.path.basename(path) for path in stores),
+    )
+    return (
+        obs,
+        np.asarray(source.latitudes, dtype=np.float64),
+        np.asarray(source.longitudes, dtype=np.float64),
+    )
 
 
 def _dataset_variable(dataset, variable):
@@ -364,11 +507,18 @@ def load_ensemble_predictions(context, init_dir, step):
 
 
 def ensure_matching_grid(pred_lat, pred_lon, obs_lat, obs_lon):
+    """比对预测与实况的网格坐标。
+
+    容差 1e-4（不是 1e-6）：两侧坐标来自不同来源 —— 预测是 NetCDF 里存的值
+    （落盘时经 float32 往返），实况是 Dataset 从 store 读的。0.25° 网格上 1e-4
+    远小于格距，不会掩盖真实的网格错配（那种情况通常差 0.25 或整个翻转/滚动），
+    但能容忍 float32 往返的舍入。
+    """
     if pred_lat.shape != obs_lat.shape or pred_lon.shape != obs_lon.shape:
         raise ValueError("预测与实况的网格坐标 shape 不一致")
     if not (
-        np.allclose(pred_lat, obs_lat, rtol=0.0, atol=1e-6)
-        and np.allclose(pred_lon, obs_lon, rtol=0.0, atol=1e-6)
+        np.allclose(pred_lat, obs_lat, rtol=0.0, atol=1e-4)
+        and np.allclose(pred_lon, obs_lon, rtol=0.0, atol=1e-4)
     ):
         raise ValueError("预测与实况的网格坐标不一致")
 
