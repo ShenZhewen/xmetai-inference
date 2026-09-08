@@ -25,7 +25,7 @@ ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 # 所以新 tp store 排最前，旧 sfc store 里的 tp 会被顶掉、不再被选中。
 TP_ROOT = "/workspace/data/liujunjie/era5_tp_zarr"
 FENGQING_STORES = [
-    TP_ROOT + "/era5.202501-202607.c1.p25.h6.v1.zarr",
+    TP_ROOT + "/era5.202501-202607.c1.p25.h6.v1.lon180.zarr",
     ERA5_ROOT + "/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     ERA5_ROOT + "/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
 ]
