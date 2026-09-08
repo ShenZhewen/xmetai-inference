@@ -76,22 +76,26 @@ class OnnxInferModel(BaseInferModel):
     # 必须在建 session 前注册对应 plugin；None = 标准模型无需注册。子类覆盖此属性。
     ops_library = None
 
-    def load(self, path):
-        """加载 ONNX 会话，绑定到 self.device_id 这张卡，并做显存/性能调优。"""
+    def _make_session(self, path):
+        """建一个 ONNX InferenceSession（路径校验 + 选项 + provider + 自定义算子）。
+
+        从 load 抽出，让多会话模型（如 Pangu 的 6h + 24h）能复用同一套配置分别建
+        session。只返回会话，不改派生属性（_pred_name/_out_shape/_input_names）。
+        """
         # 防御：把 JSON 误当成模型传进来时，直接给明确提示，而不是让 ORT 报晦涩的
-        # "Protobuf parsing failed"。--model 应指向 .onnx 文件。
+        # "Protobuf parsing failed"。--model / 权重文件应指向 .onnx 文件。
         if not os.path.exists(path):
             raise FileNotFoundError(f"模型文件不存在：{path}")
         if path.lower().endswith(".json"):
             raise ValueError(
-                f"--model 拿到的是 JSON 文件（{path}），不是 ONNX 模型。"
-                f"模型应是 .onnx 文件（--model）。")
+                f"拿到的是 JSON 文件（{path}），不是 ONNX 模型。"
+                f"模型应是 .onnx 文件。")
         with open(path, "rb") as fh:
             head = fh.read(1)
         if head in (b"{", b"["):
             raise ValueError(
-                f"--model 指向的文件是 JSON（{path}），不是 ONNX 模型。"
-                f"请把 --model 改成 .onnx 模型路径。")
+                f"指向的文件是 JSON（{path}），不是 ONNX 模型。"
+                f"请改成 .onnx 模型路径。")
         # 关掉 ORT 默认 logger 的 WARNING：模型里那些 ScatterND 提示纯属噪音。
         ort.set_default_logger_severity(3)
         options = ort.SessionOptions()
@@ -133,7 +137,11 @@ class OnnxInferModel(BaseInferModel):
                 raise FileNotFoundError(f"自定义算子库不存在：{self.ops_library}")
             _preload_onnxruntime_lib()
             options.register_custom_ops_library(self.ops_library)
-        self.session = ort.InferenceSession(path, sess_options=options, providers=providers)
+        return ort.InferenceSession(path, sess_options=options, providers=providers)
+
+    def load(self, path):
+        """加载 ONNX 会话，绑定到 self.device_id 这张卡，并做显存/性能调优。"""
+        self.session = self._make_session(path)
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())

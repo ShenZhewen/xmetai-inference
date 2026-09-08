@@ -58,6 +58,14 @@ FENGQING_SFC_VARS = ["tp", "msl", "u10m", "v10m", "t2m"]
 FENGQING_CHANNELS = _expand_channels(
     FENGQING_PL_VARS, FENGQING_LEVELS, FENGQING_SFC_VARS)
 
+# Pangu-Weather：与 FengQing 同为 0.25° 规则网格、同 13 层（1000→50 降序）、
+# 同上层变量序 [z,q,t,u,v]，差别只在地面通道：Pangu 无 tp，= [msl,u10m,v10m,t2m]。
+PANGU_LEVELS = FENGQING_LEVELS
+PANGU_PL_VARS = FENGQING_PL_VARS
+PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
+PANGU_CHANNELS = _expand_channels(
+    PANGU_PL_VARS, PANGU_LEVELS, PANGU_SFC_VARS)
+
 
 def grid_coords(grid):
     """模型网格契约 → 纬度、经度坐标数组。"""
@@ -88,9 +96,13 @@ MODEL_REGISTRY = {
         "xmetai_inference.models.iwc_fgvp_gdn2",
         "IwcFgvpGdn2Model",
     ),
-"fengqing_pre_onnx": (
+    "fengqing_pre_onnx": (
         "xmetai_inference.models.fengqing_pre_onnx",
         "FengqingPreOnnxModel",
+    ),
+    "pangu_onnx": (
+        "xmetai_inference.models.pangu_onnx",
+        "PanguOnnxModel",
     ),
 }
 
@@ -131,6 +143,7 @@ __all__ = [
     "FUXI_ENS_CHANNELS",
     "FUXI21_CHANNELS",
     "GRID_025",
+    "PANGU_CHANNELS",
     "MODEL_REGISTRY",
     "create_model",
     "get_model_class",

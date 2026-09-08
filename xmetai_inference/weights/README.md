@@ -60,6 +60,7 @@ Loader、NetCDF/Zarr 读取、网格适配、日期调度、多卡分配和结�
 | FuXi-2.1 | `fuxi-2.1.pt2` | `mean.nc`、`std.nc` |
 | FGVP | ONNX 模型 | 与运行环境匹配的自定义算子库 |
 | FengQing V1.5Beta | `fengqing_pre.onnx` | `mean_std/`、`utils/constant_masks.npy` |
+| Pangu-Weather | `pangu_weather_6.onnx` + `pangu_weather_24.onnx` | 无（归一化烘焙进图）；BY-NC-SA 4.0，商用禁止 |
 
 FuXi-2.1 当前仍由统一 Processor 管线完成归一化、反归一化和 TP 变换，因此
 `mean.nc`、`std.nc` 必须与模型一起保留。

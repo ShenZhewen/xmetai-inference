@@ -30,14 +30,17 @@
 | FuXi-2.1 | `pt2`（torch.export） | 确定性 `deterministic` | 1 | 85 | 输入侧 `normalize`、输出侧 `denormalize`（mean.nc/std.nc） |
 | IWC FGVP GDN2 | `onnx`（ONNX Runtime） | 确定性 `deterministic` | 1 | 78 | 已烘焙进图；骨干用自定义算子，需注册 `.so` |
 | FengQing V1.5Beta | `onnx`（ONNX Runtime） | 确定性 `deterministic` | 1 | 70 | 输入 `normalize_fengqing`、输出 `denormalize_fengqing`（图出残差） |
+| Pangu-Weather | `onnx`（ONNX Runtime） | 确定性 `deterministic` | 1 | 69 | 已烘焙进图，输入/输出均为物理量 |
 
-四者共用 0.25° 全球规则网格（721×1440，纬度北→南、经度 0–360°），时间窗口均为
-2 帧历史、6 小时步长。
+五种模型共用 0.25° 全球规则网格（721×1440，纬度北→南、经度 0–360°）。除 Pangu 外
+时间窗口均为 2 帧历史；Pangu 单帧历史（`history_steps=1`）、6 小时步长，但每 4 步
+（lead 24h）改用 24h 模型从锚点直接跳 24h（官方「方案B」）。
 
 > 模型名有两套，别混：**config 名**（`--model` / `--config` 用的，如 `fuxi_ens`、
-> `fuxi21`、`fgvp`、`fengqing`）对应 `configs/` 下同名配方文件；**模型类注册名**
-> （config 里 `model_class=` 引用的，如 `fuxi_ens_onnx`、`fuxi21_pt2`、
-> `iwc_fgvp_gdn2_onnx`、`fengqing_pre_onnx`）对应 `models/MODEL_REGISTRY`。
+> `fuxi21`、`fgvp`、`fengqing`、`pangu`）对应 `configs/` 下同名配方文件；**模型类
+> 注册名**（config 里 `model_class=` 引用的，如 `fuxi_ens_onnx`、`fuxi21_pt2`、
+> `iwc_fgvp_gdn2_onnx`、`fengqing_pre_onnx`、`pangu_onnx`）对应
+> `models/MODEL_REGISTRY`。
 
 ## 核心特性
 
@@ -138,6 +141,7 @@ xmetai-infer --model fuxi_ens
 xmetai-infer --model fuxi21
 xmetai-infer --model fgvp
 xmetai-infer --model fengqing
+xmetai-infer --model pangu
 ```
 
 `--model` / `--config` 都选择一份内置运行配方（`configs/<name>.py`），配方里已声明
@@ -202,6 +206,7 @@ xmetai-infer --model fuxi_ens \
 | `XMETAI_GPU_STATE` | fuxi_ens / fgvp | `1`/`0` 覆盖 GPU 常驻开关（见 [多卡运行](#多卡运行)） |
 | `FENGQING_MEAN_STD_DIR` | fengqing | FengQing `mean_std/` 目录 |
 | `FENGQING_MASKS_PATH` | fengqing | FengQing `constant_masks.npy` 路径 |
+| `PANGU_ONNX_24` | pangu | Pangu 24h 跳步模型 `.onnx` 路径（默认取 6h 同目录 `pangu_weather_24.onnx`） |
 
 ## 扩展自己的模型和数据集
 
@@ -334,6 +339,8 @@ python util/compare_outputs.py run_new run_old   # 两次预测互比，判断�
 - FuXi-2.1 的 `mean.nc` / `std.nc` 必须与 `.pt2` 放同一目录；
 - FengQing 除 `fengqing_pre.onnx` 外还需 `mean_std/`（逐像素统计量）和
   `utils/constant_masks.npy`，见 `models/fengqing_pre_onnx.py` 的查找顺序；
+- Pangu-Weather 需 `pangu_weather_6.onnx` + `pangu_weather_24.onnx`（同目录），
+  归一化已烘焙进图、无统计量文件；License BY-NC-SA 4.0，商用禁止；
 - IWC FGVP GDN2 需匹配当前 onnxruntime 版本的 `xmetai_onnx_plugins.so`（ABI 绑定）。
 
 ## 已知限制与注意事项
@@ -345,4 +352,7 @@ python util/compare_outputs.py run_new run_old   # 两次预测互比，判断�
 
 ## License
 
-尚未声明许可证。`TODO:` 如需开源，请补充 `LICENSE` 文件。
+本项目自身尚未声明许可证。`TODO:` 如需开源，请补充 `LICENSE` 文件。
+
+集成的 Pangu-Weather 模型权重遵循 **CC BY-NC-SA 4.0**（署名-非商业-相同方式共享），
+仅限非商业用途；详见 `model_artifacts/Pangu-Weather-main/README.md`。

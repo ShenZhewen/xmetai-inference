@@ -92,6 +92,12 @@ class Rollout:
         if not trajectories:
             raise ValueError("trajectories 为空，没有可跑的轨迹")
 
+        # 轨迹间状态重置：跨步有状态模型（Pangu 的 24h 锚点）在每批轨迹开始前清空，
+        # 避免上一批残留、限制常驻内存；BaseInferModel 缺省 no-op。
+        reset = getattr(self.model, "reset_runtime_state", None)
+        if reset is not None:
+            reset()
+
         recurrent_transform = self._transform("recurrent")
         output_transform = self._transform("output")
         use_gpu = getattr(self.model, "gpu_state", False)
