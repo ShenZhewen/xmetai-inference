@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 """FengQing V1.5Beta (pre-normalized ONNX) deterministic inference config.
 
-Input data is era5_foundation_store2 6-hourly Zarr:
-  * tp in this store is 1-hour accumulation in m; the model expects 6-hour
-    accumulation in mm, so unit_convert multiplies tp by 6000.
+Input data:
+  * Upper-air (era5_pl) and surface (era5_sfc) fields come from
+    era5_foundation_store2 6-hourly Zarr.
+  * tp comes from a dedicated supplementary store
+    era5.202501-202607.c1.p25.h6.v1.zarr: 6-hour accumulation in m. The model
+    expects 6-hour accumulation in mm, so unit_convert multiplies tp by 1000.
+    (The old sfc store's tp is 1h accumulation in m; listing the new tp store
+    first shadows it via MultiZarrDataset's first-match channel lookup.)
   * Input normalization is done in the data layer (normalize_fengqing). The
     ONNX graph emits a normalized *residual*; reconstructing the physical field
     and re-normalizing for the next step stays in the model class (it needs the
@@ -15,7 +20,12 @@ from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 FENGQING_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/FengQing"
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
+# tp 用官方补充数据集（6h 累积 m）并放在最前：MultiZarrDataset 用 xr.concat 拼
+# channel 且按 channel_values.index(v) 取「第一个同名」通道（multi_zarr_dataset.py），
+# 所以新 tp store 排最前，旧 sfc store 里的 tp 会被顶掉、不再被选中。
+TP_ROOT = "/workspace/data/liujunjie/era5_tp_zarr"
 FENGQING_STORES = [
+    TP_ROOT + "/era5.202501-202607.c1.p25.h6.v1.zarr",
     ERA5_ROOT + "/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     ERA5_ROOT + "/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
 ]
@@ -32,7 +42,7 @@ cfg = InferConfig(
             {
                 "name": "unit_convert",
                 "scales": {
-                    "tp": 6000.0,
+                    "tp": 1000.0,  # 新 tp 已是 6h 累积 m，只 ×1000 转 mm
                 },
             },
             {"name": "geometry"},
@@ -66,7 +76,7 @@ cfg = InferConfig(
     # `:24` 是起报**间隔**（每天一个起报），与 steps/hour_interval 的预报步长
     # 无关。显式写出来：cli.py:207 调 parse_times 时没传 hour_interval，缺省
     # 恰好也是 24，但别依赖这个巧合。
-    times="2025010200..2025010500:24",
+    times="2025010200..2025122800:24",
     # steps 与 hour_interval 是两个独立概念，别和起报间隔混在一起：
     #   hour_interval=6  模型每步推进 6h —— 这是**模型契约**（FengQing 类属性
     #                    也是 6），改成 24 会让数据层按 24h 取历史窗（模型要的是
@@ -84,5 +94,5 @@ cfg = InferConfig(
     cuda_devices="0,1",
     # 独立目录：不复用 fengqing_single_output2（那里是单起报的旧结果）。
     # eval 时必须显式传 --forecast 指向这里，否则会评到默认目录的旧数据。
-    output_dir="/workspace/data/shenzw/fengqing_2gpu_4day",
+    output_dir="/workspace/data/shenzw/fengqing_output",
 )
