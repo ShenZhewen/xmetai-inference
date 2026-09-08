@@ -23,7 +23,7 @@ cfg = InferConfig(
     name="fuxi_ens",
     model_path=os.environ.get(
         "FUXI_ENS_ONNX",
-        f"{ROOT}/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
+        "/workspace/szwCode/xmetai-inference/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
     ),
     # 统一开关：XMETAI_GPU_STATE="1"/"0" 显式覆盖，未设时用本 config 的默认（开）。
     # 原来这里是 XMETAI_DISABLE_GPU_STATE（反向语义），与 fgvp 的 ENABLE 方向相反、
@@ -62,16 +62,11 @@ cfg = InferConfig(
     ),
     times=(
         "20250102..20250107:24,"
-        "20250316,"
-        "20250428..20250519:24,"
-        "20250630..20250702:24,"
-        "20250922..20250924:24,"
-        "20251206..20251229:24"
     ),
     steps=60,
     members=51,
     vars="z500,u200,v200,msl,tp",
-    gpus=4,
-    cuda_devices="0,1,2,3",
-    output_dir="/workspace/data/shenzw/fuxi_ens_output",
+    gpus=2,
+    cuda_devices="0,1",
+    output_dir="/workspace/data/shenzw/fuxi_ens_output_new",
 )
