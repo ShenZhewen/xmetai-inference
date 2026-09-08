@@ -7,6 +7,7 @@ import argparse
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,6 +35,18 @@ _FALLBACK_STORE_NAMES = [
     "era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     "era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
 ]
+
+
+def _fmt_dur(seconds):
+    """秒 -> '1h02m05s' / '2m26s' / '35s' 的可读时长。"""
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 class _TruthModel:
@@ -410,6 +423,16 @@ def read_observations(valid_times, variables, stores, interval, scales):
 
     channels = list(source.channel_names)
     obs = {}
+    total = len(valid_times)
+    done = 0
+    t_start = time.monotonic()
+    # 起报多时这一段批量读实况是耗时大头，之前没任何输出，看着像卡死，加进度 + ETA。
+    report_every = max(1, total // 20)
+    log.info(
+        "开始读实况：%d 个时次（store：%s）",
+        total,
+        ", ".join(os.path.basename(path) for path in stores),
+    )
     for batch in source:
         inputs = batch["inputs"]
         times = batch["times"]
@@ -428,17 +451,23 @@ def read_observations(valid_times, variables, stores, interval, scales):
                 channel: frame[c]
                 for c, channel in enumerate(channels)
             }
+        done += inputs.shape[0]
+        if done == total or done % report_every == 0:
+            elapsed = time.monotonic() - t_start
+            rate = done / elapsed if elapsed > 0 else 0.0
+            eta = (total - done) / rate if rate > 0 else 0.0
+            log.info(
+                "读实况 %d/%d（%.0f%%）｜已用 %s，剩余约 %s（%.2f it/s）",
+                done, total, 100.0 * done / total,
+                _fmt_dur(elapsed), _fmt_dur(eta), rate,
+            )
 
     if len(obs) != len(valid_times):
         log.warning(
             "实况只读到 %d/%d 个时次（部分有效时次在 store 中缺失）",
             len(obs), len(valid_times),
         )
-    log.info(
-        "实况已读取 %d 个时次（store：%s）",
-        len(obs),
-        ", ".join(os.path.basename(path) for path in stores),
-    )
+    log.info("实况读取完成：%d 个时次（共 %d）", len(obs), total)
     return (
         obs,
         np.asarray(source.latitudes, dtype=np.float64),

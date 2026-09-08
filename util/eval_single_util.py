@@ -23,6 +23,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 import pandas as pd
 
@@ -31,6 +32,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from util.eval_common import (
+    _fmt_dur,
     add_common_arguments,
     available_steps,
     build_context,
@@ -66,8 +68,12 @@ def main(argv=None):
     # 1) 展开全部 (起报, step) 工作项，同时收集每个 step 对应的实况时次
     work = []
     valid_set = set()
-    for init_time, init_dir in context.init_dirs:
-        for step in available_steps(context, init_dir, ensemble=False):
+    total_inits = len(context.init_dirs)
+    for init_index, (init_time, init_dir) in enumerate(context.init_dirs, start=1):
+        steps = available_steps(context, init_dir, ensemble=False)
+        log.info("发现起报 %s（%d/%d），已有 %d 步",
+                 init_dir, init_index, total_inits, len(steps))
+        for step in steps:
             lead_hour = step * context.interval
             valid_time = init_time + pd.Timedelta(hours=lead_hour)
             work.append((init_time, init_dir, step, lead_hour, valid_time))
@@ -86,6 +92,7 @@ def main(argv=None):
     rows = []
     total = len(work)
     log.info("开始评测：工作项=%d（起报=%d）", total, len(context.init_dirs))
+    t_start = time.monotonic()
     for index, item in enumerate(work, start=1):
         init_time, init_dir, step, lead_hour, valid_time = item
         if valid_time not in obs_map:
@@ -107,9 +114,17 @@ def main(argv=None):
                     pred_lat,
                 ),
             })
-        if index == 1 or index == total or index % 20 == 0:
-            log.info("已评测 %d/%d（init=%s step=%03d lead=%dh）",
-                     index, total, init_dir, step, lead_hour)
+        if index == 1 or index == total or index % 10 == 0:
+            elapsed = time.monotonic() - t_start
+            rate = index / elapsed                          # 项/秒
+            eta = (total - index) / rate                    # 剩余秒
+            log.info(
+                "已评测 %d/%d（%.1f%%）｜init=%s step=%03d lead=%dh｜"
+                "已用 %s，剩余约 %s（%.3f it/s）",
+                index, total, 100.0 * index / total,
+                init_dir, step, lead_hour,
+                _fmt_dur(elapsed), _fmt_dur(eta), rate,
+            )
 
     write_results(rows, context.output_dir, "eval_single")
     return 0
