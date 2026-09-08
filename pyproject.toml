@@ -12,6 +12,7 @@ dependencies = [
     "xmetai-core>=0.1.0",
     "numpy",
     "pandas",
+    "torch",
     "xarray",
 ]
 
@@ -25,13 +26,6 @@ zarr = [
 ]
 onnx = [
     "onnxruntime",
-]
-pt2 = [
-    "torch",
-]
-aifs = [
-    "anemoi-inference",
-    "torch",
 ]
 
 [project.scripts]

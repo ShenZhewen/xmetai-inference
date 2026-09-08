@@ -26,9 +26,6 @@
 *.log
 infer_log.txt
 
-# ===== 离线 wheel 包 =====
-aifs_wheels/
-
 # ===== Python =====
 __pycache__/
 *.pyc

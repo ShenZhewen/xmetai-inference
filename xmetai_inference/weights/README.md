@@ -1,6 +1,6 @@
 # 模型权重与部署产物
 
-本目录只保存模型权重的说明文档，并随 `xmetai` Python 包一起发布。
+本目录只保存模型权重的说明文档，并随 `xmetai-inference` Python 包一起发布。
 
 实际模型权重和部署产物统一放在项目根目录的 `model_artifacts/` 中。该目录整体被
 `.gitignore` 忽略，其中的任何文件和子目录都不会上传 Git。
@@ -59,11 +59,10 @@ Loader、NetCDF/Zarr 读取、网格适配、日期调度、多卡分配和结�
 | FuXi-Ens | `fuxi_ens.onnx` | ONNX external data |
 | FuXi-2.1 | `fuxi-2.1.pt2` | `mean.nc`、`std.nc` |
 | FGVP | ONNX 模型 | 与运行环境匹配的自定义算子库 |
-| AIFS 1.1 | `aifs-single-mse-1.1.ckpt` | Anemoi 运行环境 |
+| FengQing V1.5Beta | `fengqing_pre.onnx` | `mean_std/`、`utils/constant_masks.npy` |
 
 FuXi-2.1 当前仍由统一 Processor 管线完成归一化、反归一化和 TP 变换，因此
-`mean.nc`、`std.nc` 必须与模型一起保留。AIFS checkpoint 自带 Anemoi 的部分
-normalizer、imputer 和自回归逻辑，不能在未验证数值一致性的情况下直接替换格式。
+`mean.nc`、`std.nc` 必须与模型一起保留。
 
 ## 使用原则
 
