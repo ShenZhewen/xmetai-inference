@@ -18,6 +18,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 import pandas as pd
 
@@ -39,6 +40,19 @@ from util.eval_common import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _fmt_dur(seconds: float) -> str:
+    """把秒数转成 '1h02m05s' / '2m26s' / '35s' 的可读时长。"""
+    seconds = int(round(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
 
 # 评测哪个 config 的输出：换模型/换跑法只改这里（或设 XMETAI_EVAL_CONFIG）。
 EVAL_CONFIG = os.environ.get("XMETAI_EVAL_CONFIG", "fuxi_ens")
@@ -91,6 +105,7 @@ def main(argv=None):
     total = len(work)
     log.info("开始评测：工作项=%d（起报=%d × 步数，成员=%d）",
              total, total_inits, len(context.members))
+    t_start = time.monotonic()
     for index, item in enumerate(work, start=1):
         init_time, init_dir, step, lead_hour, valid_time = item
         if valid_time not in obs_map:
@@ -115,9 +130,16 @@ def main(argv=None):
                     variable,
                 ),
             })
-        if index == 1 or index == total or index % 20 == 0:
-            log.info("已评测 %d/%d（init=%s step=%03d lead=%dh）",
-                     index, total, init_dir, step, lead_hour)
+        if index == 1 or index == total or index % 10 == 0:
+            elapsed = time.monotonic() - t_start
+            rate = index / elapsed                         # 项/秒
+            eta = (total - index) / rate                   # 剩余秒
+            log.info(
+                "已评测 %d/%d（init=%s step=%03d lead=%dh）｜"
+                "已用 %s，剩余约 %s（%.3f it/s）",
+                index, total, init_dir, step, lead_hour,
+                _fmt_dur(elapsed), _fmt_dur(eta), rate,
+            )
 
     write_results(rows, context.output_dir, "eval_ens")
     return 0
