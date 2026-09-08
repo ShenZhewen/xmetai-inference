@@ -13,6 +13,8 @@ xmetai_inference.models 包，数据源拆到 xmetai_inference.data 包；本文
 
 输出目录（集合 members>1）：{out}/{起报目录}/member_{成员3位}/{预测步序号3位}.nc
 输出目录（确定性 members=1）：{out}/{起报目录}/{预测步序号3位}.nc
+每个 .nc 存单个 data 变量，五维 (time=1, lead_time=1, channel, lat, lon)：
+channel 为小写变量名维度，time=起报时刻、lead_time=预报时效（小时）。
 00 UTC 起报目录使用 YYYYMMDD；其他时次使用 YYYYMMDDHH，避免同日多时次互相覆盖。
 
 多卡时，主进程使用同一个 inference.py 的内部 --worker 模式启动独立子进程，并通过
@@ -566,6 +568,7 @@ def _worker_main(argv=None):
             if members == 1:
                 def on_batch_step(step, step_state, batch_inits=batch_inits):
                     step_idx = step + 1
+                    lead_hour = step_idx * interval
                     for batch_index, init in enumerate(batch_inits):
                         init_dir = _output_init_dir(init)
                         ds = model.to_dataset(
@@ -573,6 +576,8 @@ def _worker_main(argv=None):
                             save_names=save_names,
                             lat=lat,
                             lon=lon,
+                            init_time=init,
+                            lead_hour=lead_hour,
                         )
                         writer.put(
                             f"{init_dir}/{step_idx:03d}.nc",
@@ -601,12 +606,15 @@ def _worker_main(argv=None):
 
                     def on_step(step, step_state, init=init, init_dir=init_dir):
                         step_idx = step + 1
+                        lead_hour = step_idx * interval
                         for local_index, member_id in enumerate(member_indices):
                             member_ds = model.to_dataset(
                                 step_state[local_index],
                                 save_names=save_names,
                                 lat=lat,
                                 lon=lon,
+                                init_time=init,
+                                lead_hour=lead_hour,
                             )
                             writer.put(
                                 f"{init_dir}/member_{member_id:03d}/{step_idx:03d}.nc",

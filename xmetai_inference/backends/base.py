@@ -165,13 +165,19 @@ class BaseInferModel(ABC):
         """GPU 载体 -> numpy（落盘/取预测帧用，gpu_state=True 时实现）。"""
         raise NotImplementedError
 
-    def to_dataset(self, step_state, save_names=None, lat=None, lon=None):
-        """一步 × 一成员的输出 → xarray Dataset（落盘前最后一步，后端无关入口）。
+    def to_dataset(self, step_state, save_names=None, lat=None, lon=None,
+                   init_time=None, lead_hour=None):
+        """一步 × 一成员的输出 → 五维 Dataset（落盘前最后一步，后端无关入口）。
 
         默认实现按 onnx/pt2 通道张量语义：step_state 形状 (C,H,W)，用 self.output_channels
         （模型类的输出通道契约）解码变量名、套 lat/lon 坐标、挑 save_names（None=全部
         通道）。step_state 可以是 torch.Tensor，也可以沿用 ONNX legacy 的 numpy；
         这里做唯一一次 tensor→numpy，xarray 需要 numpy 数据。
+
+        输出单个 ``data`` 变量，形状 ``(time=1, lead_time=1, channel, lat, lon)``：
+        channel 用小写变量名做维度，time/lead_time 各占长度 1 的位置（起报时刻 /
+        预报时效小时数），下游用 ``xr.open_mfdataset`` 沿 time、lead_time 可再拼回
+        完整五维。集合成员各自一步一个文件，同样走本方法，不做成员聚合。
         """
         import xarray as xr
 
@@ -181,14 +187,28 @@ class BaseInferModel(ABC):
         else:
             name2idx = {str(c).lower(): i for i, c in enumerate(channels)}
             save_indices = [name2idx[str(n).lower()] for n in save_names]
-        data_vars = {}
-        for ci in save_indices:
+        names = [channels[ci] for ci in save_indices]
+
+        h, w = step_state.shape[-2], step_state.shape[-1]
+        data = np.empty((len(save_indices), h, w), dtype=np.float32)
+        for j, ci in enumerate(save_indices):
             channel = channels[ci]
-            arr = _to_numpy(step_state[ci])                # (H, W)，北->南
+            arr = np.asarray(_to_numpy(step_state[ci]), dtype=np.float32)
             if channel in self.nonnegative_channels:
                 arr = np.maximum(arr, 0.0)
-            data_vars[channel.upper()] = (("lat", "lon"), arr)
-        return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
+            data[j] = arr
+
+        coords = {
+            "time": np.array([np.datetime64(init_time, "ns")], dtype="datetime64[ns]"),
+            "lead_time": np.array([lead_hour], dtype=np.int64),
+            "channel": np.asarray(names, dtype=str),
+            "lat": np.asarray(lat, dtype=np.float64),
+            "lon": np.asarray(lon, dtype=np.float64),
+        }
+        return xr.Dataset(
+            {"data": (("time", "lead_time", "channel", "lat", "lon"), data[None, None])},
+            coords=coords,
+        )
 
     # 自回归 rollout 循环已移至 xmetai_inference/runner.py 的 Rollout。
     #
