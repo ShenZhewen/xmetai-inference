@@ -96,6 +96,10 @@ MODEL_REGISTRY = {
         "xmetai_inference.models.iwc_fgvp_gdn2",
         "IwcFgvpGdn2Model",
     ),
+    "iwc_fgvp_mamba_ens_onnx": (
+        "xmetai_inference.models.iwc_fgvp_mamba_ens",
+        "IwcFgvpMambaEnsModel",
+    ),
     "fengqing_pre_onnx": (
         "xmetai_inference.models.fengqing_pre_onnx",
         "FengqingPreOnnxModel",
