@@ -57,6 +57,9 @@ cfg = InferConfig(
         ],
     },
     dataloader={
+        # 集合路径上前向逐条跑（图 batch 维固定 1），batch_size 只影响数据装载
+        # 分组，不影响速度；真正要控的是主机内存——预取队列 = workers×2×batch
+        # ×645MB/样本，×4 进程。4×2×4×0.65G ≈ 84G，360G 内存余量充足。
         "batch_size": 4,
         "num_workers": 4,
         "pin_memory": True,
@@ -69,11 +72,11 @@ cfg = InferConfig(
         output=[],
     ),
     # 起报范围：先按 4 个起报跑通链路，改这里调范围（语法见 base.parse_times）。
-    times="2025010200..2025010300:24",
+    times="2025010200..2025121500:24",
     steps=60,
     members=51,
     vars="z500,u200,v200,msl,tp",
-    gpus=2,
-    cuda_devices="0,1",
+    gpus=4,
+    cuda_devices="0,1,2,3",
     output_dir="/workspace/data/shenzw/fgvp_ens_output",
 )

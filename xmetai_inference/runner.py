@@ -212,16 +212,21 @@ class Rollout:
         逐步 \\r 进度条在多卡并发时会互相覆盖刷屏，改成稀疏完整行就不会乱。
         """
         done = step + 1
-        if done != steps and done % _PROGRESS_INTERVAL:
+        # 首步必打：cudnn 算法穷举搜索发生在第一个前向，可能几分钟没有动静，
+        # 让用户知道在等什么；之后的步才按 _PROGRESS_INTERVAL 稀疏输出。
+        first = done == 1
+        if done != steps and not first and done % _PROGRESS_INTERVAL:
             return
         elapsed = sum(step_times)
         eta = elapsed / done * (steps - done)
         prefix = f"{label} " if label else ""
+        note = "（首步含 cudnn 算法穷举搜索，偏慢属正常；ETA 按首步外推会偏大）" if first else ""
         log.info(
-            "%s预报 %.1f/%.1f 天，剩 %.1f 天，预计还需 %s",
+            "%s预报 %.1f/%.1f 天，剩 %.1f 天，预计还需 %s%s",
             prefix,
             done * hour_interval / 24.0,
             steps * hour_interval / 24.0,
             (steps - done) * hour_interval / 24.0,
             _fmt_dur(eta),
+            note,
         )

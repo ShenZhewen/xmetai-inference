@@ -293,6 +293,41 @@ def _run_infer(cfg, overrides):
         log_files.append(log_file)
 
     status = 0
+    # 主进程心跳：rank 的日志全在各自文件里（--no-console-log），没有心跳的话
+    # 控制台在 spawn 完到全部退出之间一行不出，看起来像冻住。每 30 秒报一次
+    # 还有哪些 rank 活着、已运行多久。
+    from time import sleep as _sleep
+
+    from xmetai_inference.backends.base import _fmt_dur as _fmt_dur_main
+
+    t_heartbeat = perf_counter()
+    reported = set()
+    while True:
+        _sleep(30)
+        statuses = [
+            (rank, process.poll()) for rank, process in enumerate(processes)
+        ]
+        # rank 一死立刻报告（含退出码与日志路径），不等全部结束——OOM kill 是
+        # SIGKILL，rank 自己的日志戛然而止，主进程这里是唯一的告警点。
+        for rank, code in statuses:
+            if code is None or rank in reported:
+                continue
+            reported.add(rank)
+            if code == 0:
+                log.info("rank %d 已完成", rank)
+            else:
+                log.error(
+                    "rank %d 已退出（code=%s），日志 %s",
+                    rank, code, os.path.join(output_dir, f"rank_{rank}.log"))
+        alive = [rank for rank, code in statuses if code is None]
+        if not alive:
+            break
+        log.info(
+            "推理进行中（已 %s）：rank %s 仍在跑，明细看 %s",
+            _fmt_dur_main(perf_counter() - t_heartbeat),
+            alive,
+            os.path.join(output_dir, "rank_*.log"),
+        )
     for rank, (process, log_file) in enumerate(zip(processes, log_files)):
         if process.wait() != 0:
             status = 1
@@ -463,15 +498,23 @@ def _worker_main(argv=None):
     # 多卡分工：把「起报时间 × 成员」的任务摊给各卡，有两种切法——
     #   按起报切：每个 rank 跑一部分起报、全部成员；
     #   按成员切：每个 rank 跑一部分成员、全部起报。
-    # 选单卡最大任务数更小的那一种（更均衡）。集合成员多、起报少时按成员切更均衡
-    # （如 7 起报 × 51 成员：按起报切最忙卡 102 任务 vs 按成员切 91）；确定性
-    # 1 成员、起报多时按起报切更均衡。
+    # 均衡上两种切法通常只差几个百分点，但内存上差异巨大：Rollout 给每条轨迹
+    # 持有独立 state 拷贝（~645MB/条），按起报切每卡要挂全部 members 条
+    # （51 成员 ≈ 33GB/卡），按成员切只挂 ceil(members/world_size) 条
+    # （4 卡 51 成员 ≈ 8GB/卡）。实测按起报切曾把 pod 的 cgroup 内存限额顶穿、
+    # 两个 rank 被 OOM kill（SIGKILL，rank 日志无 traceback 直接断）。
+    # 故集合（members>1 且成员数 ≥ 卡数）优先按成员切；members < 卡数时按成员
+    # 切会有卡分不到任务，退回均衡比较。确定性（members==1）本就只能按起报切。
     n_init = len(init_times)
     per_rank_init = (n_init + world_size - 1) // world_size
     per_rank_member = (members + world_size - 1) // world_size
     cost_by_init = per_rank_init * members
     cost_by_member = n_init * per_rank_member
-    if cost_by_init <= cost_by_member:
+    if members > 1 and members >= world_size:
+        split_by_member = True
+    else:
+        split_by_member = cost_by_init > cost_by_member
+    if not split_by_member:
         base, rem = divmod(n_init, world_size)
         start_i = local_rank * base + min(local_rank, rem)
         span = base + (1 if local_rank < rem else 0)
@@ -500,6 +543,9 @@ def _worker_main(argv=None):
     if args.num_workers is not None:
         dataloader_config["num_workers"] = args.num_workers
     dataset_spec = worker_cfg.dataset
+    t_dataset = perf_counter()
+    log.info("正在构建数据集（打开 zarr 存储、装配时间窗），起报 %d 个...",
+             len(init_times))
     dataset_source = create_dataset_source(
         dataset_spec,
         model_cls=cls,
@@ -510,8 +556,13 @@ def _worker_main(argv=None):
         dataloader=dataloader_config,
     )
     data_source = dataset_source
+    log.info("数据集就绪：%d 个 batch（batch_size=%s），构建耗时 %s",
+             len(dataset_source),
+             dataloader_config.get("batch_size"),
+             _fmt_dur(perf_counter() - t_dataset))
 
     input_specs, recurrent_specs, output_specs = worker_cfg.processor_specs()
+    t_pipeline = perf_counter()
     processors = build_pipeline(
         input_specs,
         cls,
@@ -520,6 +571,9 @@ def _worker_main(argv=None):
         recurrent_specs=recurrent_specs,
         output_specs=output_specs,
     )
+    log.info("前处理管线就绪（input=%d recurrent=%d output=%d），耗时 %s",
+             len(input_specs), len(recurrent_specs), len(output_specs),
+             _fmt_dur(perf_counter() - t_pipeline))
     model = create_model(
         model_spec,
         device_id=device_id,
@@ -557,8 +611,18 @@ def _worker_main(argv=None):
     if dataset_source is not None:
         total_t0 = perf_counter()
         completed = 0
-        for batch in dataset_source:
+        log.info("开始迭代数据集，等待首个 batch 装载（workers=%s，"
+                 "每个 worker 要重新打开 zarr 并读满一个 batch，可能较慢）...",
+                 dataloader_config.get("num_workers", 0))
+        t_fetch = perf_counter()
+        # 注意：循环体内已有局部 batch_index（按 batch_inits 枚举），这里用
+        # data_batch_index 区分，避免遮蔽/改绑。
+        for data_batch_index, batch in enumerate(dataset_source):
+            fetch_dur = perf_counter() - t_fetch
             state, batch_inits = model.prepare_dataset_batch(batch)
+            if data_batch_index == 0:
+                log.info("首个 batch 就绪：state 形状 %s，装载+前处理耗时 %s",
+                         tuple(state.shape), _fmt_dur(fetch_dur))
 
             # 确定性（members==1）：每个起报一条轨迹，一次 Rollout 跑完整个 batch。
             # 集合（members>1）：每个起报单独一次 Rollout，成员即轨迹。
@@ -636,11 +700,14 @@ def _worker_main(argv=None):
             writer.flush()
             completed += len(batch_inits)
             log.info(
-                "Dataset batch 完成：%d/%d，batch=%d",
+                "Dataset batch 完成：%d/%d，batch=%d（装载 %s，本批总耗时 %s）",
                 completed,
                 len(init_times),
                 len(batch_inits),
+                _fmt_dur(fetch_dur),
+                _fmt_dur(perf_counter() - t_fetch),
             )
+            t_fetch = perf_counter()
             del state
             gc.collect()
 
