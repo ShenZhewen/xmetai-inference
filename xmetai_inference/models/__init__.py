@@ -128,10 +128,25 @@ def get_model_class(model_name):
 
 
 def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
-                 ops_library=None, gpu_state=None):
+                 ops_library=None, gpu_state=None, weight_perturb=None,
+                 member_index=0, latent_forcing=None, intra_op_threads=0,
+                 cudnn_algo_search="", resident_members=1):
     """按模型名构造推理模型。
 
-    ops_library / gpu_state 属于运行配置，由 config 提供；None 时使用模型类默认值。
+    ops_library / gpu_state / weight_perturb / latent_forcing / member_index 属于运行配置，
+    由 config 提供；None 时使用模型类默认值（weight_perturb=None / latent_forcing=None
+    即不加扰动）。
+
+    weight_perturb 与 latent_forcing 是两条正交的「确定性 -> 集合」路径：前者按
+    `W~ = W (x) (1 + sigma*xi)` 改**权重**，后者按 `z' = z (x) (1 + sigma*U diag(xi_t) V^T)`
+    给图加一个 `spw/xi` 输入、改**图**（xi_t 是驱动侧的 AR(1) 过程）。两者可以同时开，
+    config 里同时写就是「冻结的扰动权重 + 时间相关的潜空间强迫」。
+
+    member_index 只在配了 weight_perturb 时有意义：它决定 load() 加载
+    哪一份成员模型。跑集合时同一个实例会被反复 load（每次换一个成员号）；resident_members
+    决定这些 session 在显存里驻留几份——1（缺省）是一换一放，51 个成员 x 3 GB 全挂上去
+    会把显存吃干净；显存够大就调大它（-1 = 全常驻），换回来时不重建 session、不重新预热
+    cuDNN。见 backends/session_pool.py 与 cli 的 _run_member_block。
     """
     cls = get_model_class(model_name)
     model = cls(device_id=device_id, gpu_mem_fraction=gpu_mem_fraction)
@@ -139,6 +154,35 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
         model.ops_library = ops_library
     if gpu_state is not None and hasattr(model, "gpu_state"):
         model.gpu_state = gpu_state
+    if intra_op_threads and hasattr(model, "intra_op_threads"):
+        model.intra_op_threads = int(intra_op_threads)
+    if cudnn_algo_search and hasattr(model, "cudnn_algo_search"):
+        model.cudnn_algo_search = str(cudnn_algo_search)
+    if resident_members is not None and hasattr(model, "resident_members"):
+        model.resident_members = int(resident_members)
+    model.member_index = int(member_index or 0)
+    if weight_perturb is not None:
+        from xmetai_inference.perturbation import WeightPerturbSpec
+
+        spec = WeightPerturbSpec.from_config(weight_perturb)
+        if spec is not None:
+            if not getattr(model, "supports_weight_perturb", False):
+                raise ValueError(
+                    f"{cls.__name__}（backend={model.backend}）不支持权重扰动："
+                    "当前只实现了 ONNX 后端的注入（m3 图内随机算子 / m1a 逐成员冻结"
+                    "权重），见 xmetai_inference/perturbation/README.md")
+            model.weight_perturb = spec
+    if latent_forcing is not None:
+        from xmetai_inference.perturbation import LatentForcingSpec
+
+        forcing = LatentForcingSpec.from_config(latent_forcing)
+        if forcing is not None:
+            if not getattr(model, "supports_weight_perturb", False):
+                raise ValueError(
+                    f"{cls.__name__}（backend={model.backend}）不支持潜空间 AR(1) 强迫："
+                    "当前只实现了 ONNX 后端的图改写注入（latent_forcing），"
+                    "见 xmetai_inference/perturbation/README.md")
+            model.latent_forcing = forcing
     return model
 
 

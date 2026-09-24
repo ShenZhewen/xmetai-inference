@@ -18,6 +18,7 @@ pip install -e ".[netcdf,zarr]"
 | `eval_ens_util.py` | 集合预报评测（对实况） |
 | `compare_outputs.py` | 两个输出目录互比，判断两次跑的结果是否一致 |
 | `eval_common.py` | 上述工具共用的发现、实况读取、网格对齐、指标和 CSV 汇总 |
+| `spw_hparam.py` | SPW（权重扰动集合）的**超参数敏感性复盘**：配平口径算术、成员数 M 的隐藏偏差、σ 幂律 —— 不跑推理 |
 
 ## 可复现性检查（compare_outputs.py）
 
@@ -25,7 +26,13 @@ pip install -e ".[netcdf,zarr]"
 
 ```bash
 python util/compare_outputs.py /path/run_new /path/run_old
+python util/compare_outputs.py 新输出 老输出   # 集合输出（member_XXX/ 一层）也认，逐成员比
 ```
+
+集合输出（`{起报}/member_<NNN>/{步}.nc`）多一层成员号参与匹配，末尾多一张**按成员
+汇总**表。这张表是判断「老结果可不可信」的关键：全体成员一起漂移通常是浮点路径变了；
+只有一部分成员不同，说明那批成员在两侧不是同一个 session 的第 k 次前向（旧的多卡静态
+切片会把各 rank 的第 k 条轨迹抽成同一条噪声，成员数会静默变少）。
 
 按「起报目录 + 步序号 + 变量名」三者都相同才比；任一侧缺的部分跳过并在末尾列出，
 所以**谁的日期/步数少就以少的为准**，不用手工对齐。

@@ -87,6 +87,10 @@ class Rollout:
         就走流式（内存不随 steps 增长）；不传则把 (n_traj, steps, C, H, W) 全攒
         在内存里返回。
 
+        没配 output 处理器时，流式回调收到的是「每轨迹一帧」的列表：下标语义与
+        (n_traj, C, H, W) 数组完全相同（step_state[i] 就是第 i 条轨迹的帧），
+        省掉一次整块拷贝。
+
         返回流式时为 None，否则为堆叠结果。
         """
         if not trajectories:
@@ -145,15 +149,27 @@ class Rollout:
                 # 末帧 = 本步预报。先取出副本再回填 —— recurrent Processor
                 # （如 zero_channels）是原地改，不复制会把已取出的预报也改掉。
                 pred = next_state[0, -1]
-                parts.append(
-                    pred.clone() if isinstance(pred, torch.Tensor) else pred.copy())
+                if recurrent_transform is not None:
+                    # 有 recurrent 处理器（如 zero_channels）时必须留副本：那一步是原地
+                    # 改，不留副本会把已取出的预报一起改掉。
+                    pred = (pred.clone() if isinstance(pred, torch.Tensor)
+                            else pred.copy())
+                # 没有 recurrent 时 next_state 由 states[index] 持有、本步不会再被写，
+                # 持视图即可 —— 每条轨迹一份 324 MB，51 个成员就是 16.5 GB 白占。
+                parts.append(pred)
                 states[index] = (
                     recurrent_transform(next_state)
                     if recurrent_transform is not None else next_state)
 
-            step_state = _stack(parts, 0)
             if output_transform is not None:
-                step_state = output_transform(step_state)
+                step_state = output_transform(_stack(parts, 0))
+            elif streaming:
+                # 流式 + 没配 output 处理器：直接把「每轨迹一帧」的列表交给 on_step，
+                # 下标语义与堆好的 (n_traj, C, H, W) 数组逐位一致，省掉整块拷贝
+                # （51 个成员 = 16.5 GB）。要数组（非流式收集、或配了处理器）才堆。
+                step_state = parts
+            else:
+                step_state = _stack(parts, 0)
             if streaming:
                 on_step(step, step_state)
             else:

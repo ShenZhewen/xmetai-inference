@@ -14,9 +14,10 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from xmetai_inference.data import create_dataset_source
-from xmetai_inference.logging_util import configure_logging
-from xmetai_inference.models import GRID_025
+# 刻意**不在模块顶层**导入 xmetai_inference：它的 data 子包会拉进整套数据集栈
+# （进而要求外部 xmetai 包），而纯互比工具 compare_outputs.py 只需要本模块的发现/
+# 读取函数。顶层导入会让对拍在没装 xmetai 的环境里直接 ImportError（容器里踩过）。
+# 需要数据集栈的两个函数各自在用之前惰性导入。
 
 
 log = logging.getLogger(__name__)
@@ -55,7 +56,9 @@ class _TruthModel:
     input_channels 在发现评测变量后动态赋值；grid 复用 0.25° 全球网格。
     """
 
-    grid = GRID_025
+    # grid / input_channels 由 read_observations 在交给 create_dataset_source 之前赋值：
+    # 本模块不再顶层依赖 xmetai_inference.models，拿不到 GRID_025 常量。
+    grid = None
     input_channels: tuple = ()
 
 
@@ -340,6 +343,8 @@ def build_context(args, *, ensemble: bool) -> EvaluationContext:
 
     output_dir = args.out or os.path.join(args.forecast, "evaluation")
     os.makedirs(output_dir, exist_ok=True)
+    from xmetai_inference.logging_util import configure_logging
+
     configure_logging(
         level=args.log_level,
         log_file=os.path.join(
@@ -399,6 +404,10 @@ def read_observations(valid_times, variables, stores, interval, scales):
     """
     if not valid_times:
         raise SystemExit("没有可评测的实况时次")
+    from xmetai_inference.data import create_dataset_source
+    from xmetai_inference.models import GRID_025
+
+    _TruthModel.grid = GRID_025
     _TruthModel.input_channels = tuple(variables)
     try:
         source = create_dataset_source(

@@ -101,6 +101,45 @@ class InferConfig:
     output_processors: Any = None
     ops_library: str = ""                    # 自定义算子库 .so（空 = 不注册，标准模型）
     gpu_state: Any = None                   # None = 使用模型类默认；True/False 可覆盖
+    # 确定性 ONNX -> 集合：权重扰动（SPW）规格。None = 不加扰动；dict 见
+    # perturbation.WeightPerturbSpec（groups / sigma_full / sigma / balance / ...）。
+    # 需要 onnx extra（图改写）。详见 xmetai_inference/perturbation/README.md。
+    weight_perturb: Any = None
+    # 确定性 ONNX -> 集合：潜空间 AR(1) 强迫规格（噪声的**时间相关**那条腿）。None = 不加；
+    # dict 见 perturbation.LatentForcingSpec（targets / sigma / tau_days / rank /
+    # length_scale / seed）。它不改权重，只给图加一个 `spw/xi` 输入，所以与 weight_perturb
+    # 正交、可叠加；成员之间的差别只来自 xi 的种子 -> 同一份图服务全部成员。
+    # 需要 onnx extra（图改写）。详见 xmetai_inference/perturbation/README.md 的 2M 节。
+    latent_forcing: Any = None
+    # 分段 rollout（E3）：把一条轨迹切成若干段，在段边界换一份**冻结**权重（= 换 sigma
+    # 或换一次抽样）。形如
+    #   [{"sigma_full": 0.0231, "steps": 20},
+    #    {"sigma_full": 0.0231, "steps": 20, "seed": 1}, ...]
+    # 各段 steps 之和必须等于 steps；配了 spw_segments 就必须同时配 weight_perturb。
+    # 解析、校验与段边界的定义见 perturbation.segments.parse_segment_plan。
+    # None = 不分段（默认，行为与以前逐位相同）。
+    spw_segments: Any = None
+    # 多进程 / 多卡调度（任务级动态认领）。dict 的键与含义见
+    # scheduling.SchedulingConfig：mode / procs_per_gpu / members_per_task /
+    # claim_order / resume / task_retries / max_passes / heartbeat_interval /
+    # heartbeat_timeout / task_ttl_seconds / prefetch_tasks / input_cache /
+    # poll_interval / monitor_interval / atomic_output / plan_dir。
+    # None = 全默认（claim + 1 进程/卡 + resume=outputs）。
+    scheduling: Any = None
+    # ONNX Runtime 运行旋钮（与调度无关，但同属「怎么跑」）：
+    # intra_op_threads：单 session 的算子并行线程数；0 = 自动（核数 / worker 数）。
+    # cudnn_algo_search："" = 后端默认 EXHAUSTIVE；HEURISTIC 能让「每卡多进程」时的
+    # 启动预热快很多（代价是每层卷积未必拿到最优 kernel）。
+    intra_op_threads: int = 0
+    cudnn_algo_search: str = ""
+    # resident_members：常驻 session 池的额度。扰动档的每个成员是一份独立权重（= 一个
+    # onnx session），逐成员装载建一次 session 不只读一遍权重，还要重新预热 cuDNN。
+    #   1  = 一换一放（缺省，小显存口径：任何时刻只驻留 1 份）；
+    #   N  = 最多驻留 N 份，第 N+1 份进来时按 LRU 换出最久没用过的那份；
+    #   -1 = 不限（全常驻）。
+    # 只在配了 weight_perturb 时有意义（latent_forcing 是一份 session 服务全部成员，
+    # 没有第二份可驻留）。实现见 backends/session_pool.py。
+    resident_members: int = 1
     # 数据源统一走 xmetai-core Dataset + torch DataLoader 批量读取。
     dataset: Any = None
     dataloader: Any = field(default_factory=dict)
@@ -159,6 +198,22 @@ class InferConfig:
             self.recurrent_processors,
             self.output_processors,
         )
+
+    def scheduling_config(self, overrides=None):
+        """config 的 scheduling dict（+ 命令行覆盖）-> SchedulingConfig。
+
+        命令行只覆盖三个日常要改的键（--schedule / --procs-per-gpu / --resume）；
+        其余一律以 config 为准 —— 它们是「这份配方怎么跑」的一部分，要和 times /
+        steps / members 一起进版本控制。
+        """
+        from xmetai_inference.scheduling import SchedulingConfig
+
+        config = SchedulingConfig.from_config(self.scheduling)
+        for key in ("mode", "procs_per_gpu", "resume"):
+            value = (overrides or {}).get(key)
+            if value is not None:
+                setattr(config, key, value)
+        return config.validate()
 
 
 def _resolve_config_path(value):

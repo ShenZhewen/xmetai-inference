@@ -5,8 +5,15 @@
 用途：改了代码之后再跑一遍，用这个确认「结果没变」或者「变了多少」。它**不需要
 实况数据**，纯粹是两份预测互比。
 
-匹配规则：按「起报目录 + 步序号 + 变量名」三者都相同才比。任一侧缺的部分跳过并
-在末尾列出 —— 所以谁的日期/步数少就以少的为准，不用手工对齐。
+匹配规则：
+    * 确定性输出（``{起报}/{步}.nc``）：按「起报 + 步序号 + 变量名」三者相同才比；
+    * 集合输出（``{起报}/member_<NNN>/{步}.nc``）：再加一层成员号，按「起报 + 成员
+      + 步序号 + 变量名」比，末尾另给一张**按成员汇总**表 —— 用来区分「全体成员一起
+      漂移」（浮点路径变了）和「只有一部分成员不同」（那批成员在两侧根本不是同一个
+      session 的第 k 次前向，例如旧的多卡静态切片会把各 rank 的第 k 条轨迹抽成同
+      一条噪声）。布局按「有没有 member_ 子目录」自动识别，两种走同一条判定路径。
+任一侧缺的部分跳过并在末尾列出 —— 所以谁的日期/步数/成员数少就以少的为准，不用
+手工对齐。
 
 容错为什么必要：数值等价的改动在 float32 下并不逐位相同。例如 FengQing 的残差
 反演由「反归一化→加残差→再归一化」化简成「归一化空间直接加 res_std/std」，两者
@@ -28,6 +35,7 @@ tp 这类大片为 0 的场靠 atol 兜底，z500/msl 这类 1e4~1e5 量级的�
     python util/compare_outputs.py DIR_A DIR_B --vars z500,t2m --steps 20
     python util/compare_outputs.py DIR_A DIR_B --rtol 1e-4 --quiet
     python util/compare_outputs.py DIR_A DIR_B --out /tmp/cmp    # 存 CSV
+    python util/compare_outputs.py 新输出 老输出                  # 集合输出也认，逐成员比
 
 退出码：0 = 全部 IDENTICAL 或 CLOSE；1 = 有 DRIFT 或 DIFFER；2 = 没有可比对象。
 所以可以直接用在脚本里：``python util/compare_outputs.py A B && echo 一致``
@@ -38,6 +46,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 from time import perf_counter
 
@@ -90,6 +99,72 @@ def _variables_in(path):
             for name in ds.data_vars
             if ds[name].ndim == 2
         }
+
+
+_MEMBER_PATTERN = re.compile(r"member_(\d+)$")
+
+
+def _discover_members(directory):
+    """member_<NNN>/ 子目录的成员号（确定性输出没有这一层，返回空表）。"""
+    found = []
+    if not os.path.isdir(directory):
+        return found
+    for name in os.listdir(directory):
+        match = _MEMBER_PATTERN.fullmatch(name)
+        if match and os.path.isdir(os.path.join(directory, match.group(0))):
+            found.append(int(match.group(1)))
+    return sorted(found)
+
+
+def _plan_pairs(root_a, root_b, init_dir, step_limit=None):
+    """一个起报目录的配对计划：[(成员号或 None, 步号, path_a, path_b)], skipped。
+
+    集合输出是 ``{起报}/member_<NNN>/{步号}.nc``（三层），确定性输出是
+    ``{起报}/{步号}.nc``（两层）。这里按「有没有 member_ 子目录」自动分流，对上层
+    完全透明：调用方只拿到配对清单，两种布局走同一条比对与判定路径。
+
+    只在一侧存在的成员整段跳过（绝不拿 A 的 member_007 去比 B 的 member_000），
+    只在一侧存在的步号同样跳过 —— 谁的成员/步数少就以少的为准。
+    """
+    dir_a = os.path.join(root_a, init_dir)
+    dir_b = os.path.join(root_b, init_dir)
+    members_a = _discover_members(dir_a)
+    members_b = _discover_members(dir_b)
+    skipped = []
+    pairs = []
+
+    def step_pairs(prefix, inner_a, inner_b):
+        """一层目录里的步号配对：[(步号, path_a, path_b)]，顺带记 skip。"""
+        steps_a = set(_discover_steps(inner_a))
+        steps_b = set(_discover_steps(inner_b))
+        for step in sorted(steps_a - steps_b):
+            skipped.append(("步", f"{prefix}/{step:03d}", "只在 A 侧"))
+        for step in sorted(steps_b - steps_a):
+            skipped.append(("步", f"{prefix}/{step:03d}", "只在 B 侧"))
+        common = sorted(steps_a & steps_b)
+        if step_limit is not None:
+            common = [value for value in common if value <= step_limit]
+        return [(step, os.path.join(inner_a, f"{step:03d}.nc"),
+                 os.path.join(inner_b, f"{step:03d}.nc")) for step in common]
+
+    if members_a or members_b:
+        for member in sorted(set(members_a) | set(members_b)):
+            name = f"member_{member:03d}"
+            if member not in members_a:
+                skipped.append(("成员", f"{init_dir}/{name}", "只在 B 侧"))
+                continue
+            if member not in members_b:
+                skipped.append(("成员", f"{init_dir}/{name}", "只在 A 侧"))
+                continue
+            inner = step_pairs(f"{init_dir}/{name}", os.path.join(dir_a, name),
+                               os.path.join(dir_b, name))
+            pairs.extend((member, step, path_a, path_b)
+                         for step, path_a, path_b in inner)
+        return pairs, skipped
+
+    pairs.extend((None, step, path_a, path_b)
+                 for step, path_a, path_b in step_pairs(init_dir, dir_a, dir_b))
+    return pairs, skipped
 
 
 def _classify(max_diff, ref_std, exceed_fraction):
@@ -217,12 +292,9 @@ def compare(root_a, root_b, requested_vars=None, step_limit=None,
     # 先数出总工作量，好在开跑前就把规模告诉用户（整年目录很容易上万对）
     total_pairs = 0
     for init_dir in common_inits:
-        steps_a = set(_discover_steps(os.path.join(root_a, init_dir)))
-        steps_b = set(_discover_steps(os.path.join(root_b, init_dir)))
-        common = steps_a & steps_b
-        if step_limit is not None:
-            common = {s for s in common if s <= step_limit}
-        total_pairs += len(common)
+        # 计数与实际比对共用同一份配对计划，否则进度与 ETA 的分母对不上。
+        pairs, _ = _plan_pairs(root_a, root_b, init_dir, step_limit)
+        total_pairs += len(pairs)
     if progress:
         print(f"共同起报 {len(common_inits)} 个，待比 {total_pairs} 对文件"
               f"{'（可用 --vars / --steps 缩小范围）' if total_pairs > 500 else ''}",
@@ -235,22 +307,9 @@ def compare(root_a, root_b, requested_vars=None, step_limit=None,
 
     rows = []
     for init_dir in common_inits:
-        dir_a = os.path.join(root_a, init_dir)
-        dir_b = os.path.join(root_b, init_dir)
-        steps_a = set(_discover_steps(dir_a))
-        steps_b = set(_discover_steps(dir_b))
-        for step in sorted(steps_a - steps_b):
-            skipped.append(("步", f"{init_dir}/{step:03d}", "只在 A 侧"))
-        for step in sorted(steps_b - steps_a):
-            skipped.append(("步", f"{init_dir}/{step:03d}", "只在 B 侧"))
-
-        common_steps = sorted(steps_a & steps_b)
-        if step_limit is not None:
-            common_steps = [s for s in common_steps if s <= step_limit]
-
-        for step in common_steps:
-            path_a = os.path.join(dir_a, f"{step:03d}.nc")
-            path_b = os.path.join(dir_b, f"{step:03d}.nc")
+        pairs, pairs_skipped = _plan_pairs(root_a, root_b, init_dir, step_limit)
+        skipped.extend(pairs_skipped)
+        for member, step, path_a, path_b in pairs:
             # 变量清单只在第一对文件上探测一次并缓存 —— 同一次运行里所有步的变量
             # 集合是一样的。原先每对都探测两次，加上后面 load 两次，等于每对文件
             # 开 4 次；整年目录（365 起报 × 60 步）下这就是 8.7 万次 NetCDF 打开。
@@ -288,6 +347,7 @@ def compare(root_a, root_b, requested_vars=None, step_limit=None,
                     fields_a[name], fields_b[name], lat_a, rtol, atol)
                 rows.append({
                     "init": init_dir,
+                    "member": member,
                     "step": step,
                     "var": name,
                     **metrics,
@@ -312,6 +372,8 @@ def _print_report(rows, skipped, quiet=False):
         return
     frame = pd.DataFrame(rows)
     order = {"IDENTICAL": 0, "CLOSE": 1, "DRIFT": 2, "DIFFER": 3}
+    # 只有集合输出才有成员维度；确定性输出那一列恒为 None，汇总时整列丢掉。
+    member_col = "member" in frame.columns and frame["member"].notna().any()
 
     # 每个变量取最坏一档 + 最大差异
     print("\n=== 按变量汇总（跨全部起报与步）===")
@@ -330,12 +392,27 @@ def _print_report(rows, skipped, quiet=False):
     per_var["最坏判定"] = per_var["最坏判定"].map(inv)
     print(per_var.to_string(index=False, float_format=lambda v: f"{v:.6g}"))
 
+    if member_col:
+        print("\n=== 按成员汇总（集合输出）===")
+        per_member = (
+            frame.assign(_rank=frame["verdict"].map(order))
+            .groupby("member", as_index=False)
+            .agg(最坏判定=("_rank", "max"),
+                 max_abs_diff=("max_abs_diff", "max"),
+                 超容差点占比=("exceed_frac", "max"),
+                 n=("member", "size"))
+            .sort_values(["最坏判定", "member"], ascending=[False, True])
+        )
+        per_member["最坏判定"] = per_member["最坏判定"].map(inv)
+        print(per_member.to_string(index=False, float_format=lambda v: f"{v:.6g}"))
+
     if not quiet:
         bad = frame[frame["verdict"].isin(["DRIFT", "DIFFER"])]
         if len(bad):
             print(f"\n=== DRIFT / DIFFER 明细（{len(bad)} 条，最多列 40）===")
-            cols = ["init", "step", "var", "verdict", "max_abs_diff",
-                    "diff_over_std", "exceed_frac", "nan_mismatch"]
+            cols = (["init"] + (["member"] if member_col else [])
+                    + ["step", "var", "verdict", "max_abs_diff",
+                       "diff_over_std", "exceed_frac", "nan_mismatch"])
             print(bad[cols].head(40).to_string(
                 index=False, float_format=lambda v: f"{v:.6g}"))
 

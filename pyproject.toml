@@ -26,6 +26,7 @@ zarr = [
 ]
 onnx = [
     "onnxruntime",
+    "onnx",          # 权重扰动（图内注入）需要改写 ONNX 图
 ]
 
 [project.scripts]
@@ -37,4 +38,5 @@ include = ["xmetai_inference*"]
 [tool.setuptools.package-data]
 "xmetai_inference" = [
     "weights/README.md",
+    "perturbation/README.md",
 ]

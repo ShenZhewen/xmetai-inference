@@ -84,6 +84,18 @@ class BaseInferModel(ABC):
     完整输出（state = result），与官方 inference.py 的 `new_input = model.run(...)` 一致。
     """
     backend = "base"
+    # 是否支持「确定性模型 -> 集合」的权重扰动注入（SPW）。ONNX 后端实现了两种机制：
+    # m3（图内随机算子，已定格为对照）与 m1a（逐成员冻结权重，主线）。见
+    # xmetai_inference/perturbation/README.md。
+    supports_weight_perturb = False
+
+    # ONNX Runtime 的运行旋钮（PT2 后端也带着，只是不用）。由 config 的
+    # intra_op_threads / cudnn_algo_search 经 create_model 落到实例上。
+    #   intra_op_threads：0 = 让后端自己决定（ORT 会给每个进程吃满物理核；本框架会
+    #     同时起多个 worker 进程，所以命令行会在启动期算成「核数 / worker 数」再传进来）。
+    #   cudnn_algo_search："" = 后端默认（EXHAUSTIVE）。
+    intra_op_threads = 0
+    cudnn_algo_search = ""
 
     # 落盘前做非负钳位的通道。原先 to_dataset 里硬编码 `if channel == "tp"`，
     # 那是模型语义写进了后端基类。做成类属性后各模型可自己声明；缺省 ("tp",)
@@ -100,6 +112,12 @@ class BaseInferModel(ABC):
         self.gpu_mem_fraction = gpu_mem_fraction
         self.processing = None
         self.data_source = None
+        # 权重扰动规格（config 的 weight_perturb）；None = 不加扰动。
+        # 只有声明 supports_weight_perturb=True 的后端会消费它。
+        self.weight_perturb = None
+        # 本实例代表哪个集合成员。m1a 靠它决定加载哪一份成员模型；m3 单会话多轨迹，
+        # 恒为 0。集合推理时由 cli 在每次 load 之前赋成本 rank 当前要跑的成员号。
+        self.member_index = 0
 
     def configure_processing(self, processing, data_source):
         """Bind the configured model processing recipe to this model."""
