@@ -37,6 +37,7 @@ import re
 
 import numpy as np
 
+from ._tab import write_table
 from .enscheck import (_dataset_dirs, _member_dirs, _pick_steps, _step_files,
                        _read_probe)
 
@@ -283,12 +284,11 @@ def analyse_run(root: str, *, var=None, init=None, steps_spec="all", stride: int
             "var": _picked_var, "inits": len(everything)}
 
 
-def write_csv(path: str, info: dict) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["step"] + list(FIELDS),
-                                extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(info["rows"])
+def write_curve_csv(path: str, info: dict) -> str:
+    """把一条标定曲线落成 CSV（列 = FIELDS；缺的键写空，多余的键丢掉）。"""
+    fields = ["step"] + list(FIELDS)
+    return write_table(path, fields,
+                       ([row.get(key, "") for key in fields] for row in info["rows"]))
 
 
 def load_csv(path: str) -> dict:
@@ -434,6 +434,6 @@ def run_spread(paths, *, var=None, init=None, steps_spec="all", stride: int = 1,
             targets = [osp.join(csv_out, osp.basename(info["root"].rstrip("\\/")) + ".csv")
                        for info in infos]
         for target, info in zip(targets, infos):
-            write_csv(target, info)
+            write_curve_csv(target, info)
             print(f"CSV -> {target}")
     return 0

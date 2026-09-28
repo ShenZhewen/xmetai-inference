@@ -266,12 +266,12 @@ def _assert_c_order(tensor, src_dir: str, array, name: str):
 # ---------------------------------------------------------------------------
 # 生成
 # ---------------------------------------------------------------------------
-def _noise_shape(shape, struct: str, block: int):
-    """按结构给出**独立抽样**的形状；用它广播/铺开就得到 ξ。
+def _noise_shape(shape, struct: str):
+    """按结构给出**独立抽样**的形状；用它广播就得到 ξ。
 
-    四种结构都保证每个元素 E[ξ]=0、Var(ξ)=1，所以 `σ^2 x ‖W‖^2` 的注入方差定律
-    与组间 energy 配平在四种结构下都成立 —— 这是「同预算、换结构」可比的前提。
-    ndim<2 的张量（bias / norm 权重 / dt_bias）在 channel/block 下退化为 iid：它们本来
+    三种结构都保证每个元素 E[ξ]=0、Var(ξ)=1，所以 `σ^2 x ‖W‖^2` 的注入方差定律
+    与组间 energy 配平在三种结构下都成立 —— 这是「同预算、换结构」可比的前提。
+    ndim<2 的张量（bias / norm 权重 / dt_bias）在 channel 下退化为 iid：它们本来
     就是逐通道的向量，再「按通道共享」就等于全张量共享一个 ξ —— 那种「整张量共享」已
     作为 scalar 结构单独实现（见 spec.NOISE_STRUCTS），不必靠 channel 的退化去近似。
     """
@@ -283,41 +283,31 @@ def _noise_shape(shape, struct: str, block: int):
         return shape
     if struct == "channel":
         return (shape[0],) + (1,) * (len(shape) - 1)
-    if struct == "block":
-        rows = shape[0]
-        cols = int(np.prod(shape[1:])) if len(shape) > 1 else 1
-        return ((rows + block - 1) // block, (cols + block - 1) // block)
     raise ValueError(f"未知的 noise_struct：{struct!r}")
 
 
-def _expand_noise(shape, struct: str, block: int, rng):
+def _expand_noise(shape, struct: str, rng):
     """按结构抽 ξ 并展开到 shape。"""
-    draw_shape = _noise_shape(shape, struct, block)
+    draw_shape = _noise_shape(shape, struct)
     if draw_shape == shape:
         return rng.standard_normal(shape)
-    if struct in ("channel", "scalar"):
-        return np.broadcast_to(rng.standard_normal(draw_shape), shape)
-    rows = shape[0]
-    cols = int(np.prod(shape[1:]))
-    tiled = np.repeat(np.repeat(rng.standard_normal(draw_shape), block, axis=0),
-                      block, axis=1)[:rows, :cols]
-    return tiled.reshape(shape)
+    return np.broadcast_to(rng.standard_normal(draw_shape), shape)
 
 
-def _draw(array, sigma: float, rng, struct: str = "iid", block: int = 8) -> np.ndarray:
+def _draw(array, sigma: float, rng, struct: str = "iid") -> np.ndarray:
     """W~ = W ⊙ (1 + σ ξ)。fp32 走 fp32 快路，其它 dtype 在 float64 上算再落回。
 
-    struct 决定 ξ 在张量内部的相关结构（见 spec.NOISE_STRUCTS）。四种结构的每元素方差都是 1，
+    struct 决定 ξ 在张量内部的相关结构（见 spec.NOISE_STRUCTS）。三种结构的每元素方差都是 1，
     所以它只改「能量注到哪些自由度」，不改「注入多少能量」。
     """
     base = np.asarray(array)
     if base.dtype == np.float32:
-        noise = _expand_noise(base.shape, struct, block, rng).astype(np.float32)
+        noise = _expand_noise(base.shape, struct, rng).astype(np.float32)
         out = base.astype(np.float32, copy=True)
         out *= (np.float32(1.0) + np.float32(sigma) * noise)
         return out
     work = base.astype(np.float64)
-    work *= (1.0 + float(sigma) * _expand_noise(base.shape, struct, block, rng))
+    work *= (1.0 + float(sigma) * _expand_noise(base.shape, struct, rng))
     return work.astype(base.dtype)
 
 
@@ -385,7 +375,7 @@ def _rebind_unperturbed(onnx, proto, base_map, selected):
 
 def _rewrite_member(onnx, proto, src_dir: str, member_dir: str, order, sigma_of,
                     seed: int, index: int, base_map, perturbed_name: str,
-                    struct: str = "iid", block: int = 8):
+                    struct: str = "iid"):
     """把 proto 里被选中的张量换成扰动后的值；外部数据写进成员目录的 perturbed.*.data。"""
     by_name = {tensor.name: tensor for tensor in proto.graph.initializer}
     _rebind_unperturbed(onnx, proto, base_map, set(order))
@@ -401,7 +391,7 @@ def _rewrite_member(onnx, proto, src_dir: str, member_dir: str, order, sigma_of,
             array = tensor_array(tensor, src_dir)
             _assert_c_order(tensor, src_dir, array, name)
             new = _draw(array, sigma_of[name], np.random.default_rng(child),
-                        struct=struct, block=block)
+                        struct=struct)
             raw = new.tobytes()
             if is_external:
                 del tensor.external_data[:]
@@ -536,7 +526,7 @@ def build_member_set(src_path: str, spec: WeightPerturbSpec, count: int, *,
         records, perturbed_bytes = _rewrite_member(
             onnx, proto, src_dir, set_dir, order, sigma_of,
             int(spec.seed or 0), index, base_map, perturbed_name,
-            struct=spec.noise_struct, block=spec.noise_block)
+            struct=spec.noise_struct)
         _stamp_member(onnx, proto, src_path, spec, index, sigmas, len(order), set_dir)
         out_path = member_model_path(src_path, spec, index, out_dir=out_dir)
         tmp = f"{out_path}.tmp{os.getpid()}"

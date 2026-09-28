@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""权重扰动的共享底座：选张量、配平、审计、外部数据。
+"""权重扰动的共享底座：选张量、配平、外部数据。
 
 **这里不再做注入**。注入只有一条实现，在 weights.py：逐成员按 W̃ = W ⊙ (1 + σξ) 算出
 每个成员的一套权重、落成一份普通的确定性 onnx（m1a，论文的主配置）。本模块留下的是两条
@@ -7,7 +7,6 @@
 
   * 选张量：key_parts / weight_like / group_alternatives / select_initializers
     —— 判定「什么算可学习参数」、按名字分组、并按 energy/count 配平（resolve_sigmas）；
-  * 审计：audit_model / reference_budget / structural_diff —— 静态核对注入后的图；
   * 外部数据：external_tensors / _repoint_external_data / _verify_external_refs
     —— 成员图对外只引用 base.data 与 perturbed.mNNN.data，不复制那 2.8 GB。
 
@@ -15,23 +14,21 @@
 口径，weights.py 直接复用同一套 Selection。
 
 （历史上这里还有第三条路 M3「图内随机算子」——插入 RandomNormalLike(W) 每次前向重抽。
-它 2026-09-23 被实测淘汰，代码已于 2026-09-24 删除；当时的审计/结构核对工具留了下来，
-用来复查磁盘上那批 m3 旧图。）
+它 2026-09-23 被实测淘汰，代码已于 2026-09-24 删除；当年为它留下的审计/结构核对工具
+（audit_model / reference_budget / structural_diff / find_source_for 与 `audit` 子命令）
+已于 2026-09-28 一并删除，M3 的结论与判据留在 README 的「M3 定格」一节。）
 """
 from __future__ import annotations
 
-import json
-import os
 import os.path as osp
 import re
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 from .spec import WeightPerturbSpec
 
-SPW_PREFIX = "spw/"
 _CHUNK = 1 << 22
 _FLOAT_DTYPES = ("FLOAT", "FLOAT16", "DOUBLE", "BFLOAT16")
 
@@ -180,20 +177,6 @@ def consumer_map(graph) -> dict[str, list[Any]]:
         for value in node.input:
             consumers.setdefault(value, []).append(node)
     return consumers
-
-
-def _attr(node, name, default=None):
-    for attribute in node.attribute:
-        if attribute.name == name:
-            return attribute
-    return default
-
-
-def _attr_float(node, name, default=1.0):
-    attribute = _attr(node, name)
-    if attribute is None:
-        return default
-    return float(attribute.f)
 
 
 def _match_pattern(parts: tuple[str, ...], patterns) -> str | None:
@@ -577,334 +560,3 @@ def resolve_effective_path(src_path: str, spec: WeightPerturbSpec | None,
     from .weights import resolve_member_path
 
     return resolve_member_path(src_path, spec, member_index)
-
-
-# ---------------------------------------------------------------------------
-# 审计与自检
-# ---------------------------------------------------------------------------
-def audit_model(path: str, *, reference: bool = True,
-                structural: bool = False) -> dict:
-    """静态审计一张注入后的图：每组的张量数、能量、σ 与实际注入方差。
-
-    `reference=True` 时再读一遍候选权重（外部数据走 memmap），算出「等效
-    σ_full = √(总注入方差 / 候选权重能量)」，用来核对配平是否符合预期。
-    `structural=True` 时再按 metadata 找回源图逐节点核对（structural_diff），
-    结果写进 report["structural"]；源图找不到只记一条说明，不算失败。
-    """
-    onnx = _onnx()
-    path = osp.abspath(path)
-    src_dir = osp.dirname(path)
-    model = load_model(path)
-    graph = model.graph
-    initializers = {tensor.name: tensor for tensor in graph.initializer}
-    groups: dict[str, dict] = {}
-    injected_total = 0.0
-    tensors = 0
-    for node in graph.node:
-        if node.op_type != "RandomNormalLike" or not node.name.startswith(SPW_PREFIX):
-            continue
-        source = node.input[0]
-        sigma = _attr_float(node, "scale", 1.0)
-        tensor = initializers.get(source)
-        if tensor is None:
-            continue
-        energy = tensor_energy(tensor, src_dir)
-        injected = sigma * sigma * energy
-        injected_total += injected
-        tensors += 1
-        key = key_parts(source)[0] if key_parts(source) else source
-        bucket = groups.setdefault(key, {"tensors": 0, "energy": 0.0, "variance": 0.0})
-        bucket["tensors"] += 1
-        bucket["energy"] += energy
-        bucket["variance"] += injected
-        bucket["sigma"] = max(bucket.get("sigma", 0.0), sigma)
-
-    report: dict[str, Any] = {
-        "path": path,
-        "injected_tensors": tensors,
-        "injected_variance": injected_total,
-        "groups": groups,
-        "metadata": {entry.key: entry.value for entry in model.metadata_props},
-    }
-    if reference:
-        report.update(reference_budget(
-            model, src_dir, report["metadata"].get("spw.spec_json")))
-        energy = report["reference_energy"]
-        report["sigma_full_effective"] = float(
-            np.sqrt(injected_total / energy) if energy else float("nan"))
-    if structural:
-        source, note = find_source_for(path)
-        report["source_check"] = note
-        if source:
-            report["structural"] = structural_diff(source, path)
-    return report
-
-
-def reference_budget(model, src_dir, spec_json=None) -> dict:
-    """参考口径：**候选权重**（weight_like 判定后、按组分配前的全部张量）的 ΣW²。
-
-    不能拿「所有浮点 initializer」当参考——mean/const/掩码这类烘焙常量不是权重，
-    但量级比权重高好几个数量级（FGVP 实测占全部浮点 ΣW² 的 99.99% 以上），混进来会
-    把「等效 σ_full」压成一个毫无意义的数。同时把被排除的那部分单列，让「默认排除
-    统计量/常量」这件事在审计里看得见、可核对。
-
-    spec_json 是注入时写进 metadata 的 spec.budgets()，靠它复现同一套过滤规则
-    （exclude / include / min_elements），避免审计与构建用了两套口径。
-    """
-    onnx = _onnx()
-    total_energy = 0.0
-    total_count = 0
-    for tensor in model.graph.initializer:
-        if tensor.name.startswith(SPW_PREFIX):
-            continue
-        if onnx.TensorProto.DataType.Name(tensor.data_type) not in _FLOAT_DTYPES:
-            continue
-        total_energy += tensor_energy(tensor, src_dir)
-        total_count += 1
-
-    spec = None
-    if spec_json:
-        try:
-            payload = json.loads(spec_json)
-        except ValueError:
-            payload = None
-        if isinstance(payload, dict):
-            payload.pop("groups", None)
-            # 旧图的 spec_json 是在机制字段还在的时候写的，可能带 rank_seed/noise_op 这类
-            # 已删除的键（它们现在是 budgets() 里冻结的字面量）。按当前字段集过滤，别让一个
-            # 多余的键把整条参考口径降级成「全权重默认」。
-            known = {item.name for item in fields(WeightPerturbSpec)}
-            try:
-                spec = WeightPerturbSpec(
-                    groups=("all",), **{k: v for k, v in payload.items() if k in known})
-            except TypeError:
-                spec = None
-    if spec is None:
-        spec = WeightPerturbSpec(groups=("all",))
-    try:
-        selection = select_initializers(model, spec, src_dir)
-        weight_energy = selection.candidate_energy
-        weight_tensors = len(selection.selected)
-    except ValueError:
-        weight_energy, weight_tensors = 0.0, 0
-    return {
-        "reference_energy": weight_energy,
-        "reference_tensors": weight_tensors,
-        "excluded_energy": max(total_energy - weight_energy, 0.0),
-        "excluded_tensors": max(total_count - weight_tensors, 0),
-    }
-
-
-def format_audit(report: dict) -> str:
-    lines = [f"模型：{report['path']}",
-             f"注入张量：{report['injected_tensors']} 个，总注入方差 {report['injected_variance']:.6g}"]
-    for key in sorted(report["groups"]):
-        bucket = report["groups"][key]
-        lines.append(
-            f"  组 {key:22s} 张量={bucket['tensors']:4d} σ={bucket.get('sigma', 0):.6g} "
-            f"ΣW^2={bucket['energy']:.6g} 注入方差={bucket['variance']:.6g}")
-    if "sigma_full_effective" in report:
-        lines.append(
-            f"参考（候选权重）：{report['reference_tensors']} 个张量，"
-            f"ΣW^2={report['reference_energy']:.6g}，"
-            f"等效 σ_full = {report['sigma_full_effective']:.6g}")
-    if report.get("excluded_tensors"):
-        total = report["reference_energy"] + report["excluded_energy"]
-        share = report["excluded_energy"] / total * 100.0 if total else 0.0
-        lines.append(
-            f"另有 {report['excluded_tensors']} 个非权重浮点张量（统计量/掩码/烘焙常量）"
-            f"占全部浮点 ΣW^2 的 {share:.2f}%，已排除")
-    if "source_check" in report:
-        lines.append("源图核对：" + report["source_check"])
-    if "structural" in report:
-        lines.extend(format_structural_diff(report["structural"]))
-    for key, value in sorted(report["metadata"].items()):
-        lines.append(f"  [{key}] {value}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# 源图结构核对：审计的硬证据
-# ---------------------------------------------------------------------------
-def _external_ref(tensor):
-    """外部数据引用（location/offset/length…）。原样不变 = 那 2.8 GB 没被碰过。"""
-    if not tensor.external_data:
-        return None
-    return tuple(sorted((entry.key, entry.value) for entry in tensor.external_data))
-
-
-def _node_signature(node):
-    return (
-        node.op_type,
-        node.name,
-        tuple(node.input),
-        tuple(node.output),
-        tuple(sorted((attribute.name, attribute.SerializeToString())
-                     for attribute in node.attribute)),
-    )
-
-
-def structural_diff(src_path, spw_path, *, max_examples: int = 6) -> dict:
-    """核对扰动图相对源图**只有注入这一种改动**。
-
-    做法：先把扰动图里每个 `spw/...../perturbed` 映射回它对应的权重名，然后要求除
-    `spw/` 前缀的节点外，两张图的节点逐一同名、同算子、同输入（映射后）、同输出、
-    同属性；initializer 的名字集合与外部数据引用（location/offset/length）也必须逐
-    位相同——后者是「没有复制或重写那 2.8 GB 权重」的直接证据。
-
-    为什么值得单独做一步：改图出错几乎全是静默的（扰动挂到了别的张量、顺手写坏了
-    某个节点、外部数据被重排），只看「注入张量数 = 888」根本看不出来。
-
-    返回 dict（ok / 各类计数 / 前若干条差异），供 audit 打印，也可直接当断言用。
-    """
-    src = load_model(src_path)
-    spw = load_model(spw_path)
-
-    rename: dict[str, str] = {}
-    injected: dict[str, str] = {}
-    for node in spw.graph.node:
-        if (node.op_type == "Mul" and node.name.startswith(SPW_PREFIX)
-                and node.name.endswith("/Mul")):
-            rename[node.output[0]] = node.input[0]
-            injected[node.input[0]] = node.output[0]
-
-    src_nodes = {node.name: node for node in src.graph.node}
-    problems: list[str] = []
-    matched = 0
-    spw_nodes = 0
-    extra_nodes = 0
-    for node in spw.graph.node:
-        if node.name.startswith(SPW_PREFIX):
-            spw_nodes += 1
-            continue
-        counterpart = src_nodes.get(node.name)
-        if counterpart is None:
-            extra_nodes += 1
-            if len(problems) < max_examples:
-                problems.append(f"扰动图多出节点 {node.name!r}（源图没有）")
-            continue
-        mapped = tuple(rename.get(value, value) for value in node.input)
-        signature = (node.op_type, node.name, mapped, tuple(node.output),
-                     tuple(sorted((attribute.name, attribute.SerializeToString())
-                                  for attribute in node.attribute)))
-        if signature != _node_signature(counterpart):
-            if len(problems) < max_examples:
-                problems.append(
-                    f"节点 {node.name!r} 与源图不一致：{signature[:4]} != "
-                    f"{_node_signature(counterpart)[:4]}")
-            continue
-        matched += 1
-
-    # 被扰动的权重必须只剩「它自己那个 Mul」一个消费者：这是「所有消费者都改接到了
-    # 扰动值」的等价说法，比逐个翻槽位省事，也不会漏掉被多处引用的权重。
-    consumers = consumer_map(spw.graph)
-    stale: list[str] = []
-    for name in injected:
-        users = consumers.get(name, [])
-        # 权重在扰动图里应当只剩两类消费者：自己的噪声节点（RandomNormalLike 会把
-        # W 当输入读形状）和自己的 Mul。除此之外还有引用，就说明有消费者没改接。
-        mul = [node for node in users
-               if node.op_type == "Mul" and node.name.startswith(SPW_PREFIX)]
-        stray = [node.name for node in users
-                 if not node.name.startswith(SPW_PREFIX)
-                 or node.op_type not in ("Mul", "RandomNormalLike", "RandomNormal")]
-        if len(mul) != 1 or stray:
-            stale.append(name)
-            if len(problems) < max_examples:
-                problems.append(
-                    f"权重 {name!r} 仍被非注入节点引用（消费者 {len(users)} 处，"
-                    f"可疑：{stray[:3]}）")
-
-    src_inits = {tensor.name: tensor for tensor in src.graph.initializer}
-    spw_inits = {tensor.name: tensor for tensor in spw.graph.initializer}
-    added = sorted(set(spw_inits) - set(src_inits))
-    dropped = sorted(set(src_inits) - set(spw_inits))
-    changed = sorted(
-        name for name, tensor in src_inits.items()
-        if name in spw_inits and (
-            tensor.data_type != spw_inits[name].data_type
-            or tuple(tensor.dims) != tuple(spw_inits[name].dims)
-            or _external_ref(tensor) != _external_ref(spw_inits[name])))
-    if dropped and len(problems) < max_examples:
-        problems.append(f"源图 initializer 丢了 {len(dropped)} 个：{dropped[:3]}")
-    if changed and len(problems) < max_examples:
-        problems.append(f"源图 initializer 被改了 {len(changed)} 个：{changed[:3]}")
-
-    return {
-        "ok": not problems,
-        "source": osp.abspath(src_path),
-        "perturbed": osp.abspath(spw_path),
-        "nodes_matched": matched,
-        "spw_nodes": spw_nodes,
-        "extra_nodes": extra_nodes,
-        "injected_tensors": len(injected),
-        "stale_weights": stale,
-        "added_initializers": added,
-        "dropped_initializers": dropped,
-        "changed_initializers": changed,
-        "problems": problems,
-    }
-
-
-def format_structural_diff(info: dict) -> list:
-    added = info["added_initializers"]
-    lines = [
-        f"结构核对：{info['nodes_matched']} 个原有节点与源图逐一对应，"
-        f"注入节点 {info['spw_nodes']} 个，多出节点 {info['extra_nodes']} 个",
-        f"  initializer：新增 {len(added)} 个（{', '.join(added[:4]) or '无'}），"
-        f"丢失 {len(info['dropped_initializers'])} 个，"
-        f"改动 {len(info['changed_initializers'])} 个",
-        (f"  权重引用：{info['injected_tensors']} 个被扰动张量都只剩自己的 Mul 一个消费者"
-         if not info["stale_weights"] else
-         f"  权重引用：{len(info['stale_weights'])} 个张量仍被别处引用"),
-    ]
-    for problem in info["problems"]:
-        lines.append(f"  !! {problem}")
-    lines.append("  结论：" + ("通过——除注入外，图与源图一致" if info["ok"]
-                             else "不通过，见上面的差异"))
-    return lines
-
-
-def find_source_for(spw_path: str, *, search_dirs=()):
-    """按 metadata 找回扰动图的源模型，并用指纹校验（指纹含源文件的 size+mtime）。
-
-    返回 (path | None, 说明)。指纹不一致时**故意不返回** path：宁可跳过结构核对，
-    也不拿一份别的权重去比对——那样会把「图改写正确」和「权重换过了」两件事混成
-    一个结论。
-    """
-    model = load_model(spw_path)
-    props = {entry.key: entry.value for entry in model.metadata_props}
-    source = props.get("spw.source")
-    fingerprint = props.get("spw.source_fingerprint")
-    if not source or not fingerprint:
-        return None, "扰动图缺少 spw.source / spw.source_fingerprint 元信息，跳过"
-
-    spec = None
-    payload = props.get("spw.spec_json")
-    if payload:
-        try:
-            data = json.loads(payload)
-            data.pop("groups", None)
-            spec = WeightPerturbSpec(**data)
-        except (ValueError, TypeError):
-            spec = None
-
-    candidates = [osp.join(osp.dirname(osp.abspath(spw_path)), source)]
-    for directory in search_dirs:
-        candidates.append(osp.join(directory, source))
-    if spec is not None and spec.cache_dir:
-        candidates.append(osp.join(spec.cache_dir, source))
-    env_dir = os.environ.get("XMETAI_SPW_CACHE_DIR")
-    if env_dir:
-        candidates.append(osp.join(env_dir, source))
-
-    for candidate in candidates:
-        if not osp.isfile(candidate):
-            continue
-        if spec is None:
-            return candidate, f"{candidate}（图内无 spec_json，未校验指纹）"
-        if spec.fingerprint(candidate) == fingerprint:
-            return candidate, f"{candidate}（指纹一致，源权重未变）"
-        return None, (f"{candidate} 的指纹与扰动图记录的不一致（源文件被替换或改动），"
-                      "跳过结构核对")
-    return None, f"没找到源图 {source}（找过 {len(candidates)} 个目录），跳过结构核对"

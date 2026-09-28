@@ -119,17 +119,10 @@ class InferConfig:
     # 解析、校验与段边界的定义见 perturbation.segments.parse_segment_plan。
     # None = 不分段（默认，行为与以前逐位相同）。
     spw_segments: Any = None
-    # 多进程 / 多卡调度（任务级动态认领）。dict 的键与含义见
-    # scheduling.SchedulingConfig：mode / procs_per_gpu / members_per_task /
-    # claim_order / resume / task_retries / max_passes / heartbeat_interval /
-    # heartbeat_timeout / task_ttl_seconds / prefetch_tasks / input_cache /
-    # poll_interval / monitor_interval / atomic_output / plan_dir。
-    # None = 全默认（claim + 1 进程/卡 + resume=outputs）。
-    scheduling: Any = None
-    # ONNX Runtime 运行旋钮（与调度无关，但同属「怎么跑」）：
-    # intra_op_threads：单 session 的算子并行线程数；0 = 自动（核数 / worker 数）。
-    # cudnn_algo_search："" = 后端默认 EXHAUSTIVE；HEURISTIC 能让「每卡多进程」时的
-    # 启动预热快很多（代价是每层卷积未必拿到最优 kernel）。
+    # ONNX Runtime 运行旋钮：
+    # intra_op_threads：单 session 的算子并行线程数；0 = 不设置（用 ORT 默认）。
+    # cudnn_algo_search："" = 后端默认 EXHAUSTIVE；HEURISTIC 能缩短启动预热
+    # （代价是每层卷积未必拿到最优 kernel）。
     intra_op_threads: int = 0
     cudnn_algo_search: str = ""
     # resident_members：常驻 session 池的额度。扰动档的每个成员是一份独立权重（= 一个
@@ -198,23 +191,6 @@ class InferConfig:
             self.recurrent_processors,
             self.output_processors,
         )
-
-    def scheduling_config(self, overrides=None):
-        """config 的 scheduling dict（+ 命令行覆盖）-> SchedulingConfig。
-
-        命令行只覆盖三个日常要改的键（--schedule / --procs-per-gpu / --resume）；
-        其余一律以 config 为准 —— 它们是「这份配方怎么跑」的一部分，要和 times /
-        steps / members 一起进版本控制。
-        """
-        from xmetai_inference.scheduling import SchedulingConfig
-
-        config = SchedulingConfig.from_config(self.scheduling)
-        for key in ("mode", "procs_per_gpu", "resume"):
-            value = (overrides or {}).get(key)
-            if value is not None:
-                setattr(config, key, value)
-        return config.validate()
-
 
 def _resolve_config_path(value):
     """解析外部配置路径或包内配置名。"""

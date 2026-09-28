@@ -23,11 +23,10 @@ Deterministic Machine-Learning Weather Models"（arXiv:2609.08412）。参数化
 """
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Sequence
+
+from ._specbase import SpecBase
 
 # 默认排除项：归一化统计量 + 烘焙进图的常量/掩码。它们不是可学习参数，而且量级
 # 远大于权重（FGVP 里一个 `mean` 就占全部候选 ΣW^2 的 96%，`const` 占 90% 量级的
@@ -47,14 +46,18 @@ BALANCE_MODES = ("energy", "count", "none")
 #   iid      逐元素独立（论文原式，我们的历史基线）
 #   channel  每个**输出通道**共享一个 xi（对 ndim>=2 的张量；ndim<2 退化为 iid）。
 #            「整通道一致」= 空间上均匀的一阶扰动，是权重空间里最接近「只有粗尺度」的做法
-#   block    张量按 (block x block) 分块，每块共享一个 xi（ndim<2 退化为 iid）
 #   scalar   整张量共享**一个** xi（向量也一样，不退化）。每个成员、每个被扰张量只有一个
 #            随机数，是随机自由度最少的极端：注入方差仍是 sigma^2 x ||W||^2（每元素
 #            E[xi^2]=1），但一个成员张成的扰动子空间秩 <= #被扰张量，所以 N 个成员给出的
 #            离散度**本身**就是高方差统计量（单个张量的注入方差比 = sigma^2 x chi^2_1）。
 #            它是「同预算、最小秩」的对照臂，也是论文 Phase 3 那类「噪声只落在少数自由度」
 #            在没有谱域可切时的另一种极端写法。
-NOISE_STRUCTS = ("iid", "channel", "block", "scalar")
+NOISE_STRUCTS = ("iid", "channel", "scalar")
+
+# 冻结的指纹键取值：`block` 结构（块边长 8）于 2026-09-28 删除，但当年用 channel 建出来的
+# 成员集（S2B 的 51 成员 / 76 GB）指纹里带着 "noise_block": 8，删键会让它们全部失配、
+# 被迫重新生成。所以 budgets() 仍按当年的固定值写这个键 —— 与 rank_seed / noise_op 同一个理由。
+NOISE_BLOCK_FROZEN = 8
 
 # m1a 成员集的**落盘格式版本**。凡是改动「成员图怎么写」（location 口径、落盘布局、噪声
 # 派生方式）就 +1：它进指纹，于是新版本必然落在新的成员集目录里，旧版本的产物不会被静默
@@ -71,7 +74,7 @@ MEMBER_FORMAT = 3
 
 
 @dataclass
-class WeightPerturbSpec:
+class WeightPerturbSpec(SpecBase):
     """一次 SPW 运行的注入规格。
 
     groups         选中的张量组；按名字路径分量做前缀匹配（`.` 与 `/` 等价），
@@ -96,13 +99,15 @@ class WeightPerturbSpec:
                    不按进程 rank 偏移——成员集是多卡共享的落盘产物，把 rank 叠进种子会让
                    各 rank 各造一份目录、并让相邻成员的随机流重叠。
     noise_struct   噪声在张量内部的相关结构，见 NOISE_STRUCTS。默认 "iid"（论文原式）。
-                   注意：四种结构的**每元素方差都是 1**，所以 sigma^2 * ||W||^2 的注入方差
-                   定律与组间 energy 配平在四种结构下都成立 —— 换结构不换预算。
-    noise_block    noise_struct="block" 时的块边长（默认 8）
+                   注意：三种结构的**每元素方差都是 1**，所以 sigma^2 * ||W||^2 的注入方差
+                   定律与组间 energy 配平在三种结构下都成立 —— 换结构不换预算。
     cache_dir      改写后的 .onnx 落盘目录；None = 与原模型同目录（外部数据引用最稳）
     members       要生成的成员数（0 = 由调用方从 config 的 members 取）
     member_dir     成员集落盘目录；None = 与原模型同目录（同 cache_dir 的优先级）
     """
+
+    #: from_config 的类型报错里用的名字（实现在 _specbase.SpecBase）
+    config_error = "weight_perturb"
 
     groups: Sequence[str] = ("all",)
     sigma_full: float = 0.01
@@ -113,7 +118,6 @@ class WeightPerturbSpec:
     min_elements: int = 64
     seed: int | None = None
     noise_struct: str = "iid"
-    noise_block: int = 8
     members: int = 0
     member_dir: str | None = None
     cache_dir: str | None = None
@@ -142,26 +146,8 @@ class WeightPerturbSpec:
             raise ValueError(
                 f"weight_perturb.noise_struct 只能是 {NOISE_STRUCTS}，"
                 f"实际 {self.noise_struct!r}")
-        if self.noise_block < 1:
-            raise ValueError(
-                f"weight_perturb.noise_block 必须 >= 1，实际 {self.noise_block}")
         if self.members < 0:
             raise ValueError("weight_perturb.members 不能为负")
-
-    @classmethod
-    def from_config(cls, value: Any) -> "WeightPerturbSpec | None":
-        """配置字段 -> 规格；None/False 表示不启用扰动。"""
-        if value is None or value is False:
-            return None
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            return cls(**dict(value))
-        if value is True:
-            return cls()
-        raise TypeError(
-            f"weight_perturb 应为 dict / WeightPerturbSpec / None，"
-            f"实际 {type(value).__name__}")
 
     def budgets(self) -> dict:
         """参与指纹与审计的字段（cache_dir 这类不影响结果的项不参与）。"""
@@ -180,31 +166,19 @@ class WeightPerturbSpec:
             # （S2B 的 51 成员 / 76 GB）全部失配，被迫重生成。取值就是它们当年的固定值。
             "rank_seed": False,
             "noise_op": "random_normal_like",
-            # noise_struct/noise_block 是后加的字段：**默认值不参与指纹**，否则既有成员集
-            # （F / prod 的 51 成员）会因为多出一个 "iid" 键而指纹改变、被迫整份重生成。
-            # 非默认值必须进来 —— 否则 channel/block 会命中 iid 的成员集目录，静默复用错权重。
-            **({"noise_struct": self.noise_struct, "noise_block": self.noise_block}
+            # noise_struct 是后加的字段：**默认值不参与指纹**，否则既有成员集（F / prod 的
+            # 51 成员）会因为多出一个 "iid" 键而指纹改变、被迫整份重生成。非默认值必须进来
+            # —— 否则 channel 会命中 iid 的成员集目录，静默复用错权重。
+            # noise_block 的取值走 NOISE_BLOCK_FROZEN（冻结键，见那里的说明）。
+            **({"noise_struct": self.noise_struct, "noise_block": NOISE_BLOCK_FROZEN}
                if self.noise_struct != "iid" else {}),
         }
 
-    def source_identity(self, src_path: str) -> dict:
-        """源模型身份：权重换了，缓存必须失效。"""
-        stat = os.stat(src_path)
-        return {
-            "source": os.path.basename(src_path),
-            "size": int(stat.st_size),
-            "mtime": int(stat.st_mtime),
-        }
-
-    def fingerprint(self, src_path: str) -> str:
-        payload = {
-            "spec": self.budgets(),
-            "source_identity": self.source_identity(src_path),
-            # 成员集是**落盘产物**，格式一旦变就必须换目录。见 MEMBER_FORMAT。
-            "member_format": MEMBER_FORMAT,
-        }
-        blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hashlib.sha1(blob).hexdigest()[:10]
+    def fingerprint_payload(self, src_path: str) -> dict:
+        payload = super().fingerprint_payload(src_path)
+        # 成员集是**落盘产物**，格式一旦变就必须换目录。见 MEMBER_FORMAT。
+        payload["member_format"] = MEMBER_FORMAT
+        return payload
 
     def describe(self) -> str:
         # 用 " | " 连接：单个 token 内部本来就可能含逗号（并集写法），再用逗号连接
@@ -213,9 +187,7 @@ class WeightPerturbSpec:
         amplitude = (f"sigma={self.sigma}" if self.sigma is not None
                      else f"sigma_full={self.sigma_full} (balance={self.balance})")
         extra = f" include={list(self.include)}" if self.include else ""
-        struct = "" if self.noise_struct == "iid" else (
-            f" noise_struct={self.noise_struct}"
-            + (f"(block={self.noise_block})" if self.noise_struct == "block" else ""))
+        struct = "" if self.noise_struct == "iid" else f" noise_struct={self.noise_struct}"
         return (f"groups={groups} {amplitude} exclude={list(self.exclude)}"
                 f"{extra}{struct}")
 

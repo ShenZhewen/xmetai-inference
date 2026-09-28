@@ -13,7 +13,7 @@ from Deterministic Machine-Learning Weather Models*, arXiv:2609.08412（2026）�
 
 | 代号 | 噪声住在哪一维 | 状态 |
 | --- | --- | --- |
-| **M3「图内随机算子」** | 图里插随机算子，**每次前向重抽**（= 论文的 refreshed-noise 变体） | **已淘汰（2026-09-23 定档），代码已于 2026-09-24 删除**。离散度只有 m1a 的 1/3-1/8、CRPS 差 23%；淘汰判据见 **2A** 节，那一节连同 `graph.py` 里剩下的审计/结构核对工具只用来复查磁盘上那批 m3 旧图 |
+| **M3「图内随机算子」** | 图里插随机算子，**每次前向重抽**（= 论文的 refreshed-noise 变体） | **已淘汰（2026-09-23 定档），代码已于 2026-09-24 删除**。离散度只有 m1a 的 1/3-1/8、CRPS 差 23%；淘汰判据见 **2A** 节（历史记录）。为它保留的审计 / 结构核对工具与磁盘上那张 m3 旧图已于 2026-09-28 一并删除 |
 | **M1a「逐成员冻结权重」** | 每个成员一套 `W ⊙ (1 + σξ)` 落盘，**整条轨迹冻结**（= 论文主配置） | **当前唯一机制**，见 **2B** 节 |
 
 两条路线共用同一条公式、同一套选组/配平/种子纪律、同一个 `WeightPerturbSpec`，差别只在
@@ -102,9 +102,9 @@ session 里连续 51 次前向天然拿到 51 条不同的扰动流（第 5 节�
 > `verify_session_variation` / `probe.sigma_scan`，以及 `mechanism` / `noise_op` /
 > `rank_seed` / `verify_on_load` 四个 spec 字段和 `build` / `verify` 两个子命令）。
 > 本节及下一小节的全部数字都是**当时跑出来的历史记录**，不要再试图复现：跑不出来了。
-> `graph.py` 里留下的 `audit_model` / `structural_diff` / `find_source_for` /
-> `reference_budget` 只用来**复查磁盘上那批 m3 旧图**（`perturbation ... audit` /
-> `structural` 两个子命令），不参与任何生产路径。
+> 当时为复查 m3 旧图留在 `graph.py` 的 `audit_model` / `structural_diff` /
+> `find_source_for` / `reference_budget`（`audit` 子命令）已于 2026-09-28 删除，
+> 磁盘上那张 m3 旧图也一并删掉 —— 这套工具从此没有服务对象。
 
 ### 做法
 
@@ -204,9 +204,8 @@ M3 的**选组 / 配平 / 逐张量独立种子 / 外部数据改写**全部被 
 >    / `_case_m1a`）。同一条断言换个注入路径跑，并不增加覆盖，只增加一份要跟着改的代码。
 >
 > 删掉的是**注入实现**；本节的全部数字、判据与诊断留着——它们是「为什么冻结是前提」的证据。
-> `graph.py` 里还留着 `audit_model` / `structural_diff` / `find_source_for` /
-> `reference_budget`（`audit` / `structural` 两个子命令），用途是**复查磁盘上那批 m3 旧图**，
-> 不参与生产路径。
+> 为复查 m3 旧图留在 `graph.py` 的 `audit_model` / `structural_diff` / `find_source_for` /
+> `reference_budget`（`audit` 子命令）也已在 2026-09-28 删除，磁盘上那张 m3 旧图一并删掉。
 
 ---
 
@@ -297,7 +296,7 @@ $P probe <onnx> --m1a-members 8 --provider cuda
 $P check /workspace/data/shenzw/fgvp_spw_m1a_test --steps all
 ```
 
-`members` 的参数与 `groups` / `audit` 同形（`--groups` / `--sigma` / `--sigma-full` /
+`members` 的参数与 `groups` 同形（`--groups` / `--sigma` / `--sigma-full` /
 `--balance` / `--exclude` / `--include` / `--min-elements` / `--out` / `--no-link` /
 `--verify`）。正常推理也可以不手动造：config 里配了 `weight_perturb` 时，
 `cli.py` 会在建 session 之前按 rank 分片自动把成员造出来（**加载路径本身不会替你造**：
@@ -3412,20 +3411,13 @@ $P groups model_artifacts/fgvp/iwc_fgvp_gdn2.onnx --top 12
 $P groups model_artifacts/fgvp/iwc_fgvp_gdn2.onnx --energy \
     --under latent_mixer.layers.0.blocks --depth 5 --top 20
 
-# 2) 生成 SPW 图（默认同目录、文件名带指纹）
-$P build  model_artifacts/fgvp/iwc_fgvp_gdn2.onnx --groups all --sigma-full 0.01
-
-# 3) 审计：每组 σ / 注入方差 / 等效 σ_full + 与源图的逐节点结构核对
-$P audit  model_artifacts/fgvp/iwc_fgvp_gdn2.spw-XXXXXXXXXX.onnx
-
-# 4) 真机自检：两次同输入前向必须不同（需要自定义算子库时带上 --ops-library）
-$P verify model_artifacts/fgvp/iwc_fgvp_gdn2.spw-XXXXXXXXXX.onnx \
-          --ops-library /workspace/tmp/douzsh/models/xmetai_onnx_plugins.so --provider cuda
+# 2)~4) build / audit / verify 都是 **M3** 的命令：build / verify 随 M3 于 2026-09-24 删除，
+#        audit 于 2026-09-28 删除。这里只留历史痕迹，已无法执行。
 ```
 
-上面 1)–4) 是 **M3** 的流程。**M1a 的主线流程**是：`self-test` / `e2e` 照跑，然后把
-「2) build 图」换成「造成员 + 直接推理」（`build` / `audit` / `verify` 都是 m3 专属，
-m1a 用 `members` / `probe` / `check`）：
+除 1) 之外，上面的流程都是 **M3** 专属，命令已全部删除。**M1a 的主线流程**是：`self-test` /
+`e2e` 照跑，然后把「build 图 + 审计」换成「造成员 + 直接推理」（m1a 用 `members` /
+`probe` / `check`）：
 
 ```bash
 # M1a：先把成员造出来（幂等，可先造 5 个再补到 51；清单会合并）
@@ -3518,7 +3510,7 @@ $P verdict F A32 A1 A32T1 A32T0 W32
 | `decoder_group` | 333 | 177.64M | 15.7% | 0.02521 |
 | `vae_encoder_group` | 345 | 180.79M | 7.9% | 0.03548 |
 
-`audit` 输出（σ_full=0.01、全部权重）：
+当年 `audit`（工具已删）的输出（σ_full=0.01、全部权重，历史记录）：
 
     注入张量：888 个，总注入方差 45.9257
       组 latent_mixer          张量= 210 σ=0.01 ΣW^2=350541  注入方差=35.0541
@@ -3702,9 +3694,9 @@ xmetai-infer --model fgvp_spw_prod_s2b
 不需要实况）：成员内容是否有逐位重复（uniq vs 成员数）、离散度是否后 1/3 至少是前 1/3 的
 1.05 倍、有无 NaN/Inf、各成员步数是否一致。有真实产物就优先看这个 —— 坑 1 只看它才露头。
 
-`$P audit <spw.onnx>` 会打印组 σ、注入方差、候选口径的等效 σ_full、被排除张量的能量占比，
-并按 `spw.source` + 指纹**找回源图做逐节点核对**（指纹含源文件 size+mtime，源权重换过就会
-拒绝核对，而不是给出错误结论）。审计通过时退出码 0，结构核对不通过时非 0。
+`$P audit <spw.onnx>` 曾打印组 σ、注入方差、候选口径的等效 σ_full、被排除张量的能量占比，
+并按 `spw.source` + 指纹找回源图做逐节点核对。**该子命令已于 2026-09-28 随 M3 一并删除**
+（它只对 M3 的图内随机算子图有意义；成员图没有图内噪声节点，对它本来就不适用）。
 
 ---
 
@@ -3749,18 +3741,20 @@ xmetai-infer --model fgvp_spw_prod_s2b
 
 | 文件 | 作用 |
 | --- | --- |
-| `spec.py` | `WeightPerturbSpec`：选组 / σ / 配平 / 排除 / 包含 / 种子 / 噪声算子 / **噪声结构**（`NOISE_STRUCTS` = `iid` / `channel` / `block` / `scalar`）/ **机制**（`m3` / `m1a`）/ 缓存与指纹 |
-| `graph.py` | **M3** 图改写核心：选张量 `select_initializers`、配平 `resolve_sigmas`、注入 `inject_perturbation`、建图 `build_perturbed_model`、审计 `audit_model`、结构核对 `structural_diff`、随机性自检 `verify_session_variation`；另有两种机制的统一分流 `resolve_effective_path` |
-| `weights.py` | **M1a** 落盘核心：`build_member_set`（可按 `indices` 分片生成）、`verify_member_set`（逐成员复核 + 权重级 σ 实测）、`member_model_path` / `resolve_member_path`、清单合并 `_merge_manifest`、C 序自检 `_assert_c_order`；噪声形状 `_noise_shape` / `_expand_noise` 实现四种 `noise_struct` |
+| `spec.py` | `WeightPerturbSpec`：选组 / σ / 配平 / 排除 / 包含 / 种子 / **噪声结构**（`NOISE_STRUCTS` = `iid` / `channel` / `scalar`；`block` 于 2026-09-28 删除）/ 缓存与指纹 |
+| `_specbase.py` | 两个 spec 类（`WeightPerturbSpec` / `LatentForcingSpec`）的公共样板：`from_config`（配置字段 -> 规格）、`source_identity`（源文件 size+mtime）、`fingerprint`（sha1 载荷）。指纹决定落盘目录名，抽出来的必须是**同一段代码**，所以按类不同的部分走 `config_error` / `fingerprint_payload` 两个钩子 |
+| `graph.py` | 两条路径共用的底座：选张量 `select_initializers` / `weight_like` / `key_parts` / `group_alternatives`、配平 `resolve_sigmas`、外部数据 `external_tensors` / `_verify_external_refs`、框架侧分流 `resolve_effective_path`（M3 的注入与审计工具已随 M3 删除） |
+| `weights.py` | **M1a** 落盘核心：`build_member_set`（可按 `indices` 分片生成）、`verify_member_set`（逐成员复核 + 权重级 σ 实测）、`member_model_path` / `resolve_member_path`、清单合并 `_merge_manifest`、C 序自检 `_assert_c_order`；噪声形状 `_noise_shape` / `_expand_noise` 实现三种 `noise_struct` |
 | `segments.py` | **分段 rollout**（E3）的纯逻辑层：`Segment` / `SegmentPlan`（`specs()` / `switch_after()`）、`parse_segment_plan`（预算 / 继承 / 键名 / 段长校验，含 7 类错例） |
 | `probe.py` | 探针：量「输出级相对离散度 / σ」是否线性、逐成员是否互相独立——不必跑完整推理（`$P probe`） |
-| `selftest.py` | 合成图上的断言集（含成员权重的冻结语义、扁平布局与 base 只复制一次、分片生成、成员集目录不随 rank 变、group token 的并集写法与「并集 1 份 / 拆开 N 份」的预算守恒、四种 `noise_struct` 的同预算对照、`spw_segments` 的预算 / 继承 / 段边界与错例拦截、**潜空间 AR(1) 强迫**的基正交 / 无 DC / 隐含 σ / ρ 与实测 lag-1 一致 / 同 ξ 两次逐位相同 / member×槽位×rank 独立） |
+| `selftest.py` | 合成图上的断言集（含成员权重的冻结语义、扁平布局与 base 只复制一次、分片生成、成员集目录不随 rank 变、group token 的并集写法与「并集 1 份 / 拆开 N 份」的预算守恒、三种 `noise_struct` 的同预算对照、`spw_segments` 的预算 / 继承 / 段边界与错例拦截、**潜空间 AR(1) 强迫**的基正交 / 无 DC / 隐含 σ / ρ 与实测 lag-1 一致 / 同 ξ 两次逐位相同 / member×槽位×rank 独立） |
 | `e2e.py` | 端到端预检：真实框架路径下 N 个成员是否互不相同、成员是否各自冻结且互相独立、cli 编排是否落对 `member_NNN/`、**分段 rollout 的段边界**（边界前逐位相同 / 边界后全不同 / 每成员 load K 次）（`$P e2e`） |
 | `enscheck.py` | 产物体检：读真实 member_XXX/ 输出目录，判成员是否互不相同、离散度是否随时效增长（`$P check <out>`） |
 | `spread.py` | **标定口径**曲线：σ̂ / 大尺度 σ̂ / σ̂-rmse 比 / k<=20 占比 / k50 / 纬向分量 / 涡动相关 / 域均值离散度，多输入给对比表（`$P spread <out> ...`）；`--members 0-5 / first:6 / last:6` 在同一份产物上抽成员子集，用来量「成员数把 σ̂ 带偏了多少」） |
 | `verdict.py` | **判决页**（零推理、零 GPU）：读 v2 评测归档，算 `r(lead)` / `k(lead) = r^(1/p(lead))` / 带功率相对值 / 基准臂缺口 ↔ 需要的 `k`，出「判负 / 选择性 / 整体锐化」的一句话判决与六节表格（`$P verdict F S T V E3`） |
+| `_tab.py` | 两个 writer（`spread.write_curve_csv` / `verdict.write_profile_csv`）共用的 CSV 样板：开文件 + 写表头 + 写行；行的构造各自实现 |
 | `latent.py` | **潜空间 AR(1) 强迫**（第二条腿：噪声的**时间相关**）：目标解析 `resolve_targets`、布局探测 `detect_layout`、基构造 `build_basis`（通道正交 + 空间低通去 DC）、图内注入 `inject_forcing`、改图 `build_forcing_model`、驱动侧递推 `Ar1Driver`、审计 `audit_forcing`、自相关实测 `lag1_autocorr`（`$P latent build` / `$P latent audit`，见 2N 节） |
-| `__main__.py` | CLI：`groups` / `build` / `audit` / `verify` / `members` / `probe` / `self-test` / `e2e` / `check` / `spread` / `verdict` / `latent` |
+| `__main__.py` | CLI：`groups` / `members` / `probe` / `self-test` / `e2e` / `check` / `spread` / `verdict` / `latent` |
 | `../configs/fgvp_spw_ab.py` | **A/B 协议**：`SPW_AB` 选变体（A-D 第一轮、E-H 第二轮已跑完；**T/S/V = 第三轮：同预算只换注入结构**、**E3 = 第四轮：分段 rollout**；I..M 已删）。`SPW_AB=A` 即原 M1a 基线入口 |
 | `../configs/fgvp_spw_prod_s2b.py` | **生产跑（S2B 配方）**：A/B 的 S2B 臂放大到 51 成员 / 9 起报（`latent_mixer` + channel + σ_full=0.027，见文件头）。**取代了原 `fgvp_spw_prod.py`（F 配方，已于 2026-09-24 删除；协议存档见 2F 节）** |
 | `../configs/fgvp_ar1.py` | **潜空间 AR(1) 强迫的 5 个臂**（`SPW_AR1=A32\|A1\|A32T1\|A32T0\|W32`，见 **2N.5**；其余照抄 F，`W32` 复用 F 的成员集） |

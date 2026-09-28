@@ -31,6 +31,11 @@ from .spec import WeightPerturbSpec
 # ---------------------------------------------------------------------------
 def make_session(model_path: str, *, provider: str = "cpu", device: int = 0,
                  ops_library: str | None = None):
+    """建 session 的**唯一**实现：探针 / 自检 / e2e 都走这里。
+
+    `enable_mem_pattern=False` 与「日志只报 error」是共同的硬要求（探针要干净输出，
+    自检的合成图里还有故意留的无消费者张量）；provider 与自定义算子按需加。
+    """
     import onnxruntime as ort
 
     options = ort.SessionOptions()

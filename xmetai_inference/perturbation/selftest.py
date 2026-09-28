@@ -13,8 +13,8 @@
      Var(W'-W) = sigma^2*||W||^2（这是 sigma 无量纲、组间按能量配平的前提）；
   3. 选择集：mean / const / 掩码 / 非浮点 / 无消费者 / 过小的张量确实没被扰动，
      哪一条规则把它挡下来的都记在 skipped 里，一并断言；
-  4. 噪声结构：iid / 逐通道 / 分块 / 标量四种结构的抽样形状、行与块的常数性、
-     标量只抽一个 xi，以及四种结构下的方差定律都成立；
+  4. 噪声结构：iid / 逐通道 / 标量三种结构的抽样形状、行内常数性、标量只抽一个 xi，
+     以及三种结构下的方差定律都成立；
   5. 流独立性：同一张图里不同张量的噪声流不相关（共用一条流会把整个模型退化成
      rank-1 方向扰动）；
   6. M1a：逐成员冻结权重落盘——成员目录自包含、成员之间不同、**成员内两次前向逐位
@@ -247,13 +247,9 @@ def _write_probe(path, *, count=1, size=256, seed=1):
 
 def _session(path):
     """建一个可反复 run 的 session（模拟「一个 rank = 一个进程 = 一个 session」）。"""
-    import onnxruntime as ort
+    from .probe import make_session
 
-    options = ort.SessionOptions()
-    options.enable_mem_pattern = False
-    options.log_severity_level = 3
-    return ort.InferenceSession(path, sess_options=options,
-                                providers=["CPUExecutionProvider"])
+    return make_session(path)
 
 
 def _write_weight_passthrough(path, *, size=256, seed=1):
@@ -306,16 +302,11 @@ def _feeds(seed=0):
 
 
 def _run(path, feeds):
-    import onnxruntime as ort
+    from .probe import make_session
 
-    options = ort.SessionOptions()
-    options.enable_mem_pattern = False
     # 合成图故意留了「无消费者」的 initializer 来测跳过规则，ORT 会逐条告警；
-    # 自检的输出只需要我们自己的断言结果，这里把 ORT 的日志压掉。
-    options.log_severity_level = 3
-    session = ort.InferenceSession(path, sess_options=options,
-                                   providers=["CPUExecutionProvider"])
-    return session.run(None, feeds)
+    # 自检的输出只需要我们自己的断言结果，make_session 已把日志压到只报 error。
+    return make_session(path).run(None, feeds)
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +408,7 @@ def _case_noise_struct(work, check):
 
     为什么要单独测：结构化噪声的全部意义在于「同预算、换结构」。如果它顺手把注入方差
     也改了，那就变成了又一次 σ 扫描，前面 A/B 的结论一个都用不上。所以「独立样本数」、
-    「每元素方差」、「块内常数性」、「方差定律」四条都要钉死。纯数值，不需要 onnx。
+    「每元素方差」、「行内常数性」、「方差定律」四条都要钉死。纯数值，不需要 onnx。
     """
     from .weights import _draw, _noise_shape
 
@@ -425,13 +416,12 @@ def _case_noise_struct(work, check):
     want = {
         "iid": (12, 5, 3, 3),           # 逐元素独立
         "channel": (12, 1, 1, 1),       # 每个输出通道一个
-        "block": ((12 + 3) // 4, (45 + 3) // 4),   # (3, 12)：按 (out, in*kh*kw) 摊平后分块
         "scalar": (1, 1, 1, 1),                     # 整张量只有**一个**随机数
     }
     for struct in NOISE_STRUCTS:
-        got = _noise_shape(shape, struct, 4)
+        got = _noise_shape(shape, struct)
         check(got == want[struct],
-              f"[{struct}] 独立样本数正确（iid 逐元素 / channel 逐通道 / block 逐块）",
+              f"[{struct}] 独立样本数正确（iid 逐元素 / channel 逐通道 / scalar 整张量）",
               f"got={got} want={want[struct]}")
 
     # 因子 1：每元素 E[xi]=0、Var(xi)≈1 —— 所有结构都必须成立（这才叫「同预算」）
@@ -444,7 +434,7 @@ def _case_noise_struct(work, check):
         squares = np.zeros(shape)
         draws = 4000 if struct == "scalar" else 200
         for _ in range(draws):
-            noise = _draw(np.ones(shape), 1.0, rng, struct=struct, block=4) - 1.0
+            noise = _draw(np.ones(shape), 1.0, rng, struct=struct) - 1.0
             acc += noise
             squares += noise ** 2
         mean = acc / draws
@@ -456,12 +446,11 @@ def _case_noise_struct(work, check):
               f"[{struct}] 每元素方差 ≈ 1（注入方差定律的前提）",
               f"var={float(var.mean()):.4g}")
 
-    # 因子 2：结构本身 —— channel 逐行常数、block 块内常数、iid 两者都不是
+    # 因子 2：结构本身 —— channel 逐行常数、iid 不是
     rng = np.random.default_rng(11)
     ones = np.ones(shape)
     iid = _draw(ones, 1.0, rng, struct="iid") - 1.0
     chan = _draw(ones, 1.0, rng, struct="channel") - 1.0
-    blk = _draw(ones, 1.0, rng, struct="block", block=4) - 1.0
     scal = _draw(ones, 1.0, rng, struct="scalar") - 1.0
 
     def row_scatter(a):
@@ -489,32 +478,16 @@ def _case_noise_struct(work, check):
           "[scalar] 与 channel 不同：channel 逐行各异，scalar 连行间也相同",
           f"两者最大偏离={float(np.abs(scal - chan).max()):.3g}")
 
-    flat = blk.reshape(shape[0], -1)                    # (12, 45)
-    # 块网格是 ceil(12/4) x ceil(45/4) = 3 x 12；最后一列块只剩 1 列（44），所以「块内常数」
-    # 只能在完整的 4 列上验，而「各块不同」可以把 36 个块全算上。
-    corners = [(a, b) for a in (0, 4, 8)
-               for b in (0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44)]
-    full = [(a, b) for a, b in corners if b + 4 <= flat.shape[1]]
-    ok_blocks = all(float(np.abs(flat[a:a + 4, b:b + 4] - flat[a, b]).max()) == 0.0
-                    for a, b in full)
-    check(ok_blocks,
-          "[block] 每个 4x4 块内 ξ 完全相同（块边长 4、张量按 (out, in*kh*kw) 摊平）",
-          f"{len(full)} 个完整块")
-    values = [float(flat[a, b]) for a, b in corners]
-    check(len(set(values)) == len(values),
-          "[block] 每个块有自己独立的 xi（没有两块共用同一个值）",
-          f"{len(values)} 个块，{len(set(values))} 个不同值")
-
     # 因子 3：方差定律在所有结构下都成立 —— 这是「同预算」的操作定义
     w = np.random.default_rng(3).standard_normal((64, 32))
     for struct in NOISE_STRUCTS:
         sigma = 0.05
-        # 同样是自由度问题：iid/channel/block 一次抽样就有上千个独立元素，40 次平均已经
+        # 同样是自由度问题：iid/channel 一次抽样就有上千个独立元素，40 次平均已经
         # 远超需要；scalar 一次只有一个随机数，40 次的相对误差 ~22%（相对 ±30% 的带就是
         # 1.4 sigma），所以它抽 400 次（~7%）。
         draws = 400 if struct == "scalar" else 40
-        ratios = [float(np.sum((_draw(w, sigma, np.random.default_rng(s), struct=struct,
-                                      block=8) - w) ** 2) / np.sum(w ** 2))
+        ratios = [float(np.sum((_draw(w, sigma, np.random.default_rng(s),
+                                      struct=struct) - w) ** 2) / np.sum(w ** 2))
                   for s in range(draws)]
         measured = float(np.mean(ratios))
         check(0.7 < measured / sigma ** 2 < 1.4,
@@ -1444,7 +1417,7 @@ def _case_latent(work, check):
 CASES = (
     ("无损改写（sigma->0 与源权重逐位相同）", _case_equivalence),
     ("扰动冻结与注入方差定律", _case_randomness),
-    ("噪声结构（iid / channel / block / scalar 同预算）", _case_noise_struct),
+    ("噪声结构（iid / channel / scalar 同预算）", _case_noise_struct),
     ("流独立性（同图内不同张量不相关）", _case_stream_independence),
     ("选择集与跳过原因", _case_selection),
     ("M1a 逐成员冻结权重落盘", _case_m1a),

@@ -18,8 +18,9 @@
 `members` 造完之后直接 `xmetai-infer --model <config>` 即可（配置里写 weight_perturb，
 框架会按成员号自己换路径）。
 
-`audit` 留在这里只是为了复查磁盘上那批**旧图内随机算子图**（该机制 2026-09-23 淘汰、
-2026-09-24 删码）；成员图没有图内噪声节点，audit 对它没有意义。
+`audit` 子命令与它依赖的审计 / 结构核对工具（`audit_model` / `structural_diff` /
+`find_source_for` / `reference_budget`）已于 2026-09-28 删除：它们只服务于 2026-09-23 淘汰的
+M3「图内随机算子」旧图，而磁盘上那张 m3 旧图也已一并删掉；成员图本来就没有图内噪声节点。
 """
 from __future__ import annotations
 
@@ -33,8 +34,6 @@ from .graph import (
     _FLOAT_DTYPES,
     _onnx,
     consumer_map,
-    audit_model,
-    format_audit,
     key_parts,
     load_model,
     tensor_energy,
@@ -155,32 +154,6 @@ def _cmd_groups(args) -> int:
           " `groups`。\n扫子组用：--under <前缀> --depth <级数>；权重名被导出器拍平的图会走"
           "消费者节点名前缀匹配。")
     return 0
-
-
-def _cmd_audit(args) -> int:
-    report = audit_model(args.model, reference=not args.no_reference,
-                         structural=not args.no_structural)
-    if args.json:
-        import json
-
-        payload = {
-            "path": report["path"],
-            "injected_tensors": report["injected_tensors"],
-            "injected_variance": report["injected_variance"],
-            "sigma_full_effective": report.get("sigma_full_effective"),
-            "reference_energy": report.get("reference_energy"),
-            "groups": report["groups"],
-            "excluded_tensors": report.get("excluded_tensors"),
-            "excluded_energy": report.get("excluded_energy"),
-            "source_check": report.get("source_check"),
-            "structural": report.get("structural"),
-            "metadata": report["metadata"],
-        }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        print(format_audit(report))
-    structural = report.get("structural")
-    return 1 if structural is not None and not structural["ok"] else 0
 
 
 def _cmd_self_test(args) -> int:
@@ -390,14 +363,6 @@ def main(argv=None) -> int:
                              "并把桶从它的下一级开始列 —— 注入点的细粒度扫描")
     groups.set_defaults(func=_cmd_groups)
 
-    audit = sub.add_parser("audit", help="静态审计注入后的图（组/σ/注入方差/等效 σ_full）")
-    audit.add_argument("model")
-    audit.add_argument("--no-reference", action="store_true",
-                       help="不读全部权重，跳过「等效 σ_full」那一项")
-    audit.add_argument("--json", action="store_true")
-    audit.add_argument("--no-structural", action="store_true",
-                       help="跳过与源图的逐节点结构核对（默认做）")
-    audit.set_defaults(func=_cmd_audit)
 
     self_test = sub.add_parser(
         "self-test", help="在合成小图上自检：σ→0 无损 / 注入方差定律 / 外部数据不被复制")

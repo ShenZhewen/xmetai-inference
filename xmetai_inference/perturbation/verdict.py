@@ -32,11 +32,12 @@ p(lead) 是 sigma 的响应指数，默认取 2L.4 的实测表（B: sigma_full=
 """
 from __future__ import annotations
 
-import csv
 import json
 import math
 import os
 import os.path as osp
+
+from ._tab import write_table
 
 DEFAULT_BASE = os.environ.get("SPW_EVAL_BASE", "D:\\xmetai-evaluation-result")
 DEFAULT_PREFIX = "weather_rmse_ens_spw_"
@@ -438,17 +439,16 @@ def format_page(names, facts, curves, bands, p_table, p_source, var,
     return "\n".join(lines), summary, needs
 
 
-def write_csv(path, names, curves, p_table):
-    with open(path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["arm", "lead_h", "p", "spread", "r", "k"])
-        ref = names[0]
-        for name in names[1:]:
-            for row in k_profile(curves[name]["spread"], curves[ref]["spread"], p_table):
-                writer.writerow([name, row["lead"], "%.6f" % row["p"],
-                                 "%.6f" % float(curves[name]["spread"].get(row["lead"], float("nan"))),
-                                 "%.6f" % row["r"], "%.6f" % row["k"]])
-    return path
+def write_profile_csv(path, names, curves, p_table):
+    """把 r/k 剖面落成 CSV：一行 = (臂, 时效, p, spread, r, k)。"""
+    rows = []
+    ref = names[0]
+    for name in names[1:]:
+        for row in k_profile(curves[name]["spread"], curves[ref]["spread"], p_table):
+            rows.append([name, row["lead"], "%.6f" % row["p"],
+                         "%.6f" % float(curves[name]["spread"].get(row["lead"], float("nan"))),
+                         "%.6f" % row["r"], "%.6f" % row["k"]])
+    return write_table(path, ["arm", "lead_h", "p", "spread", "r", "k"], rows)
 
 
 def run_verdict(arms, *, base=DEFAULT_BASE, prefix=DEFAULT_PREFIX, dirs=None, ref=None,
@@ -508,5 +508,5 @@ def run_verdict(arms, *, base=DEFAULT_BASE, prefix=DEFAULT_PREFIX, dirs=None, re
                                          daily=daily, days=days, check=check)
     print(page)
     if out_csv:
-        print("\nCSV -> " + write_csv(out_csv, names, curves, p_table))
+        print("\nCSV -> " + write_profile_csv(out_csv, names, curves, p_table))
     return 0

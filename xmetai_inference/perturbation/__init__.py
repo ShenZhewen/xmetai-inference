@@ -19,12 +19,11 @@
   * 配置面：configs/*.py 里的 `weight_perturb={...}`（见 spec.WeightPerturbSpec）
   * 命令行：
       python -m xmetai_inference.perturbation groups  <onnx>   # 看候选张量组
-      python -m xmetai_inference.perturbation audit   <onnx>   # 静态审计 + 配平后 σ
       python -m xmetai_inference.perturbation members <onnx>   # 落盘成员集
       python -m xmetai_inference.perturbation probe   <onnx>   # 探针：量离散度随风向
       python -m xmetai_inference.perturbation latent build <onnx> --tau-days 3 --length-scale 32
       python -m xmetai_inference.perturbation latent audit <onnx.ar1-xxxxxxxxxx.onnx>
-      python -m xmetai_inference.perturbation structural|check|self-test|e2e
+      python -m xmetai_inference.perturbation check|self-test|e2e
   * 代码面：spec.WeightPerturbSpec / graph.resolve_effective_path / weights.build_member_set
     / segments.parse_segment_plan（分段 rollout：段边界换权重，config 的 spw_segments）
     / latent.LatentForcingSpec + latent.resolve_stack_path（潜空间 AR(1)，config 的
@@ -35,15 +34,7 @@
 详见包内 README.md。
 """
 from .spec import DEFAULT_EXCLUDE, NOISE_STRUCTS, WeightPerturbSpec
-from .graph import (
-    SPW_PREFIX,
-    audit_model,
-    find_source_for,
-    reference_budget,
-    resolve_effective_path,
-    select_initializers,
-    structural_diff,
-)
+from .graph import (resolve_effective_path, select_initializers)
 from .latent import (
     Ar1Driver,
     LatentForcingSpec,
@@ -78,17 +69,14 @@ __all__ = [
     "DEFAULT_EXCLUDE",
     "LatentForcingSpec",
     "NOISE_STRUCTS",
-    "SPW_PREFIX",
     "Segment",
     "SegmentPlan",
     "WeightPerturbSpec",
     "audit_forcing",
-    "audit_model",
     "build_basis",
     "build_forcing_model",
     "build_member_set",
     "default_forcing_path",
-    "find_source_for",
     "format_forcing_audit",
     "format_member_report",
     "inject_forcing",
@@ -100,7 +88,6 @@ __all__ = [
     "member_perturbed_path",
     "member_tag",
     "parse_segment_plan",
-    "reference_budget",
     "resolve_effective_path",
     "resolve_forcing_path",
     "resolve_member_path",
@@ -108,7 +95,6 @@ __all__ = [
     "resolve_targets",
     "select_initializers",
     "set_dir_for",
-    "structural_diff",
     "verify_member_set",
     "run_e2e",
     "run_check",

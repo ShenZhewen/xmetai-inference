@@ -32,7 +32,8 @@ A/B 协议只有 6 成员，σ̂ 由单个成员主导（拿掉第 3 号掉 22-3
 成员集：**本次整份重造 51 个**（不复用第五轮那份）。
 
   指纹 = (groups, sigma_full, balance, exclude, include, min_elements, seed,
-  **noise_struct**, noise_block, member_format, 源 .onnx 的 size/mtime)。
+  **noise_struct**, noise_block（冻结键，见 spec.NOISE_BLOCK_FROZEN）, member_format,
+  源 .onnx 的 size/mtime)。
   S2B 与 F 只差 `sigma_full`（0.027 vs 0.04）与 `noise_struct`（channel vs iid）；
   `noise_struct` 的**非默认值进指纹**（`perturbation/spec.py` 的 `budgets()`，且有 selftest
   专门钉住「channel 不许耦合命中 iid 的成员集目录、静默复用错权重」）—— 所以 S2B 走自己的
@@ -184,54 +185,6 @@ FGVP_SPW_PROD_S2B_DYNAMIC_STORES = [
 # 那几轮的结论照样适用（重建后 `cmp` 一下就能确认，见文件头「成员集」段）。
 BASE_EXCLUDE = ("mean", "std", "const", "mask", "attn_mask", "ones", "zeros")
 
-# 多进程 / 多卡调度（任务级动态认领）。键名写错会直接报错，不会被静默忽略。
-# 1479 个任务（29 起报 x 51 成员）：谁先干完谁接着认领。
-SCHEDULING = {
-    # claim = 任务级动态认领（默认）；static = 旧的「按起报/按成员静态分片」回退开关。
-    "mode": "claim",
-    # 3 = 每卡三个进程，**这是显存允许的上限**（理由见文件头「多进程 / 多卡」那段里的
-    # 「为什么停在 3 不往 4 走」，一句话：单 worker 吃 14 GB，4 份的 ORT 配额正好压到
-    # 14 GB = 实测用量本身）。原来写「必须 1（一卡分不出第二份显存）」，2026-09-24 实测
-    # 证伪：单进程单卡只占 14153 MiB / 81559 MiB，功耗 142-200 W / 700 W。gpu_mem 按份数
-    # 分（缺省 0.7 -> 每份 0.233，约 18.7 GB），>0.9 时 cli 才告警。
-    # 附带收益：intra_op_threads=auto 时线程按 worker 数分 —— 2 卡 x 3 进程 = 6 个 worker，
-    # 所以机器给多少核都会被自动平分（36 核 -> 每个 6 条、48 核 -> 每个 8 条），不用手调。
-    # 核多不是浪费，但也别指望靠加核提吞吐：瓶颈在卡上（见文件头预算段）。
-    "procs_per_gpu": 2,
-    # 一个任务装一个成员：任务越碎负载越均衡。代价是每个任务一次「换成员」的开销，
-    # 靠下面的 claim_order 让同一成员的任务连在一起，把装载省掉。
-    "members_per_task": 1,
-    # m1a 一律按成员认领（auto 也会这么分流）：连续认领同一成员就不必重新装载权重。
-    # 换成别的成员再切回来也不重装 —— 只要它还在 cfg 的 resident_members 池子里。
-    "claim_order": "member",
-    # 产物齐全（该起报该成员的 60 帧都在）就算完成 -> 中断重启后跳过，不重算。
-    "resume": "outputs",
-    # 单个任务最多重跑 1 次（跑挂 -> 重派一次 -> 再挂就判 FAILED，不再耗卡）；
-    # 主控最多重派 3 轮，且只有整轮零进展才重派。
-    "task_retries": 1,
-    "max_passes": 3,
-    # 心跳 15 s 一次；120 s 没动静判该 worker 已死 -> 它手里的任务可被回收重跑。
-    "heartbeat_interval": 15.0,
-    "heartbeat_timeout": 120.0,
-    # 硬租约兜底：3.66 s/前向 x 60 帧 ~= 4 min，这里给 2 h。心跳线程万一卡住（进程还活着
-    # 但一个任务上不动），靠它把任务放出来，而不是让整轮卡到天亮。0 = 关，只靠心跳。
-    "task_ttl_seconds": 7200.0,
-    # 预取 2 个任务：认领与读帧在后台线程做，GPU 不等 IO。
-    "prefetch_tasks": 2,
-    # 缓存 2 个起报的输入帧：同一起报下的 51 个成员任务复用同一份输入，把 51x 的读放大
-    # 压掉。29 个起报缓存不下全部（那是 2F 的 3 起报口径）。主机内存紧就降到 1 或 0。
-    # 注意：这一条只在 claim_order 取 "init" 时才真的生效 —— 本配方是 "member"，相邻任务
-    # 的起报每次都在换，框架会把 cache_size 强制归零（见 cli 的 _run_claimed）。想同时要
-    # 「输入只读一次」与「成员不重复装载」，可以把 claim_order 改成 "init" —— 但要算清楚：
-    # 改 "init" 后相邻任务换的是不同成员，而一轮要扫过 51 个成员，池子（开 2 还是 8 都一样）
-    # 留不下，等于每个任务多付一次 15s 装载（实测加载耗时，约 +7.5%）。所以别为了
-    # input_cache 去动 claim_order，这条留着只是记着有这么个开关。
-    "input_cache": 2,
-    "poll_interval": 5.0,
-    "monitor_interval": 30.0,
-    # 落盘先写隐藏临时名再 os.replace：下游评测不会读到半成品 .nc。
-    "atomic_output": True,
-}
 
 cfg = InferConfig(
     name="fgvp_spw_prod_s2b",
@@ -346,11 +299,6 @@ cfg = InferConfig(
     # 任务失败时框架会 `_drop_sessions` 整池清空重来，重派同样指望不上池子。
     # 给 2 是留一个余量（正常用 1 个，另一个槽位给「同成员换批」之类的意外）。
     resident_members=2,
-    # 调度超参数（见上面的 SCHEDULING）。命令行只覆盖 --schedule / --procs-per-gpu /
-    # --resume 这三个日常要改的。`--procs-per-gpu` 放心拿来做对照：它**不进 plan 指纹**
-    # （见 scheduling/plan.py 的 run_payload），配上 resume=outputs，已落盘的帧照样认 ——
-    # 试错成本只有正在跑的那一个任务（<= 3.5 分钟）。
-    scheduling=SCHEDULING,
     # 正式输出目录（与 F 的生产目录分开，也与试跑目录分开）。
     output_dir="/workspace/data/shenzw/fgvp_spw_prod_s2b",
 )

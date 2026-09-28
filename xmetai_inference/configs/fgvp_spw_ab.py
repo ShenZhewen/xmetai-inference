@@ -353,51 +353,6 @@ VARIANTS = {
                    "判读：短时效 CRPS 比 → ~1.00（3/3 天）、长时效仍 < 0.95，且判据 1 / 3 仍 ✅、判据 2 转 ✅"},
 }
 
-# 多进程 / 多卡调度（任务级动态认领）。键名写错会直接报错，不会被静默忽略。
-# 3 起报 x 6 成员 = 18 个任务：谁先干完谁接着认领，两个 worker 上不再有「一个 rank 分到最慢
-# 的起报、另一个空等」。变体之间只是改了注入结构，调度口径保持一致（便于并排读日志）。
-SCHEDULING = {
-    # claim = 任务级动态认领（默认）；static = 旧的「按起报/按成员静态分片」回退开关。
-    "mode": "claim",
-    # 一卡一进程：m1a 每个成员是一份权重（latent_mixer 1.49 GB / decoder_group 710 MB）
-    # + 一个 session，一卡分不出第二份显存。
-    "procs_per_gpu": 1,
-    # 一个任务装一个成员：任务越碎负载越均衡。代价是每个任务一次「换成员」的开销，
-    # 靠下面的 claim_order 让同一成员的任务连在一起，把装载省掉。
-    "members_per_task": 1,
-    # m1a 一律按成员认领（auto 也会这么分流）：连续认领同一成员就不必重新装载权重。
-    # 换成别的成员再切回来也不重装 —— 只要它还在 cfg 的 resident_members 池子里。
-    # 只有 E3（分段 rollout）拿不到这个便宜：段边界要换成另一份冻结权重，换段必须重新装载。
-    "claim_order": "member",
-    # 产物齐全（该起报该成员的 60 帧都在）就算完成 -> 中断重启后跳过，不重算。
-    # 变体各写自己的输出目录，账本也跟着各自一份，互不干扰。
-    "resume": "outputs",
-    # 单个任务最多重跑 1 次（跑挂 -> 重派一次 -> 再挂就判 FAILED，不再耗卡）；
-    # 主控最多重派 3 轮，且只有整轮零进展才重派。
-    "task_retries": 1,
-    "max_passes": 3,
-    # 心跳 15 s 一次；120 s 没动静判该 worker 已死 -> 它手里的任务可被回收重跑。
-    "heartbeat_interval": 15.0,
-    "heartbeat_timeout": 120.0,
-    # 硬租约兜底：单成员 60 帧约 4 min，这里给 2 h。心跳线程万一卡住（进程还活着但一个任务上
-    # 不动），靠它把任务放出来，而不是让整轮卡到天亮。0 = 关，只靠心跳。
-    "task_ttl_seconds": 7200.0,
-    # 预取 2 个任务：认领与读帧在后台线程做，GPU 不等 IO。
-    "prefetch_tasks": 2,
-    # 输入缓存：**只在本配方把 claim_order 改成 "init" 时才有效**。m1a 的缺省是「按成员
-    # 优先」，而相邻任务的起报每次都在换 -> 缓存几乎不命中，框架在这种情况下会把 cache_size
-    # 强制归零（见 cli 的 _run_claimed），只留 650 MB 白占内存。想省输入 IO 就两条路：
-    #   * claim_order="init" + 这里给 3（3 个起报全缓存）：一个 worker 把一个起报的成员扫完，
-    #     输入只读一次；换成员那点开销由 cfg 的 resident_members 兜住（6 份全常驻 ->
-    #     无论任务怎么切，一个成员只装载一次）。
-    #   * 或者把 members_per_task 调大（一个任务 = 一个起报的 N 个成员），输入读一次摊到 N 个
-    #     成员上；代价是任务变少、负载均衡变粗。
-    "input_cache": 3,
-    "poll_interval": 5.0,
-    "monitor_interval": 30.0,
-    # 落盘先写隐藏临时名再 os.replace：下游评测不会读到半成品 .nc。
-    "atomic_output": True,
-}
 
 VARIANT = os.environ.get("SPW_AB", "S").strip().upper()
 if VARIANT not in VARIANTS:
@@ -423,8 +378,8 @@ cfg = InferConfig(
         "sigma_full": variant["sigma_full"],
         "balance": "energy",
         "exclude": exclude,
-        # 注入结构：iid（论文原式）/ channel（逐输出通道共享）/ block。三种结构的每元素
-        # 方差都是 1，所以「换结构不换预算」；非 iid 会进指纹 -> 落到另一个成员集目录。
+        # 注入结构：iid（论文原式）/ channel（逐输出通道共享）/ scalar（整张量共享一个 ξ）。
+        # 三种结构的每元素方差都是 1，所以「换结构不换预算」；非 iid 会进指纹 -> 另落一个目录。
         "noise_struct": variant.get("noise_struct", "iid"),
         "min_elements": 64,
         # 成员集落盘目录。变体的 groups/sigma/noise_struct 不同 -> 指纹不同 -> 各自一个
@@ -495,8 +450,5 @@ cfg = InferConfig(
     # 让连续任务落在同一成员上，池子补的是「被另一个 worker 插队后切回来」与「失败重派」。
     # 显存紧就降到 2-3；1 = 一换一放（改造前的口径）。
     resident_members=6,
-    # 调度超参数（见上面的 SCHEDULING）。命令行只覆盖 --schedule / --procs-per-gpu /
-    # --resume 这三个日常要改的。
-    scheduling=SCHEDULING,
     output_dir=f"{OUT_ROOT}/{VARIANT}",
 )

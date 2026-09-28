@@ -83,16 +83,16 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import os.path as osp
-from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Mapping, Sequence
 
 import numpy as np
 
+from ._specbase import SpecBase
 from .graph import (
     _check_model_path,
     _external_data_outside,
@@ -133,7 +133,7 @@ def _rank_entropy(spec, member_index, slot):
 
 
 @dataclass
-class LatentForcingSpec:
+class LatentForcingSpec(SpecBase):
     """一次潜空间 AR(1) 强迫的规格。
 
     targets        注入哪些张量。内置别名 "latent_state"（默认，3 个潜状态）/ "blocks"
@@ -156,6 +156,9 @@ class LatentForcingSpec:
                    （.data）引用要被 onnxruntime 接受，必须落在模型目录内（坑 6）。
     verify_on_load 加载时确认图里真的有 spw/xi 输入且 metadata 对得上（抓「图没被改写」）。
     """
+
+    #: from_config 的类型报错里用的名字（实现在 _specbase.SpecBase）
+    config_error = "latent_forcing"
 
     targets: Sequence[str] = ("latent_state",)
     sigma: float = 0.04
@@ -197,20 +200,6 @@ class LatentForcingSpec:
         if self.hour_interval < 0:
             raise ValueError("latent_forcing.hour_interval 不能为负")
 
-    @classmethod
-    def from_config(cls, value: Any) -> "LatentForcingSpec | None":
-        if value is None or value is False:
-            return None
-        if isinstance(value, cls):
-            return value
-        if isinstance(value, Mapping):
-            return cls(**dict(value))
-        if value is True:
-            return cls()
-        raise TypeError(
-            f"latent_forcing 应为 dict / LatentForcingSpec / None，"
-            f"实际 {type(value).__name__}")
-
     # ---- 派生量 ----
 
     def rho(self, hour_interval: float | None = None) -> float:
@@ -235,16 +224,6 @@ class LatentForcingSpec:
             "input_name": self.input_name,
             "format": FORCING_FORMAT,
         }
-
-    def source_identity(self, src_path: str) -> dict:
-        stat = os.stat(src_path)
-        return {"source": osp.basename(src_path), "size": int(stat.st_size),
-                "mtime": int(stat.st_mtime)}
-
-    def fingerprint(self, src_path: str) -> str:
-        payload = {"spec": self.budgets(), "source_identity": self.source_identity(src_path)}
-        blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hashlib.sha1(blob).hexdigest()[:10]
 
     def describe(self) -> str:
         return ("latent-ar1 targets=%s sigma=%g tau=%gd rank=%d length_scale=%g"
