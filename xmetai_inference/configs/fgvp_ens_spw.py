@@ -23,7 +23,7 @@ session 驱动 J 条轨迹（复用 _run_plain_block 的 members>1 分支，含 
   1) 看集合图的注入组（latent_mixer 是 gdn2 的张量名前缀，集合图是 Mamba 骨干，
      组名结构未必相同）：
        P="python -m xmetai_inference.perturbation"
-       $P groups /workspace/tmp/douzsh/models/20261008/iwc_gssp_im.onnx
+       $P groups /workspace/tmp/douzsh/models/20261008/iwc_gssp_im_fp16.onnx
      下面的 weight_perturb["groups"] 按这个输出改。
   2) σ 不许直接抄 0.027：集合图自带图内离散度，σ̂ 目标值与确定性档不同。先用探针
      量基线再定（$P probe 的 --m1a-members 8）。
@@ -101,9 +101,13 @@ BASE_EXCLUDE = ("mean", "std", "const", "mask", "attn_mask", "ones", "zeros")
 
 cfg = InferConfig(
     name="fgvp_ens_spw",
-    # ⚠ 源是**集合图**（iwc_gssp_im，图内随机算子出成员），不是 s2b 用的确定性
-    # iwc_fgvp_gdn2.onnx。源进指纹（size/mtime），挪动 = G 份图全部重造。
-    model_path=f"{MODEL_DIR}/20261008/iwc_gssp_im.onnx",
+    # ⚠ 源是**集合图**（iwc_gssp_im 的 **fp16** 版，图内随机算子出成员），不是 s2b
+    # 用的确定性 iwc_fgvp_gdn2.onnx。源进指纹（size/mtime），挪动 = G 份图全部重造。
+    # fp16 + 动态 batch 轴：一次 forward 堆 k 条轨迹（下面的 rollout_batch）。
+    # 批的仍是**同图的成员**（图外层编舞下每 rank 一份图、J 条轨迹），k 的有效上限
+    # 就是 J（51/5 -> 11），再大最后一块只装余数。显存按 k 倍涨（fp16 减半），
+    # k 超出 batch_axis_dynamic 的实测能力时 runner 会打 WARNING 退回 1。
+    model_path=f"{MODEL_DIR}/20261008/iwc_gssp_im_fp16.onnx",
     ops_library=f"{MODEL_DIR}/xmetai_onnx_plugins.ort1_24.cuda12.so",
     # 必须 False：单步型图，GPU 常驻分支绕过滑窗回填（同 fgvp_ens 的理由）。
     gpu_state=False,
