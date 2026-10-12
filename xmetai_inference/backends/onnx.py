@@ -77,6 +77,9 @@ class OnnxInferModel(BaseInferModel):
     """ONNX Runtime 后端（CUDAExecutionProvider）。"""
     backend = "onnx"
     supports_weight_perturb = True
+    # 潜空间 AR(1) 的能力位：与 supports_weight_perturb 分开声明（pt2 后端实现了
+    # latent_forcing 的 fx 图改写，但不支持 m1a 权重扰动——见 perturbation/latent_pt2.py）。
+    supports_latent_forcing = True
     # 潜空间 AR(1) 强迫规格（config 的 latent_forcing）；None = 不加。
     # 与 weight_perturb 共用 supports_weight_perturb 这一个能力位：两者都是「改图 / 改权重」
     # 把确定性模型变成集合的手段，且**正交、可叠加**（图改写与权重改写互不干涉）。
@@ -207,16 +210,31 @@ class OnnxInferModel(BaseInferModel):
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())
+        # 能不能一次吃多条轨迹：state 输入（喂料时键名固定为 "input"）与输出的
+        # batch 轴**都**得是符号维。任何一个静态，喂 k>1 都不成立 —— 输入静态会被
+        # ORT 直接拒，输出静态则批次对不上（也会报错，但信息更绕）。
+        # 标量（shape 为空）一律当静态。
+        _inputs = self.session.get_inputs()
+        _state_input = next((i for i in _inputs if i.name == "input"), _inputs[0])
+        _in_shape = list(getattr(_state_input, "shape", None) or [])
+        _out_dim = list(getattr(self.session.get_outputs()[0], "shape", None) or [])
+        self.batch_axis_dynamic = (
+            bool(_in_shape) and bool(_out_dim)
+            and isinstance(_in_shape[0], str) and isinstance(_out_dim[0], str))
         self._check_gpu_state_frames()
         self._verify_forcing(forcing)
         # 输出 OrtValue 复用池：forward_gpu 把用完的输入 state 回收为下一个输出 buffer，
         # 避免每步 ortvalue_from_shape_and_type 分配/释放 618MB 显存。首个调用时才新建。
         self._spare = None
         # 潜空间强迫的驱动状态：xi 的递推在 Python 侧（ONNX 单步图没有跨步状态机制），
-        # 键 = (成员号, batch, 进程 rank)。load() 里重置，所以每个成员一份、从不共享。
-        self._latent_n_targets = 0
-        self._ar1 = None
-        self._ar1_key = None
+        # 键 = (成员号, 进程 rank)，行号 = 轨迹（见 _latent_step_stream）。load() 里重建，
+        # 所以每个成员一份、从不共享。
+        # ⚠ _latent_n_targets 不在这里清零：它在上面 _verify_forcing 里按图 metadata 设定
+        # （无 forcing 时它自己会先清零再早退）。这里再清一次会把刚设好的目标数抹回 0，
+        # _latent_step_stream 恒返回 None，forward 喂不上 spw/xi —— 2026-09-29 A32 首跑实踩。
+        from xmetai_inference.perturbation.latent import LatentStepStream
+
+        self._latent_stream = LatentStepStream()
 
     def _verify_perturbation(self, spec):
         """加载后的扰动自检：确认加载进来的图就是 self.member_index 那个成员。
@@ -323,41 +341,21 @@ class OnnxInferModel(BaseInferModel):
             "补齐帧数。"
         )
 
-    def _latent_driver(self, batch, step):
-        """取本步要喂的 xi（潜空间 AR(1) 的驱动状态）。
+    def _latent_step_stream(self, step):
+        """潜空间 AR(1) 的驱动状态机：返回本步第几条轨迹该拿的行号（None = 不强迫）。
 
-        键 = (成员号, batch, 进程 rank)：成员号让 51 个成员拿到互不相同的随机流（cli 的集合
-        编排在每次 load 之前设 self.member_index），batch 让同一步里的多条轨迹各拿一份，
-        rank 见下面的注释。step == 0 时重抽 xi_0 —— 每条轨迹（每批起报）都必须从新的噪声
-        相位开始，否则新起报会继承上一条轨迹的相位。重抽不重置随机流，所以「重抽 = 新轨迹」，
-        而整个任务的抽样序列仍可复现。
-
-        为什么不覆盖 reset_runtime_state：那是「换 session 之后状态还在不在」的契约
-        （cli 的 _guard_segment_model 靠它判断分段 rollout 能不能用），而 xi 的递推本来就在
-        驱动侧、与 session 无关。用 step 判新轨迹，语义等价且不牵动那条契约。
+        实现在 perturbation.latent.LatentStepStream（onnx / pt2 后端共享——这段逻辑出过
+        A32 接线事故，两份拷贝比一次受控共享危险）。完整语义、以及原接线错误的判决
+        见该类的 docstring。
         """
         forcing = getattr(self, "latent_forcing", None)
         if not forcing or self._latent_n_targets <= 0:
             return None
-        from xmetai_inference.perturbation.spec import _rank_offset
-
-        batch = int(batch)
-        # 进程 rank 必须计进熵：只开 latent_forcing（没有 m1a 权重）时，集合走的是
-        # 「一个 session + 一批轨迹」那条路，成员身份 = 批里的位置、member_index 恒为 0。
-        # 多卡按成员切时每个 rank 跑一部分成员，不把 rank 计进熵的话各 rank 的 xi 序列
-        # **逐位相同** —— member_000 与 member_001 拿到同一份噪声，静默地变成重复成员。
-        rank = int(_rank_offset())
-        key = (int(getattr(self, "member_index", 0)), batch, rank)
-        if self._ar1 is None or self._ar1_key != key:
-            from xmetai_inference.perturbation import Ar1Driver
-
-            self._ar1 = Ar1Driver(forcing, self._latent_n_targets,
-                                  member_index=key[0], slot=rank, batch=batch,
-                                  hour_interval=getattr(self, "hour_interval", None))
-            self._ar1_key = key
-        elif int(step) == 0:
-            self._ar1.reset()
-        return self._ar1
+        return self._latent_stream(
+            forcing, step,
+            n_targets=self._latent_n_targets,
+            member_index=getattr(self, "member_index", 0),
+            hour_interval=getattr(self, "hour_interval", None))
 
     def forward(self, x, step, valid_time):
         feeds = {"input": _as_numpy_onnx(x)}
@@ -365,17 +363,16 @@ class OnnxInferModel(BaseInferModel):
             for k, v in _scalar_feeds(valid_time, step).items():
                 if k in self._input_names:
                     feeds[k] = v
-        driver = self._latent_driver(int(x.shape[0]), step)
-        if driver is not None:
-            feeds[self.latent_forcing.input_name] = driver.value(int(x.shape[0]))
+        row = self._latent_step_stream(step)
+        if row is not None:
+            # 本步第 row 条轨迹的 xi（[1, T, R]）。递推已移到 step 变化处整批推进一次，
+            # 不再逐 forward 调用 advance —— 逐轨迹调用下那样会把整批推进 n 次/步。
+            feeds[self.latent_forcing.input_name] = self._latent_stream.ar1.row(row)
         # 输出完整滑动窗口 (1, in_frames, C, H, W)：输入 [t-1,t] → 输出 [t,t+1]，
         # 末帧才是本步预报。基类 run 会取 state[:, -1] 当预报、用完整 state
         # 回填（state = result），与官方 inference.py 的 `new_input = model.run(...)`
         # 一致。这里原样返回完整输出，不再只切末帧。
         result = self.session.run([self._pred_name], feeds)[0]
-        if driver is not None:
-            # 递推放在 run 之后：本步喂进去的是 xi_t，下一步该用 xi_{t+1}。
-            driver.advance()
         return result
 
     # ---- GPU 常驻（IOBinding）：state 全程待在 GPU，只在落盘时搬回 CPU ----
@@ -419,7 +416,8 @@ class OnnxInferModel(BaseInferModel):
         """
         self.session = None
         self._spare = None
-        self._ar1 = None
+        if getattr(self, "_latent_stream", None) is not None:
+            self._latent_stream.release()
         if self._pool is not None and self._pool.budget == 1:
             self._pool.purge()
 
@@ -427,7 +425,8 @@ class OnnxInferModel(BaseInferModel):
         """把当前 session 与整个常驻池一起放开（进程收尾，或想立刻把显存还回去）。"""
         self.session = None
         self._spare = None
-        self._ar1 = None
+        if getattr(self, "_latent_stream", None) is not None:
+            self._latent_stream.release()
         if self._pool is not None:
             self._pool.purge()
         gc.collect()

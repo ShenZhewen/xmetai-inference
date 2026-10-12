@@ -3172,6 +3172,131 @@ corr(r_long, act)         = -0.928   拟合  act  = 0.9107 - 0.1178 * r_long
 * **`length_scale=32` 是否真对应「行星尺度」**要在跑完后用 `p(lead, band)` 复核（2L.8 的带口径），
   不能只靠 token 数的换算。
 
+### 2N.9 pt2 后端：同一套 AR(1) 迁到 FuXi-2.1（torch.export，2026-09-30）
+
+**目的**：2M 把方案写成「通用」的，但 2N 全程只有 FGVP/GDN 一个骨干（ONNX 图）。这一节把
+**同一套** `LatentForcingSpec` / `build_basis` / `Ar1Driver` / `LatentStepStream` 架到第二个
+架构（FuXi-2.1 transformer，torch.export 的 `.pt2`）上 —— 公式、基构造、驱动递推**一行没改**，
+换掉的只有「把强迫接进图」的那一层（`perturbation/latent_pt2.py`）。
+泛化性如果成立，这一节的结果应当与 2N.5 的臂在**方向**上一致（P1/P3 照读）。
+
+**三处必须不一样的地方**：
+
+| | ONNX（FGVP） | pt2（FuXi-2.1） |
+| --- | --- | --- |
+| 改写时机 | 落盘一份 `*.ar1-<指纹>.onnx` | **内存改写**（`gm.graph` 插节点 + `recompile()`），无产物、无 metadata |
+| 注入点 | 节点名后缀 / `latent_state` / `blocks` 别名 | **从权重占位符沿单链回溯**：`p_model_decoder_layers_{k}_mlp_w2_weight` → `aten.linear` →（透明算子）→ 残差 `aten.add` = 第 k 层末残差流；别名 `layer_stream` / `layer_stream:0,10,20` |
+| ξ 的入口 | 新增**图输入** `spw/xi` | GraphModule **属性** `spw_xi`（`get_attr` 读，驱动侧每步 `copy_` 覆写） |
+
+第三行是被逼的：`torch.export` 的图签名固定（`args_0..3`），塞不进新输入。属性名还必须用
+**下划线**——fx codegen 把 `get_attr` 的名字直接写进生成代码，ONNX 版的 `spw/xi` 会生成非法
+Python。每目标插 5 个节点（`select → mul → mm → add → mul`；ONNX 版是 6 个，多一个
+Reshape/Transpose，这边 `aten.mm` 直接吃 `[N,R]@[R,C]`）。
+
+**FuXi-2.1 实测布局**（探针，torch 2.11）：`tokens=28800`（120×240）、`channels=1536`、
+30 个 decoder 层、**全程 fp16**、潜状态 `[1, 28800, 1536]`（3-D，与 FGVP 同构 ⇒ `build_basis`
+直接用）。fp16 有个直接后果：算 `‖Vt‖` / 隐含 sigma 必须**先转 float32**，28800×16 个元素的
+fp16 平方和会溢出成 Inf。
+
+**网格推不出来，必须显式给**：ONNX 版能从 `patch_embed` 卷积反推 `rows×cols`，fx 图里没有
+可靠来源（`meta['val']` 只给到 `[1, 28800, 1536]`）。所以 `latent_forcing.grid` 在 pt2 上是
+**必填**（FuXi-2.1 = `(120, 240)`），不给直接报错。这不是形式主义：网格猜错，空间低通就平滑
+在错的轴上，场会被静默搅乱，而**所有结构检查仍然全绿**。
+
+**三个臂**（`configs/fuxi_ar1.py`，`SPW_FUXI_AR1`，默认 `F32`；只 latent、无成员权重集）：
+
+| 臂 | σ | τ | 唯一变量 |
+| --- | --- | --- | --- |
+| `S0` | 0 | 3.0 | **先跑这个**：不改图，给后面所有臂划「零强迫下限」——fuxi2.1 实测高空通道每次前向差 ~0.2% 场变率（GPU 非确定性），那是底噪 |
+| `F32` | 0.04 | 3.0 | 主臂：`length_scale=32` + ρ=0.92 |
+| `F32T0` | 0.04 | 0.05 | iid 端点（ρ=0.0067）：与 `F32` 唯一变量 = 驱动侧 τ ⇒ P1 的 FuXi 版 |
+
+注入 `layer_stream:0,10,20`（3 处，对齐 FGVP-A32 的 3 个 `latent_state`，σ 口径可比）；
+要全 30 层把 targets 换成 `("layer_stream",)`。**τ 不进图**（同 2N.5 的共图设计）⇒ `F32` 与
+`F32T0` 是同一份改写逻辑下的单变量对照。
+
+**验收（本地，零 GPU、零推理）**：
+
+1. `self-test` 全过（**223 条**）。pt2 侧钉住：回溯规则（含 `layer_stream` 三种写法、层号错位、
+   非 decoder 图明确拒绝而**不是**静默注 0 个）、**回溯链路的形状**（合成夹具刻意复刻真图
+   的 `linear → clone → mul(×[1,1,C]) → add` 四跳，并断言链长=4、终点是 `aten.add.Tensor`；
+   另配两个错例图 —— 层内夹 `sigmoid`、链路分叉 —— 都必须被拦下）、布局的三个错例、
+   **σ=0 时输出与未注入的同一份导出图逐位相同**、每目标 5 节点、基的隐含 σ、
+   `xi=0` 逐位等价 / 同 xi 两次逐位相同（图里没有随机算子）、**逐列数值参考**
+   （只喂第 0 列 / 只喂第 1 列 / 两列互换 —— 列↔层如果错位会立刻分家）、重复注入被拒、
+   **裸数字注入点被拒** + CLI `--targets` 的逗号只在别名外切（下面坑 3 的两端回归）、
+   以及驱动侧的发号 / 加宽 / 槽位归零 / 换 τ / 换成员。
+2. CLI 同一条入口，把 `.onnx` 换成 `.pt2`（合成夹具冒烟已过）：
+   `latent build <x.pt2> --targets layer_stream:0,10,20 --grid 120,240 ...`；
+   `latent audit <x.pt2>` 会**明确拒绝**（没有可单独审计的产物，改跑 build）。
+3. **真实模型验收**（fuxi-2.1.pt2，3.9 GB）—— **2026-09-30 本地实测通过**：
+
+```bash
+cd /mnt/d/output
+/home/zhulu/miniconda3/envs/szw-xmetai/bin/python -m xmetai_inference.perturbation latent build \
+  /mnt/d/fuxi-2.1.pt2 \
+  --targets layer_stream:0,10,20 \
+  --sigma 0.04 --tau-days 3 --rank 16 --length-scale 32 --grid 120,240
+```
+
+实测输出（对不上就是有问题，别往下走）：
+
+```text
+目标        3 个（add_12, add_112, add_212）
+  layer_0    linear_9 → clone_5 → mul_20 → add_12
+  layer_10   linear_89 → clone_45 → mul_160 → add_112
+  layer_20   linear_169 → clone_85 → mul_300 → add_212
+新增节点    15
+布局        tokens=28800 channels=1536 grid=(120, 240)
+dtype       torch.float16
+指纹        cd03fe77c7
+基          ‖Vt‖=4.0000（= sqrt(rank)）基隐含 sigma=0.040000（= 设定值）退化=0
+ρ(Δt=6h) = 0.9200（τ=3 天，驱动侧）
+审计        结构自洽 (拓扑序=True)
+```
+
+另外单独验过真图上的 **unlift 路径**（`ep.module()`，即下面「`setattr` 换张量」那条的爆点）：`spw_V/U/xi`
+三个属性都被带进 unlifted module、且与 `graph_module` 共享同一批张量对象；驱动侧走一遍
+发号 0/1/2、取行形状 `(1, 3, 16)`、ρ=0.92。**前向没在 CPU 上跑**（28800 token × 30 层
+的注意力在 CPU 上不现实）—— 数值等价性由第 1 条的合成夹具守。
+
+**踩出来的四个坑**（都会**静默**出错的，记下来）：
+
+* **回溯别假设 `linear → add` 只有一步。** 第一版规则是「w2 权重 → 它的 `linear` → 吸收
+  该输出的 `aten.add`」，在真图上当场报 `层 0 的 MLP 输出有 0 个 add 消费者` —— 真链路是
+  `linear_9 → clone_5 → mul_20（乘一个 [1,1,1536] 的调制向量）→ add_12`，中间隔了
+  **clone + 逐通道调制**两跳（30 层全都是这个形状）。改成「从权重占位符出发**沿单链**走，
+  穿过透明算子（clone / to_copy / view / reshape / mul / div）直到残差 `add`」，
+  并在每一步校验 **①消费者恰好 1 个（分叉即报错）②遇到的非透明算子即报错**，
+  链长上限 8 跳。两条错例（层内夹 `sigmoid`、链路分叉）已进自检。
+  顺带确认：**图里没有任何随机算子**（全图扫 `rand/dropout/bernoulli` 零命中），
+  所以「同 xi 两次逐位相同」这条等价性是可用的。
+* **`inserting_after` 是一个插入点，不是「从这里往后追加」。** 同一个 `with` 块里连续
+  `create_node` 全插在同一位置 ⇒ 后建的排在**前面**，整条链逆序。逆序的图**照样
+  `recompile()` 成功、节点数也对**，只在 ① 代码生成「先用后定义」② `ep.module()` 的 unlift
+  （`deepcopy` 整张图）`KeyError` 时才炸。修法是每建一个节点就把锚点挪到它身上接力着插
+  （`get_attr` 同样受此约束，它也是 `create_node`）。**并把 `gm.graph.lint()` 变成审计里的
+  断言**（`report["topological"]`）——这类错误必须在改图那一刻就露头。
+* **`setattr` 换张量 = 静默退化成确定性预报。** `ep.module()` 会走 unlift，用 deepcopy 出来的
+  图**新建**一个 GraphModule；`spw_*` 因为 `get_attr` 被一起带过去，但那是同一批张量对象的
+  **引用**。若每步用 `setattr(gm, "spw_xi", 新张量)` 只改到其中一个副本，**真正在跑的那个**
+  还全是 0 ⇒ gain 恒为 1.0 ⇒ 集合里所有成员逐位相同，而且**没有任何报错**。
+  所以：持有 unlifted 的那个 module，每步 `copy_` **就地**改写。backend 里另加一条断言：
+  注入了图却丢了 gm 引用，直接 `RuntimeError`，不给你静默的机会。
+* **`--targets` 的逗号会把 `layer_stream:0,10,20` 拆开。** 拆出来的裸 `10` / `20` 会去撞
+  **节点名后缀**——实测 `layer_stream:0,2` 拆出的裸 `2` 就**碰巧**匹配到了一个无关节点
+  （注到了 channels 不同的那个上，不报错）。两头都堵：CLI 侧窄合并（别名内的逗号并回同一个
+  token），`resolve_fx_targets` 侧**裸数字一律拒绝**——后缀匹配是给显式节点名兜底的，
+  不该被数字撞上。
+
+**剩余的洞**：
+
+* `length_scale=32` 在 28800 token 上是「行星尺度」这个换算（同 2N.8 末条）仍需 `p(lead, band)` 复核；
+* pt2 没有 metadata ⇒ 「注入对不对」只能靠数值判（`xi=0` 逐位等价 + 逐列参考已经覆盖了
+  「注错层 / 注错位置 / 加成加性」三类，但没有 ONNX 版那种可事后翻查的落盘证据）；
+* `S0` 的底噪（GPU 非确定性 ~0.2% 场变率）**必须先量出来**，否则所有臂的 spread 都缺一个下限；
+* 仍然只有 6 成员 × 3 起报（同 2N.8）⇒ 只有方向，没有量级。
+
 ---
 
 ## 3. 图上到底改了什么

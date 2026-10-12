@@ -125,6 +125,17 @@ class InferConfig:
     # （代价是每层卷积未必拿到最优 kernel）。
     intra_op_threads: int = 0
     cudnn_algo_search: str = ""
+    # rollout_batch：一次 forward 堆几条轨迹（1 = 逐条前向，缺省，与历史行为一致）。
+    # ⚠ 与上面 dataset 的 batch_size **不是一个东西**：那个是 Dataset 一次装几个起报
+    # （I/O 批），这个是**前向批**。members>1 时批的是成员，members==1 时批的是起报。
+    # 三个前提（不满足不会静默算错：前两个在 runner 里挡掉，第三个图自己会拒）：
+    #   * 图导出时输入/输出的 batch 轴都是符号维 —— 后端 load 时实测后置
+    #     batch_axis_dynamic，没置位就打 WARNING 退回 1，这一趟照跑完；
+    #   * 不能与 gpu_state=True 同用（配置互斥，直接报错，不静默退回）；
+    #   * 一批里各轨迹的时刻可以不同（step/hour/doy 按 (k,) 逐行喂），所以既支持
+    #     「同起报的多成员」也支持「多起报」。
+    # 显存按此倍数涨：0.25° 78 通道 2 帧，一条轨迹的状态约 648 MB，照可用显存给。
+    rollout_batch: int = 1
     # resident_members：常驻 session 池的额度。扰动档的每个成员是一份独立权重（= 一个
     # onnx session），逐成员装载建一次 session 不只读一遍权重，还要重新预热 cuDNN。
     #   1  = 一换一放（缺省，小显存口径：任何时刻只驻留 1 份）；

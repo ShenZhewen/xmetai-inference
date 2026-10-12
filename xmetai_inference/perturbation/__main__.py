@@ -274,6 +274,68 @@ def _cmd_verdict(args) -> int:
     )
 
 
+def _split_targets(text):
+    """`--targets` 的逗号分隔，但 `layer_stream:0,10,20` 别名**内部**的逗号不算分隔符。
+
+    `--targets` 用逗号分隔多个注入点，而 pt2 的层号别名天生也带逗号，两者会撞：不处理的话
+    `layer_stream:0,2` 被拆成 `layer_stream:0` + `2`，而裸 `2` 作为节点名后缀会**静默**匹配到
+    某个无关节点（实测踩过）。合并规则很窄：上一个 token 是 `layer_stream:` 开头、当前 token
+    是纯数字，才并回去 —— 想同时注入 `layer_stream:0` 和名字以数字结尾的节点，请写显式节点名。
+    """
+    merged = []
+    for token in (part.strip() for part in str(text).split(",")):
+        if not token:
+            continue
+        if merged and merged[-1].startswith("layer_stream:") and token.isdigit():
+            merged[-1] = f"{merged[-1]},{token}"
+        else:
+            merged.append(token)
+    return tuple(merged)
+
+
+def _latent_build_pt2(args, spec) -> int:
+    """pt2 的注入验收：加载 → 改内存图 → 就地审计（没有落盘产物，所以只有这一步）。
+
+    验收看三件事：目标回溯到几个层（FuXi-2.1 应为 30）、布局是否与配置相符
+    （tokens/channels/grid）、以及 audit 的 `ok`（含**拓扑序** —— 逆序的图照样能
+    recompile，只在跑 module() 时才炸，所以它是断言不是提醒）。
+    """
+    import torch.export
+
+    from .latent_pt2 import attach_forcing
+
+    ep = torch.export.load(args.model)
+    report = attach_forcing(ep, spec, src_path=args.model, verbose=not args.quiet)
+    if args.json:
+        print(json.dumps({k: v for k, v in report.items()}, ensure_ascii=False, indent=2,
+                         default=str))
+        return 0 if report.get("ok") else 1
+
+    print(f"pt2 注入报告：{args.model}")
+    if report.get("skipped"):
+        print(f"  sigma={report['sigma']} ⇒ 空转对照：不改图、驱动侧不喂 xi（n_targets=0）")
+        return 0
+    layout = report["layout"]
+    print(f"  目标        {report['n_targets']} 个（{', '.join(report['targets'])}…）")
+    # 链路是验收的关键证据：节点名（add_12）看不出是哪一层，也看不出中间隔了什么。
+    for key, chain in sorted(report.get("chains", {}).items(),
+                             key=lambda item: int(item[0].split("_")[1])):
+        print(f"    {key:<10} {' → '.join(chain)}")
+    print(f"  新增节点    {report['nodes']}")
+    print(f"  布局        tokens={layout['tokens']} channels={layout['channels']} "
+          f"grid={layout['grid']}")
+    print(f"  dtype       {report['dtype']}")
+    print(f"  指纹        {report['fingerprint']}")
+    basis = report["basis"]
+    print(f"  基          ‖Vt‖={report['norm_v']:.4f}（应 ≈ sqrt(rank)="
+          f"{np.sqrt(basis['rank']):.4f}）基隐含 sigma={report['sigma_implied']:.6f}"
+          f"（设定 {spec.sigma:.6f}）退化={basis['fallbacks']}")
+    print(f"  ρ(Δt={spec.hour_interval:g}h) = {spec.rho():.4f}（τ={spec.tau_days:g} 天，驱动侧）")
+    print(f"  审计        {'结构自洽' if report['ok'] else '**不过**'} "
+          f"(拓扑序={report.get('topological')} {report.get('lint_error', '')})")
+    return 0 if report.get("ok") else 1
+
+
 def _cmd_latent(args) -> int:
     """潜空间 AR(1) 强迫：build（给图加 spw/xi）/ audit（看改得对不对）。
 
@@ -283,6 +345,10 @@ def _cmd_latent(args) -> int:
     只会得到「sigma=0 的空转」——那正是等价性回归用的对照。
     """
     if args.latent_command == "audit":
+        if str(args.model).endswith(".pt2"):
+            print("pt2 后端的强迫图**不落盘**（改的是加载后的内存图），没有可以单独审计的"
+                  "产物；改跑 build —— 它注入完就地审计并打印同一份报告。", file=sys.stderr)
+            return 2
         report = audit_forcing(args.model)
         if args.json:
             print(json.dumps(dict(report), ensure_ascii=False, indent=2))
@@ -292,16 +358,20 @@ def _cmd_latent(args) -> int:
         return 0 if report.get("ok") else 1
 
     spec = LatentForcingSpec(
-        targets=tuple(token.strip() for token in str(args.targets).split(",")
-                      if token.strip()),
+        targets=_split_targets(args.targets),
         sigma=args.sigma,
         tau_days=args.tau_days,
         rank=args.rank,
         length_scale=args.length_scale,
         seed=args.seed,
         hour_interval=args.hour_interval,
+        grid=(tuple(int(v) for v in str(args.grid).split(",")) if args.grid else None),
         cache_dir=args.cache_dir,
     )
+    if str(args.model).endswith(".pt2"):
+        # pt2：改内存图、不落盘 ⇒ build 与 audit 是同一步（见上面的 audit 分支）。
+        return _latent_build_pt2(args, spec)
+
     path = build_forcing_model(args.model, spec, args.out, verbose=not args.quiet)
     report = audit_forcing(path)
     if args.json:
@@ -485,7 +555,9 @@ def main(argv=None) -> int:
         "build", help="把 AR(1) 潜空间强迫注入图上（权重一个字节都不动），写出新图")
     latent_build.add_argument("model", help="源确定性 onnx（也可以直接给 m1a 的成员图）")
     latent_build.add_argument("--targets", default="latent_state",
-                              help="注入目标：latent_state（默认）/ blocks / 节点名后缀，逗号分隔")
+                              help="注入目标：onnx 用 latent_state（默认）/ blocks / 节点名后缀；"
+                                   "pt2 用 layer_stream 或 layer_stream:0,10,20。多个目标逗号分隔"
+                                   "（别名内部的逗号会被识别，不用转义）")
     latent_build.add_argument("--sigma", type=float, default=0.04,
                               help="相对强迫强度（z (x) (1 + sigma*n)），默认 0.04；0 = 空转对照")
     latent_build.add_argument("--tau-days", dest="tau_days", type=float, default=3.0,
@@ -498,6 +570,9 @@ def main(argv=None) -> int:
     latent_build.add_argument("--hour-interval", dest="hour_interval", type=float, default=6.0,
                               help="一步多少小时（算 rho 用），默认 6")
     latent_build.add_argument("--seed", type=int, default=None, help="驱动侧随机流的种子")
+    latent_build.add_argument("--grid", default=None,
+                              help="pt2 专用：空间网格「rows,cols」（FuXi-2.1 = 120,240）。"
+                                   "fx 图里没有可靠的网格来源，必须显式给；onnx 自动推")
     latent_build.add_argument("--cache-dir", dest="cache_dir", default=None,
                               help="输出目录；默认源模型同目录（外部数据要求同目录，别乱指）")
     latent_build.add_argument("--out", default=None, help="输出文件路径；默认按指纹命名")

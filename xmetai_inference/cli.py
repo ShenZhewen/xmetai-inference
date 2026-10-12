@@ -593,7 +593,7 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
 
 def _run_member_block(model, processors, dataset_source, writer, args, init_times,
                       member_indices, save_names, lat, lon, interval, local_rank,
-                      world_size, segments=None):
+                      world_size, segments=None, rollout_batch=1):
     """成员外层的一段编舞 = 上面那个「成员循环」本身（不含收尾的 close 与总结）。
 
     逐成员跑完 ``member_indices``（每个成员一份冻结权重，进来前先 load），逐帧写盘并
@@ -677,6 +677,7 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
                 on_step=on_step,
                 progress=False,
                 progress_label=f"[rank {local_rank}/{world_size}] m{member_id:03d}",
+                batch_size=rollout_batch,
             )
             writer.flush()
             completed += len(batch_inits)
@@ -696,7 +697,7 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
 
 def _run_plain_block(model, processors, dataset_source, writer, args, member_indices,
                      save_names, lat, lon, interval, local_rank, world_size, members,
-                     total_inits, num_workers=0):
+                     total_inits, num_workers=0, rollout_batch=1):
     """确定性 / 同 session 集合的一段编舞：数据集在内层遍历，逐 batch 落盘并 flush。
 
     与 m1a 的成员外层相反：这里的「成员」是同一次 Rollout 里的多条轨迹（m3 的图内随机
@@ -753,6 +754,7 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
                 hour_interval=interval,
                 on_step=on_batch_step,
                 progress=False,
+                batch_size=rollout_batch,
             )
         else:
             for batch_index, init in enumerate(batch_inits):
@@ -788,6 +790,7 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
                     ],
                     steps=args.steps,
                     hour_interval=interval,
+                    batch_size=rollout_batch,
                 on_step=on_step,
                 # 这一个 Rollout 要跑「51 成员 x 60 步」约 3000 次前向（几十分钟），
                 # 关掉进度行等于全程零日志 —— 连首步那条「含 cudnn 穷举搜索、偏慢属正常」
@@ -1079,7 +1082,8 @@ def _worker_main(argv=None):
         return _run_member_outer(
             model, processors, dataset_source, writer, args, init_times,
             member_indices, save_names, lat, lon, interval, local_rank, world_size,
-            segments=segments)
+            segments=segments,
+            rollout_batch=worker_cfg.rollout_batch)
 
     if dataset_source is not None:
         total_t0 = perf_counter()
@@ -1087,7 +1091,8 @@ def _worker_main(argv=None):
             model, processors, dataset_source, writer, args, member_indices,
             save_names, lat, lon, interval, local_rank, world_size, members,
             total_inits=len(init_times),
-            num_workers=dataloader_config.get("num_workers", 0))
+            num_workers=dataloader_config.get("num_workers", 0),
+            rollout_batch=worker_cfg.rollout_batch)
         errors = writer.close()
         if errors:
             log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))

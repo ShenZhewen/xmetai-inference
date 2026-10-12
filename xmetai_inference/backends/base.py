@@ -88,6 +88,10 @@ class BaseInferModel(ABC):
     # m3（图内随机算子，已定格为对照）与 m1a（逐成员冻结权重，主线）。见
     # xmetai_inference/perturbation/README.md。
     supports_weight_perturb = False
+    # 是否支持潜空间 AR(1) 强迫（latent_forcing，config 字段）。与权重扰动分开声明：
+    # onnx 后端走 ONNX 图改写（latent.py），pt2 后端走 torch.fx 图改写（latent_pt2.py），
+    # 两个能力互不蕴含。见 xmetai_inference/perturbation/README.md 2N 节。
+    supports_latent_forcing = False
 
     # ONNX Runtime 的运行旋钮（PT2 后端也带着，只是不用）。由 config 的
     # intra_op_threads / cudnn_algo_search 经 create_model 落到实例上。
@@ -170,6 +174,11 @@ class BaseInferModel(ABC):
     # 就走 GPU 常驻分支。当前 GPU state 不支持 numpy recurrent transform；需要
     # 回填处理的模型应保持 gpu_state=False。
     gpu_state = False
+
+    # 图能不能一次吃多条轨迹（batch 轴是符号维）。Rollout.run 的 batch_size>1
+    # 依赖它：没声明就退回逐条，免得拿静态 batch 的图去喂 k>1 被 ORT 拒。
+    # 后端在 load 时按图的输入签名实测后置位（见 backends/onnx.py）。
+    batch_axis_dynamic = False
 
     def to_gpu(self, x):
         """numpy 初始 state -> GPU 载体（gpu_state=True 时实现）。"""

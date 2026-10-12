@@ -97,10 +97,11 @@ from .graph import (
     _check_model_path,
     _external_data_outside,
     _onnx,
-    _repoint_external_data,
     _verify_external_refs,
+    external_tensors,
     load_model,
 )
+from .spec import _rank_offset
 
 log = logging.getLogger(__name__)
 
@@ -231,8 +232,11 @@ class LatentForcingSpec(SpecBase):
                    self.length_scale))
 
 
-# 图格式版本：改「图怎么改写」（输入名、节点结构、基的归一化）就 +1 -> 指纹变 -> 新文件。
-FORCING_FORMAT = 1
+# 图格式版本：改「图怎么改写」（输入名、节点结构、基的归一化、外部数据落位方式）就
+# +1 -> 指纹变 -> 新文件。v2（2026-09-29）：跨目录落盘改为「.data 就地放进图目录 +
+# location 裸文件名」（见 _localize_external_data），v1 的「相对路径指回源目录」会被
+# onnxruntime 的 realpath 校验拒绝。
+FORCING_FORMAT = 2
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +571,53 @@ def default_forcing_path(src_path: str, spec: LatentForcingSpec) -> str:
     return osp.join(osp.abspath(directory), f"{stem}.ar1-{spec.fingerprint(src_path)}.onnx")
 
 
+def _localize_external_data(onnx, model, src_dir: str, out_dir: str) -> dict:
+    """out_dir != src_dir 时：把外部 .data 就地放进 out_dir，location 改成裸文件名。
+
+    为什么不是「相对路径指回源目录」（_repoint_external_data 的老写法，v1 用过）：新版
+    onnxruntime 建会话会把外部数据解析成**真实路径**，再校验它必须落在图所在目录内，
+    `../../..` 直接被拒（2026-09-29 A32 实踩：
+
+        External data path: "../../../tmp/.../<stem>.data" escapes both model
+        directory: ".../model_onnx" and real model directory: ...）
+
+    符号链接同样过不了 realpath 校验（weights._share_data 的头注释，2026-09-23 实测）。
+    能同时满足「换个名字、realpath 仍在图目录内」的只有**硬链接**；硬链接不可用（跨卷
+    EXDEV / fs.protected_hardlinks 且源文件不属于当前用户）就整份复制**一次**——每个
+    .data 在 out_dir 里只放一份，全部臂共用。
+
+    走 external_tensors 的完整口径（initializer + Constant 节点的外置张量）：漏掉后者
+    不会报错，只会让成员图静默指向源目录然后建会话失败（weights 的头注释有实测记录）。
+
+    返回 {basename: 方式}，方式 ∈ link / copy / exist（已在位且就是同一份文件）。
+    """
+    from .weights import _share_data
+
+    placed = {}
+    for tensor in external_tensors(model):
+        if tensor.data_location != onnx.TensorProto.EXTERNAL:
+            continue
+        for entry in tensor.external_data:
+            if entry.key != "location" or not entry.value:
+                continue
+            target = entry.value if osp.isabs(entry.value) else osp.join(src_dir, entry.value)
+            target = osp.abspath(target)
+            base = osp.basename(target)
+            dst = osp.join(out_dir, base)
+            if base not in placed:
+                if osp.exists(dst) and os.path.samefile(dst, target):
+                    placed[base] = "exist"        # 上一臂已放过（硬链接/复制），直接共用
+                else:
+                    # 同名但不是同一份文件（陈旧残留）：删掉重放。宁可重做一次也不能错读。
+                    if osp.lexists(dst):
+                        os.remove(dst)
+                    method, _reason = _share_data(target, dst, link=True)
+                    placed[base] = method
+            if entry.value != base:
+                entry.value = base
+    return placed
+
+
 def _relax_needed(onnx, model, out_dir: str, message: str = "") -> bool:
     """要不要放宽 checker 的「外部数据定位」校验。
 
@@ -597,8 +648,11 @@ def build_forcing_model(src_path: str, spec: LatentForcingSpec, out_path: str | 
 
     out_path = osp.abspath(out_path) if out_path else default_forcing_path(src_path, spec)
     out_dir = osp.dirname(out_path)
+    shared = {}
     if out_dir != src_dir:
-        _repoint_external_data(onnx, model, src_dir, out_dir)
+        # 跨目录：.data 必须真实落在图目录内（ORT 的 realpath 校验），link/copy 一次后
+        # 所有臂共用（见 _localize_external_data 的头注释）。
+        shared = _localize_external_data(onnx, model, src_dir, out_dir)
     os.makedirs(out_dir, exist_ok=True)
     tmp = f"{out_path}.tmp{os.getpid()}"
     onnx.save(model, tmp)
@@ -637,6 +691,9 @@ def build_forcing_model(src_path: str, spec: LatentForcingSpec, out_path: str | 
         print("  基：‖Vt‖=%.4f（应 ≈ sqrt(rank)=%.4f）；基隐含 sigma=%.6f（设定 %.6f）"
               % (norm_v, np.sqrt(spec.rank), sigma_implied, spec.sigma))
         print("  ρ(Δt=%gh) = %.4f（τ=%g 天）" % (spec.hour_interval, spec.rho(), spec.tau_days))
+        if shared:
+            print("  外部数据落位（%s）：%s" % (
+                out_dir, ", ".join("%s=%s" % item for item in sorted(shared.items()))))
         if not checked:
             print("  提示：checker 对「外部数据位置」的要求已放宽（.data 不复制、仍指向源文件）："
                   f"{relaxed}")
@@ -773,6 +830,19 @@ class Ar1Driver:
             self.reset(int(batch))
         return self.state
 
+    def row(self, index: int, width: int = 1) -> np.ndarray:
+        """第 index 条轨迹的 ξ（[width, T, R]）。行 = 一条**独立**的 AR(1) 流，行间
+        独立（同一 rng 流的先后抽样）；行数不够自动加宽，新行独立新抽、不影响已有行
+        的递推。供 runner **逐轨迹**调 forward 的编排用（x.shape[0] 恒 1，batch 维
+        到不了驱动侧）—— 发号（本步第几条轨迹拿第几行）由 onnx._latent_step_stream
+        负责，这里只管取行。
+        """
+        need = int(index) + int(width)
+        if need > self.state.shape[0]:
+            self.state = np.concatenate(
+                [self.state, self._draw(need - self.state.shape[0])], axis=0)
+        return self.state[index:need]
+
     def advance(self) -> None:
         noise = self.rng.standard_normal(self.state.shape).astype(np.float32)
         decay = float(np.sqrt(max(0.0, 1.0 - self.rho * self.rho)))
@@ -792,6 +862,87 @@ class Ar1Driver:
                    self.spec.sigma, self.spec.rank, self.steps))
 
 
+class LatentStepStream:
+    """潜空间 AR(1) 的驱动状态机（后端共享；onnx / pt2 各持一份实例）。
+
+    职责：在「runner **逐轨迹**调 forward（x.shape[0] 恒 1）」的编排下，决定本次
+    forward 调用该拿第几行 ξ、以及何时 reset / advance。返回行号，None = 不强迫。
+
+    语义（2026-09-29 修正版；A32 首跑暴露的原接线错误见类尾）：
+
+      * 一行 = 一条轨迹**独立**的 AR(1) 流（行间独立，来自同一 rng 流的先后抽样）；
+      * step 变化 = 新的模式步：整批推进一次（advance 对 state 的 batch 维是向量化的，
+        等价 batched forward 里的一步递推，ρ 按每步 6h 折算），槽位归零；
+      * step == 0 = 新的轨迹批（新起报 / 新成员）：全部行重抽 —— 即原 reset 语义
+        （重抽不重置随机流，「重抽 = 新轨迹」，整个任务的抽样序列仍可复现）；
+      * 同一步内按调用次序轮流发第 0,1,2... 行（Ar1Driver.row），行数不够自动加宽。
+
+    为什么不覆盖 reset_runtime_state：那是「换 session 之后状态还在不在」的契约
+    （cli 的 _guard_segment_model 靠它判断分段 rollout 能不能用），而 xi 的递推本来就在
+    驱动侧、与 session 无关。用 step 判新轨迹，语义等价且不牵动那条契约。
+
+    ---- 原接线错误（为什么不能直接 value()/advance()）----
+
+    runner 是逐轨迹调 forward 的（`for index, init_time in enumerate(...)` 里
+    `self.model.forward(states[index], ...)`），「一个 batch 多条轨迹、batch 维区分成员」
+    的假设在这条编排下不成立。直接共用单行驱动（batch=1）时，同一 Rollout 的 n 条轨迹
+    会穿插共用一条流：step 0 各自 reset 还各自独立，step >= 1 起全体消费同一条流的相邻
+    相位 —— 成员间强迫相关 rho（tau=3 天时 rho=0.92，成员几乎重复、集合严重欠散），
+    每成员自身的有效相关时间被压成 tau/n。成员间仍然互不相同，所以 check 不会报错 ——
+    这正是它危险的地方。
+    """
+
+    def __init__(self):
+        self.ar1 = None
+        self.key = None
+        self.step = None
+        self.slot = 0
+
+    def __call__(self, forcing, step, *, n_targets, member_index=0,
+                 hour_interval=None):
+        """返回本次 forward 该拿的行号（int），None = 未启用强迫。
+
+        forcing / n_targets 由后端给（onnx：图 metadata 里的目标数；pt2：注入时
+        记下的目标数）。后端自己先判 None 早退也行 —— 这里再判一次只是保险。
+        """
+        if not forcing or int(n_targets) <= 0:
+            return None
+        # 进程 rank 必须计进熵：只开 latent_forcing（没有 m1a 权重）时，集合走的是
+        # 「一个 session + 一批轨迹」那条路，member_index 恒为 0，成员身份 = 轨迹批里
+        # 的行号。多卡按成员切时每个 rank 跑一部分成员，不把 rank 计进熵的话各 rank 的
+        # xi 序列**逐位相同** —— 静默地变成重复成员。
+        rank = int(_rank_offset())
+        key = (int(member_index or 0), rank)
+        if self.ar1 is None or self.key != key:
+            self.ar1 = Ar1Driver(forcing, int(n_targets),
+                                 member_index=key[0], slot=rank, batch=1,
+                                 hour_interval=hour_interval)
+            self.key = key
+            self.step = None
+            self.slot = 0
+        if int(step) != self.step:
+            if int(step) == 0:
+                # 新轨迹批（新的起报 / 新的成员）：全部行重抽
+                self.ar1.reset()
+            else:
+                # 新的模式步：整批（每行）推进一次。首个 step==0 的行由创建时的初始
+                # 抽样给出，不推进 —— 所以这里恰好做到「step 0 喂 xi_0，step t 喂
+                # 推进 t 次的 xi_t」。
+                self.ar1.advance()
+            self.step = int(step)
+            self.slot = 0
+        index = self.slot
+        self.slot += 1
+        return index
+
+    def release(self):
+        """丢掉驱动状态（后端 release()/release_all() 时调，成员之间不共享 ξ）。"""
+        self.ar1 = None
+        self.key = None
+        self.step = None
+        self.slot = 0
+
+
 def lag1_autocorr(values) -> float:
     """诊断用：一串标量序列的 lag-1 自相关（应 ≈ ρ）。"""
     series = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -807,6 +958,7 @@ __all__ = [
     "FORCING_FORMAT",
     "FORCING_INPUT",
     "LatentForcingSpec",
+    "LatentStepStream",
     "NODE_PREFIX",
     "TARGET_ALIASES",
     "audit_forcing",

@@ -11,6 +11,20 @@ r"""fgvp_ar1：AR(1) 潜空间强迫 —— 拧「噪声的时间相关」这条
 
     python -m xmetai_inference.perturbation verdict F A32 A1 A32t1 A32t0 W32
 
+跑前冒烟（可选；2026-09-29 起 .data 跨目录落位已由 _localize_external_data 自动处理
+——硬链接进图目录，跨卷/权限不可用则整份复制**一次**。正常应直接通过）：
+
+    python -m xmetai_inference.perturbation latent build \
+        /workspace/tmp/douzsh/models/iwc_fgvp_gdn2.onnx \
+        --sigma 0.04 --tau-days 3 --length-scale 32 --rank 16 \
+        --cache-dir /workspace/data/shenzw/model_onnx
+    python - <<'EOF'
+    import onnxruntime as ort, glob
+    p = sorted(glob.glob("/workspace/data/shenzw/model_onnx/*.ar1-*.onnx"))[-1]
+    s = ort.InferenceSession(p, providers=["CPUExecutionProvider"])  # 只建会话，不跑前向
+    print("session OK:", [i.name for i in s.get_inputs()])
+    EOF
+
 为什么是这条轴（前四轮的诊断链，细节见 perturbation/README 的 2L 节）：
 
   1. sigma 只是**幅度**旋钮：D/A 同组 sigma x2 在 <=120 h 精确 x2.00；S / T / V 三个
@@ -113,6 +127,8 @@ from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 MODEL_DIR = "/workspace/tmp/douzsh/models"
 OUT_ROOT = "/workspace/data/shenzw/spw_ab"
+# 强迫图（.ar1-<指纹>.onnx）集中落这里，不落在源模型目录（2026-09-29 改）。
+MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"
 
 FGVP_AR1_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
@@ -197,10 +213,15 @@ cfg = InferConfig(
         "hour_interval": 6.0,
         # 加载时确认图里真的有 spw/xi 输入且 metadata 对得上（抓「图没被改写」）。
         "verify_on_load": True,
-        # 强迫图与源图**同目录**：外部数据（.data）引用必须落在模型目录内，否则
-        # onnxruntime 建会话时会以 "External data path validation failed" 拒绝。
-        # 纯 latent 臂落在 MODEL_DIR，W32 落在成员集目录（成员图旁边）。
-        "cache_dir": None,
+        # 强迫图集中落 MODEL_ONNX_DIR（2026-09-29 改）。跨目录时 _localize_external_data
+        # 会把 .data 硬链接（跨卷/权限不可用时整份复制**一次**）进该目录、location 改裸
+        # 文件名 —— onnxruntime 校验的是外部数据的**真实路径**必须在图目录内，相对路径
+        # 指回源目录和符号链接都过不了（坑 6，A32 首跑实测）。首跑日志看「外部数据落位」
+        # 一行确认是 link 还是 copy。
+        # 注意 W32 的强迫图也落这里（届时成员集的 perturbed.mNNN.data 也会各复制/链接
+        # 一份进来）；m1a 成员集仍在 MODEL_DIR/spw_ab（见 F_WEIGHT_PERTURB 的 member_dir，
+        # 挪它 = 指纹失配 = 重建 6 x 6.6 GB，别动）。
+        "cache_dir": MODEL_ONNX_DIR,
         },
     dataset={
         "type": "processed_multi_zarr",

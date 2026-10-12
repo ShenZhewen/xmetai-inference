@@ -138,9 +138,10 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
     即不加扰动）。
 
     weight_perturb 与 latent_forcing 是两条正交的「确定性 -> 集合」路径：前者按
-    `W~ = W (x) (1 + sigma*xi)` 改**权重**，后者按 `z' = z (x) (1 + sigma*U diag(xi_t) V^T)`
-    给图加一个 `spw/xi` 输入、改**图**（xi_t 是驱动侧的 AR(1) 过程）。两者可以同时开，
-    config 里同时写就是「冻结的扰动权重 + 时间相关的潜空间强迫」。
+    `W~ = W (x) (1 + sigma*xi)` 改**权重**（仅 ONNX 后端），后者按
+    `z' = z (x) (1 + sigma*U diag(xi_t) V^T)` 改**图**（xi_t 是驱动侧的 AR(1) 过程；
+    ONNX 后端加 `spw/xi` 输入，pt2 后端改写 torch.fx 图 + 模块属性喂 xi）。两者可以
+    同时开（仅 ONNX），config 里同时写就是「冻结的扰动权重 + 时间相关的潜空间强迫」。
 
     member_index 只在配了 weight_perturb 时有意义：它决定 load() 加载
     哪一份成员模型。跑集合时同一个实例会被反复 load（每次换一个成员号）；resident_members
@@ -177,11 +178,13 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
 
         forcing = LatentForcingSpec.from_config(latent_forcing)
         if forcing is not None:
-            if not getattr(model, "supports_weight_perturb", False):
+            # 能力位与 weight_perturb 分开：onnx（latent.py 图改写）与 pt2
+            # （latent_pt2.py 的 fx 图改写）各自声明 supports_latent_forcing。
+            if not getattr(model, "supports_latent_forcing", False):
                 raise ValueError(
                     f"{cls.__name__}（backend={model.backend}）不支持潜空间 AR(1) 强迫："
-                    "当前只实现了 ONNX 后端的图改写注入（latent_forcing），"
-                    "见 xmetai_inference/perturbation/README.md")
+                    "已实现的是 ONNX 后端（latent.py）与 pt2 后端（latent_pt2.py）的图改写"
+                    "注入，见 xmetai_inference/perturbation/README.md 2N 节")
             model.latent_forcing = forcing
     return model
 

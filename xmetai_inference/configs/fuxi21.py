@@ -24,12 +24,15 @@ FUXI21_DYNAMIC_STORES = [
 
 cfg = InferConfig(
     name="fuxi21",
-    # 权重仍在旧仓库目录下（xmetai-inference，无 2），而 ROOT 指向当前包所在的
-    # xmetai-inference2 —— 用 ROOT 拼会指到不存在的路径。这里写绝对路径，
+    # 权重与归一化统计量（mean.nc/std.nc）**必须在同一个目录**：normalize/denormalize
+    # 按 dirname(model_path) 找统计量（processing/tensor_processors.py），分开放会直接
+    # FileNotFoundError。本机三样都在 xmetai-inference2 下。
+    # 2026-09-30 更正：原默认指的「旧仓库 xmetai-inference（无 2）」在这台机器上不存在
+    # （当时以为权重留在旧目录），实测权重/mean/std/input.nc 全在 2 号目录里，改过来。
     # 换机器用 FUXI21_MODEL_PATH 覆盖。
     model_path=os.environ.get(
         "FUXI21_MODEL_PATH",
-        "/workspace/szwCode/xmetai-inference/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
+        "/workspace/szwCode/xmetai-inference2/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
     ),
     model_class="fuxi21_pt2",
 

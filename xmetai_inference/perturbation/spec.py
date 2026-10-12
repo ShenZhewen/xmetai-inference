@@ -23,6 +23,8 @@ Deterministic Machine-Learning Weather Models"（arXiv:2609.08412）。参数化
 """
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -71,6 +73,27 @@ NOISE_BLOCK_FROZEN = 8
 #       落在模型所在目录内，符号链接（指向目录外）会被直接拒绝。
 
 MEMBER_FORMAT = 3
+
+
+def _rank_offset() -> int:
+    """本进程的 rank（掺进扰动随机流的熵，防多卡各 rank 的噪声流逐位相同）。
+
+    读法与 cli 一致：LOCAL_RANK 优先（cli 给每个 worker 都设了），退回 RANK /
+    SLURM_PROCID，都没有就是单进程（0）。只影响「抽到哪份噪声」：掺熵只发生在驱动侧
+    （onnx._latent_step_stream 的 key、Ar1Driver 的 slot），任何落盘产物（成员集目录/内容）
+    都必须与 rank 无关 —— self-test 有回归钉住，别在这里做任何影响落盘的事。
+
+    2026-09-29 补写：onnx._latent_driver 一直在 import 这个名字，但它此前从不存在
+    —— latent 的框架接线没进 e2e，A32 首跑才暴露。
+    """
+    for name in ("LOCAL_RANK", "RANK", "SLURM_PROCID"):
+        value = os.environ.get(name)
+        if value:
+            try:
+                return int(value)
+            except ValueError:
+                continue            # 脏值当没有，宁可退化成单进程也别炸
+    return 0
 
 
 @dataclass

@@ -1414,6 +1414,402 @@ def _case_latent(work, check):
     check(ok, "把噪声挂在图的输出上会被明确拒绝（注入无处安放）")
 
 
+# ---------------------------------------------------------------------------
+# 潜空间 AR(1) 强迫 —— pt2 后端（latent_pt2.py）
+# ---------------------------------------------------------------------------
+# 夹具尺寸取到「网格大于 1x1、rank < channels」的最小可用档：空间基的低通在 4x4 上
+# 不会退化（length_scale=1 时非 DC 模的能量远在兜底阈值之上），也不至于让用例变慢。
+_PT2_TOKENS = 16
+_PT2_CHANNELS = 8
+_PT2_HIDDEN = 16
+_PT2_LAYERS = 3
+_PT2_GRID = (4, 4)
+_PT2_RANK = 4
+
+
+def _write_pt2_fixture(path, kind="fuxi"):
+    """写一个 FuXi 形状的迷你 decoder，导出成真 .pt2，返回 (路径, 内存里的 torch 模型)。
+
+    `kind` 换层内结构，只给负例用："fuxi"（真图拓扑）/ "sig"（链路撞上未知算子）/
+    "fanout"（链路分叉）—— 后两者要求回溯**报错**，不是硬穿过去。
+
+    为什么必须过真正的 `torch.export` 而不是手搭一个 GraphModule：本用例要钉的恰恰是
+    **回溯规则本身** —— torch.export 把参数名变成 `p_model_decoder_layers_{k}_mlp_w2_weight`、
+    它的消费者是 `aten.linear`、中间隔着 clone/mul 才到残差 `aten.add`。手搭图等于把这条
+    规则当成前提，真机上名字一变（torch 版本、导出选项）用例还是绿的 —— 而这里的绿正是
+    「别拿真模型试」的替代品。
+
+    结构逐层照抄 FuXi-2.1 的命名**与拓扑**：
+
+        x --(layers.0)--> z0 --(layers.1)--> z1 --(layers.2)--> z2 --head--> y
+        每层：z = z + mlp(z).clone() * scale，mlp = w1 -> relu -> w2（w2 无 bias）
+        注入点 = 每层那个残差 add 的输出（= build_basis 要的 [B, tokens, channels]）。
+
+    `clone` 与 `scale`（形状 [1,1,C]，在 token 维广播）是**照抄真图**的，不是凑数：2026-09-30
+    在 fuxi-2.1.pt2 上实测的链路是 `linear → clone → mul(×[1,1,1536]) → add`，而最初的回溯
+    只认 `linear → add` 一步，于是在真图上直接报「0 个 add 消费者」。夹具跟真图同构，这条
+    规则才有人守 —— 否则自测测的是一个真机上不存在的结构。
+    """
+    import torch
+    import torch.nn as nn
+
+    class _Mlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w1 = nn.Linear(_PT2_CHANNELS, _PT2_HIDDEN, bias=False)
+            self.w2 = nn.Linear(_PT2_HIDDEN, _PT2_CHANNELS, bias=False)
+
+        def forward(self, x):
+            return self.w2(torch.relu(self.w1(x)))
+
+    class _Layer(nn.Module):
+        def __init__(self, kind="fuxi"):
+            super().__init__()
+            self.kind = kind
+            self.mlp = _Mlp()
+            # [1, 1, C]：与真图的调制向量同形（在 token 维广播）。
+            self.scale = nn.Parameter(torch.ones(1, 1, _PT2_CHANNELS))
+
+        def forward(self, x):
+            hidden = self.mlp(x)
+            if self.kind == "fuxi":
+                return x + hidden.clone() * self.scale
+            if self.kind == "sig":
+                # 链路上出现未知算子：回溯必须**报错**而不是硬穿过去。
+                return x + torch.sigmoid(hidden)
+            # "fanout"：linear 输出被用两次，链路分叉 —— 同样必须报错。
+            return x + hidden + hidden
+
+    class _Decoder(nn.Module):
+        def __init__(self, kind):
+            super().__init__()
+            self.layers = nn.ModuleList([_Layer(kind) for _ in range(_PT2_LAYERS)])
+
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+
+    class _MiniFuxi(nn.Module):
+        def __init__(self, kind="fuxi"):
+            super().__init__()
+            # model.decoder.layers.{k}.mlp.w2 这条嵌套路径是必需的：占位符名字由它拼出来。
+            self.model = nn.Module()
+            self.model.decoder = _Decoder(kind)
+            self.head = nn.Linear(_PT2_CHANNELS, _PT2_CHANNELS, bias=False)
+
+        def forward(self, x, step, hour, doy):
+            return self.head(self.model.decoder(x))
+
+    torch.manual_seed(0)
+    model = _MiniFuxi(kind).eval()
+    args = (torch.zeros(1, _PT2_TOKENS, _PT2_CHANNELS),
+            torch.zeros(1), torch.zeros(1), torch.zeros(1))
+    torch.export.save(torch.export.export(model, args), path)
+    return path, model
+
+
+def _pt2_spec(**overrides):
+    """夹具用的规格：显式给 tokens/channels/grid（fx 图推不出网格）。"""
+    kwargs = {"targets": ("layer_stream:0,2",), "sigma": 0.04, "tau_days": 3.0,
+              "rank": _PT2_RANK, "length_scale": 1.0, "tokens": _PT2_TOKENS,
+              "channels": _PT2_CHANNELS, "grid": _PT2_GRID, "seed": 0,
+              "hour_interval": 6.0}
+    kwargs.update(overrides)
+    return LatentForcingSpec(**kwargs)
+
+
+def _pt2_state(torch, path):
+    """加载一份**未注入**的 ExportedProgram（attach_forcing 是就地改写，必须逐次重载）。"""
+    return torch.export.load(path)
+
+
+def _pt2_reference(torch, model, x, xi, applied, basis_v, basis_u):
+    """独立参考：逐层重放，在指定的层输出上乘 (1 + n)。
+
+    `applied` 是 [(层号, xi 列号), ...] —— 列号与层号的对应由 targets 决定，**故意分开传**：
+    写成 `xi[层号]` 就等于把「第 k 列接在第 k 层」这条待验证的假设塞进了参考里。
+
+    n[tok, c] = sum_r xi[r] * V[tok, r] * U[r, c] —— 与图里那条链同一个式子，但走
+    torch 的 eager 路径。两边一致才说明「改图真的把场乘在了**这一层**的残差流上」。
+    """
+    z = x
+    for index, layer in enumerate(model.model.decoder.layers):
+        z = layer(z)
+        for layer_no, column in applied:
+            if layer_no == index:
+                field = (basis_v * xi[column].unsqueeze(0)) @ basis_u   # [N, C]
+                z = z * (1.0 + field)
+    return model.head(z)
+
+
+def _case_latent_pt2(work, check):
+    """潜空间 AR(1) 强迫的 **pt2（torch.export）后端**：回溯 / 注入 / 数值 / 列序 / 驱动。
+
+    与 ONNX 版（`_case_latent`）的分工：那边钉的是「图改写 + 落盘 + 外部数据」，这边钉的是
+    torch.fx 特有的三件事 ——
+
+      1. **回溯规则**：目标只能从权重占位符倒着找（fx 图里计算节点全是泛型 aten 名），
+         名字一变就会静默注错地方；
+      2. **xi 走模块属性**：torch.export 的图签名固定，塞不进新输入，所以属性名的形状 /
+         执行期可覆写性是唯一的接入口（名字还必须用下划线，`/` 会生成非法 Python）；
+      3. **不落盘**：没有图文件、没有 metadata，所以「注入对不对」只能靠**数值**判，
+         不像 ONNX 版还能查 spw.ar1.* 元数据。
+
+    数值判据里最锋利的一条是 **xi 全 0 时输出与未注入模型逐位相同**：gain 恒为 1.0、
+    `z * 1.0` 逐位等于 `z`，所以任何「改错了节点 / 改错了乘的位置 / 改成了加性」都会在这里露出来。
+    """
+    try:
+        import torch  # noqa: F401
+    except ImportError as error:  # noqa: BLE001 - 环境里没有 torch 就跳过整节
+        check(True, f"没有 torch，跳过 pt2 后端用例：{error}")
+        return
+
+    from .latent_pt2 import (attach_forcing, audit_fx_forcing, detect_fx_layout,
+                             resolve_fx_targets, _walk_layer)
+
+    box = osp.join(work, "latent_pt2")
+    os.makedirs(box, exist_ok=True)
+    path, model = _write_pt2_fixture(osp.join(box, "mini_fuxi.pt2"))
+    tokens, channels = _PT2_TOKENS, _PT2_CHANNELS
+    x = torch.randn(1, tokens, channels, generator=torch.Generator().manual_seed(3))
+    step, hour, doy = torch.zeros(1), torch.zeros(1), torch.zeros(1)
+
+    # ---- 1) 目标回溯 ----
+    gm = _pt2_state(torch, path).graph_module
+    anchors = sorted(node.name for node in gm.graph.nodes if node.op == "placeholder"
+                     and "mlp_w2_weight" in node.name)
+    check(len(anchors) == _PT2_LAYERS,
+          "导出图里每层都有 mlp_w2 权重占位符（回溯锚点存在）", str(anchors))
+    two = resolve_fx_targets(gm, _pt2_spec())
+    everything = resolve_fx_targets(gm, _pt2_spec(targets=("layer_stream",)))
+    one = resolve_fx_targets(gm, _pt2_spec(targets=("layer_stream:1",)))
+    check(len(two) == 2 and len(everything) == _PT2_LAYERS and len(one) == 1,
+          "layer_stream:0,2 / layer_stream / layer_stream:1 分别解析出 2 / 3 / 1 个目标",
+          f"得到 {len(two)} / {len(everything)} / {len(one)}")
+    order = [node.name for node in gm.graph.nodes]
+    check(all(str(node.target) == "aten.add.Tensor" for node in two)
+          and order.index(two[0].name) < order.index(two[1].name),
+          "解析出来的目标是残差 add，且层号顺序 = 图里的先后顺序",
+          f"得到 {[node.name for node in two]}")
+    check(two == [everything[0], everything[2]],
+          "「0,2」就是「全部层」里的第 0、2 个（层号没有错位）",
+          f"{[n.name for n in two]} vs {[n.name for n in everything]}")
+    check(one[0] not in two,
+          "层号 1 解析到的是另一个节点（不是所有层号都落到同一个 add 上）")
+    # 回溯**链路**：真图是 linear → clone → mul → add，夹具必须同构，否则这条规则没人守。
+    chains = {layer: [node.name for node in _walk_layer(gm, layer)] for layer in range(_PT2_LAYERS)}
+    targets = {str(node.target) for node in two}
+    check(all(len(chain) == 4 and targets == {"aten.add.Tensor"}
+              for chain in chains.values())
+          and all("clone" in name or "mul" in name for chain in chains.values()
+                  for name in chain[1:3]),
+          "回溯沿单链穿过 clone/mul 才到残差 add（与真图 fuxi-2.1.pt2 同构，不是直连）",
+          f"层 0 链路 {chains[0]}")
+    for kind, fragment in (("sig", "不在已知的透明算子里"), ("fanout", "分叉")):
+        variant = osp.join(box, f"variant_{kind}.pt2")
+        _write_pt2_fixture(variant, kind=kind)
+        try:
+            _walk_layer(_pt2_state(torch, variant).graph_module, 0)
+            ok = False
+        except ValueError as error:
+            ok = fragment in str(error)
+        check(ok, f"回溯错例被拦下：{fragment}（层内结构 {kind}）")
+
+    for bad, fragment in ((_pt2_spec(targets=("layer_stream:9",)), "不在图里"),
+                          (_pt2_spec(targets=("没有这个节点",)), "找不到")):
+        try:
+            resolve_fx_targets(gm, bad)
+            ok = False
+        except ValueError as error:
+            ok = fragment in str(error)
+        check(ok, f"错例被拦下：{fragment}（{'层号越界' if '层' in fragment else '节点名不存在'}）")
+    plain_path = osp.join(box, "plain.pt2")
+    torch.export.save(torch.export.export(
+        torch.nn.Linear(channels, channels), (torch.zeros(1, tokens, channels),)), plain_path)
+    try:
+        resolve_fx_targets(_pt2_state(torch, plain_path).graph_module, _pt2_spec())
+        ok = False
+    except ValueError as error:
+        ok = "没有任何 layer_stream 锚点" in str(error)
+    check(ok, "不是 decoder 结构的图（没有锚点）被明确拒绝，而不是静默注 0 个目标")
+
+    # 裸数字：CLI 的 `--targets layer_stream:0,2` 会被逗号拆成 ("layer_stream:0", "2")，而 "2"
+    # 作为节点名后缀**碰巧**能匹配到无关节点（本夹具上就匹配到了 channels 不同的那个）⇒ 静默注错。
+    # 后缀匹配是给显式节点名兜底的，裸数字一律拒绝。
+    try:
+        resolve_fx_targets(gm, _pt2_spec(targets=("layer_stream:0", "2")))
+        ok = False
+    except ValueError as error:
+        ok = "裸数字" in str(error)
+    check(ok, "裸数字注入点被拒绝（防 CLI 逗号把 layer_stream 层号拆开后静默后缀匹配）")
+    from .__main__ import _split_targets
+
+    check(_split_targets("layer_stream:0,10,20") == ("layer_stream:0,10,20",)
+          and _split_targets("layer_stream:0,2,latent_state") == ("layer_stream:0,2", "latent_state")
+          and _split_targets("a, b") == ("a", "b"),
+          "CLI 的 --targets 只在别名**外**按逗号切（别名内的逗号并回同一个 token）",
+          str(_split_targets("layer_stream:0,2,latent_state")))
+
+    # ---- 2) 布局：网格必须显式给，tokens/channels 对不上要报错 ----
+    layout = detect_fx_layout(gm, two, _pt2_spec())
+    check((layout["tokens"], layout["channels"], layout["grid"]) == (tokens, channels, _PT2_GRID),
+          "detect_fx_layout：从目标节点的 meta 读出 tokens/channels，grid 用显式值",
+          f"得到 {layout}")
+    for bad, fragment in ((_pt2_spec(grid=None), "必须显式给"),
+                          (_pt2_spec(tokens=tokens + 1), "配置与模型不符"),
+                          (_pt2_spec(channels=channels + 1), "配置与模型不符"),
+                          (_pt2_spec(grid=(2, 2)), "!= tokens")):
+        try:
+            detect_fx_layout(gm, two, bad)
+            ok = False
+        except ValueError as error:
+            ok = fragment in str(error)
+        check(ok, f"错例被拦下：{fragment}")
+
+    # ---- 3) sigma=0 = 一个节点都不插（空转对照必须是**真的**没改图）----
+    zero_ep = _pt2_state(torch, path)
+    report = attach_forcing(zero_ep, _pt2_spec(sigma=0.0), src_path=path, verbose=False)
+    check(report["skipped"] and report["n_targets"] == 0
+          and not hasattr(zero_ep.graph_module, "spw_xi"),
+          "sigma=0 时不改图（不挂 spw_* 属性、n_targets=0 == 驱动侧不喂 xi）",
+          str(report))
+    check(torch.equal(zero_ep.module()(x, step, hour, doy), model(x, step, hour, doy)),
+          "sigma=0 的空转模型与未注入模型逐位相同")
+
+    # ---- 4) 注入：节点数 / 属性形状 / 审计 ----
+    ep = _pt2_state(torch, path)
+    spec = _pt2_spec(sigma=0.3)
+    report = attach_forcing(ep, spec, src_path=path, verbose=False)
+    gm = ep.graph_module
+    check(report["ok"] and report["nodes"] == 5 * len(two) and report["n_targets"] == len(two),
+          "每个目标 5 个节点（select/mul/mm/add/mul），审计通过",
+          f"nodes={report['nodes']} n_targets={report['n_targets']} ok={report['ok']}")
+    check(tuple(gm.spw_V.shape) == (tokens, _PT2_RANK)
+          and tuple(gm.spw_U.shape) == (_PT2_RANK, channels)
+          and tuple(gm.spw_xi.shape) == (len(two), _PT2_RANK),
+          "基挂在模块属性上：V [tokens, rank] / U [rank, channels] / xi [目标数, rank]",
+          f"{tuple(gm.spw_V.shape)} / {tuple(gm.spw_U.shape)} / {tuple(gm.spw_xi.shape)}")
+    bare = attach_forcing(_pt2_state(torch, path), _pt2_spec(sigma=0.3), verbose=False)
+    check(bare["fingerprint"].startswith("s-") and len(bare["fingerprint"]) == 12,
+          "没给 src_path 时指纹退成规格自身的 s- 前缀（不像 ONNX 版含源图身份）",
+          bare["fingerprint"])
+    check(report["fingerprint"] == spec.fingerprint(path),
+          "给了 src_path 时指纹与 ONNX 版同一套口径（spec.fingerprint(源文件)）",
+          report["fingerprint"])
+
+    # ---- 5) 数值：xi=0 逐位恒等 / 与参考一致 / 图自身无随机性 ----
+    module = ep.module()
+    # ⚠ unlift 陷阱（后端接线全建在这条实测上）：ep.module() **不是** ep.graph_module，
+    # 它会用 deepcopy 出来的图新建一个 GraphModule；spw_* 因为是 get_attr 的目标会被
+    # 一起带过去，但那是同一批张量对象的**引用** ⇒ 就地 copy_ 两边都看得见，而 setattr
+    # 换一个新张量只会改到其中一个副本（另一个正是前向在读的那个，于是静默退化成确定性
+    # 预报）。backends/pt2.py 因此持有 module() 的返回值并 copy_ 就地写。
+    check(module is not gm, "ep.module() 与 ep.graph_module 是两个不同的 GraphModule（走了 unlift）")
+    check(all(hasattr(module, name) for name in ("spw_V", "spw_U", "spw_xi")),
+          "注入的 spw_* 跟着 get_attr 一起被带进了 unlift 出来的 module")
+    check(module.spw_xi is gm.spw_xi and module.spw_V is gm.spw_V,
+          "两个 module 共享的是**同一批张量对象**（所以就地改写在两边都生效）")
+    module.spw_xi.copy_(torch.full_like(module.spw_xi, 0.5))
+    check(torch.equal(module.spw_xi, gm.spw_xi),
+          "在 module 上 copy_ 后 graph_module 看到同样的值（就地改写，不是换张量）")
+    with torch.no_grad():
+        gm.spw_xi.zero_()
+    # 基线用**同一份导出图**再加载一次（未注入）：与 out0 走同一条 codegen 路径，唯一差别
+    # 就是那 5xN 个新节点在 xi=0 时恒等于恒等映射 —— 拿 eager 模型比会掺进「eager 与导出图
+    # 的算子等价性」这个无关变量，逐位判据就不锋利了。
+    base = _pt2_state(torch, path).module()(x, step, hour, doy)
+    out0 = module(x, step, hour, doy)
+    check(torch.equal(out0, base),
+          "xi 全 0 时输出与**未注入的同一份导出图**逐位相同（gain 恒为 1.0，注入是乘性的）")
+    check(torch.equal(out0, module(x, step, hour, doy)),
+          "同一个 xi 两次前向逐位相同（图里没有随机算子 —— 随机性全在驱动侧）")
+
+    basis_v, basis_u = gm.spw_V.detach(), gm.spw_U.detach()
+    # 列号↔层号按 targets=("layer_stream:0,2") 的解析顺序推定：第 0 列 = 第 0 层、第 1 列
+    # = 第 2 层。**只喂一列**的两种情形是关键：若图里某一列实际接到了另一层，参考与实测
+    # 会立刻分家（两列都喂的话有概率互相掩盖）。
+    for applied, seed in [(((0, 0),), 1), (((2, 1),), 2), (((0, 0), (2, 1)), 3)]:
+        generator = torch.Generator().manual_seed(seed)
+        xi = torch.zeros(len(two), _PT2_RANK)
+        for _, column in applied:
+            xi[column] = torch.randn(_PT2_RANK, generator=generator)
+        with torch.no_grad():
+            gm.spw_xi.copy_(xi)
+            got = module(x, step, hour, doy)
+            expected = _pt2_reference(torch, model, x, xi, applied, basis_v, basis_u)
+        gap = float((got - expected).abs().max())
+        label = " / ".join(f"第 {column} 列 -> 第 {layer} 层" for layer, column in applied)
+        check(torch.allclose(got, expected, rtol=1e-4, atol=1e-5),
+              f"xi 只喂这几列时输出 == 参考（{label}）", f"最大偏差 {gap:.3e}")
+    check(not torch.allclose(out0, module(x, step, hour, doy)),
+          "换一个 xi 输出就变（属性是执行期读的，不是注册时烘死的）")
+
+    # 列序的独立证据：把两列**互换**应当给出与「交换后的参考」一致的结果 —— 如果
+    # 图里某两列实际接到了同一层，这条会与上一条同时失败。
+    xi = torch.randn(len(two), _PT2_RANK, generator=torch.Generator().manual_seed(13))
+    swapped = xi.flip(0)
+    with torch.no_grad():
+        gm.spw_xi.copy_(xi)
+        straight = module(x, step, hour, doy)
+        gm.spw_xi.copy_(swapped)
+        flipped = module(x, step, hour, doy)
+        expected = _pt2_reference(torch, model, x, swapped, ((0, 0), (2, 1)), basis_v, basis_u)
+    check(not torch.allclose(straight, flipped)
+          and torch.allclose(flipped, expected, rtol=1e-4, atol=1e-5),
+          "两列互换后输出随之改变，且等于「按互换后的 xi 重算的参考」（列序真的分到了不同的层）",
+          f"互换前后最大差 {float((straight - flipped).abs().max()):.3e}")
+
+    # ---- 6) 重复注入必须被拦下（否则同一层被乘两次，spread 静默放大）----
+    try:
+        attach_forcing(ep, spec, src_path=path, verbose=False)
+        ok = False
+    except RuntimeError as error:
+        ok = "已经注入过" in str(error)
+    check(ok, "对同一个 GraphModule 重复注入会被拒绝（防止双重扰动）")
+    check(audit_fx_forcing(gm)["ok"],
+          "audit_fx_forcing：每目标一条 select(spw_xi) 链且形状自洽", str(audit_fx_forcing(gm)))
+
+    # ---- 7) 驱动侧：后端共享的 LatentStepStream（A32 首跑踩的是这条接线）----
+    from .latent import LatentStepStream
+
+    stream = LatentStepStream()
+    rows = [stream(spec, 0, n_targets=len(two), member_index=0, hour_interval=6.0)
+            for _ in range(3)]
+    check(rows == [0, 1, 2],
+          "同一步内按调用次序轮流发第 0/1/2 行（runner 是逐轨迹调 forward 的）",
+          str(rows))
+    wide = stream(spec, 0, n_targets=len(two), member_index=0, hour_interval=6.0)
+    # 发号与加宽是两步：状态机只发**行号**，加宽发生在后端真正取行时（Ar1Driver.row）。
+    check(wide == 3 and stream.ar1.state.shape[0] == 1,
+          "第 4 条轨迹拿到行号 3，而驱动状态此时还只有 1 行（发号不预抽）",
+          f"行号 {wide}，state 行数 {stream.ar1.state.shape[0]}")
+    taken = stream.ar1.row(wide)
+    check(taken.shape == (1, len(two), _PT2_RANK) and stream.ar1.state.shape[0] == 4
+          and not np.allclose(taken[0], stream.ar1.state[0]),
+          "取行时自动加宽到 4 行，新行与已有行不同（新行独立新抽，不影响已有行的递推）",
+          f"取到 {taken.shape}，state 行数 {stream.ar1.state.shape[0]}")
+    check(stream(spec, 1, n_targets=len(two), member_index=0, hour_interval=6.0) == 0,
+          "换一个 step -> 槽位归零（同一模式步整批只推进一次）")
+    check(abs(stream.ar1.rho - math.exp(-(6.0 / 24.0) / 3.0)) < 1e-12,
+          "rho 由驱动侧按 hour_interval 折算（tau 不进图，所以换 tau 复用同一份改写）",
+          f"rho={stream.ar1.rho:.6f}")
+    drifted = stream.ar1.state.copy()
+    stream(spec, 0, n_targets=len(two), member_index=0, hour_interval=6.0)
+    check(not np.allclose(drifted, stream.ar1.state),
+          "step 回到 0 = 新轨迹批：全部行重抽（重抽不重置随机流）")
+    other = LatentStepStream()
+    first = stream(spec, 0, n_targets=len(two), member_index=1, hour_interval=6.0)
+    second = other(spec, 0, n_targets=len(two), member_index=2, hour_interval=6.0)
+    check(first == 0 and second == 0
+          and not np.allclose(stream.ar1.state[0], other.ar1.state[0]),
+          "换成员号 -> 换一条独立的 xi 流（成员独立性来自 member_index 这条熵）")
+    stream.release()
+    check(stream.ar1 is None and stream(spec, 0, n_targets=0, member_index=0) is None,
+          "release() 丢掉驱动状态；n_targets=0（sigma=0 空转）时恒返回 None",
+          "两个后端共用的早退路径")
+
+
 CASES = (
     ("无损改写（sigma->0 与源权重逐位相同）", _case_equivalence),
     ("扰动冻结与注入方差定律", _case_randomness),
@@ -1425,6 +1821,7 @@ CASES = (
     ("分段 rollout 计划（spw_segments / E3）", _case_segment_plan),
     ("判决页的判据层（p 插值 / k 折算 / 平坦度 / 判据分类 / 门槛）", _case_verdict),
     ("潜空间 AR(1) 强迫（等价性 / 数值 / 结构 / 驱动侧）", _case_latent),
+    ("潜空间 AR(1) 强迫的 pt2 后端（fx 回溯 / 属性喂 xi / 列序）", _case_latent_pt2),
 )
 
 

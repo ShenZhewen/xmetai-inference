@@ -45,6 +45,19 @@ def _stack(values, axis=0):
     return np.stack(values, axis)
 
 
+def _cat(values, axis=0):
+    """torch 用 torch.cat，numpy 用 np.concatenate —— 沿**已有**维拼，不新增维。
+
+    与 _stack 的区别在这里是致命的：Trajectory.state 的契约是 (1, F, C, H, W)，
+    本身已带 batch 维。拼 k 条要的是 (k, F, C, H, W)，所以是 cat(dim=0)；
+    用 stack 会得到 (k, 1, F, C, H, W)，喂给图直接报
+    "Invalid rank for input: input Got: 6 Expected: 5"。
+    """
+    if values and isinstance(values[0], torch.Tensor):
+        return torch.cat(values, dim=axis)
+    return np.concatenate(values, axis=axis)
+
+
 @dataclass
 class Trajectory:
     """一条独立的自回归轨迹。
@@ -79,7 +92,7 @@ class Rollout:
         return getattr(self.processing, f"process_{stage}")
 
     def run(self, trajectories, steps, hour_interval=6, on_step=None,
-            progress=True, progress_label=""):
+            progress=True, progress_label="", batch_size=1):
         """跑 steps 步，每步对全部轨迹各前向一次。
 
         on_step(step_index, step_state) 每步回调一次，step_state 形状
@@ -91,7 +104,20 @@ class Rollout:
         (n_traj, C, H, W) 数组完全相同（step_state[i] 就是第 i 条轨迹的帧），
         省掉一次整块拷贝。
 
-        返回流式时为 None，否则为堆叠结果。
+        ``batch_size`` 是一次 forward 最多堆几条轨迹（默认 1 = 逐条前向，与历史
+        行为逐位一致）。>1 时把轨迹按块堆成 (k, F, C, H, W) 一次喂给模型，GPU 上
+        的算力占用明显不同（Mamba/GatedDeltaNet 这类顺序扫描骨干尤其吃这个）。
+        三个前提：
+
+          * 图导出时 batch 轴是**符号维**（动态），静态维喂 k>1 会被 ORT 直接拒；
+            模型层用 ``batch_axis_dynamic`` 声明，没声明就自动退回 1（见下）。
+          * 各轨迹的时刻**可以不同** —— step/hour/doy 按 (k,) 向量喂，见
+            ``_scalar_feeds``。同一批里既有同起报的多成员、也有多起报的场合都成立。
+          * ``gpu_state=False``。GPU 常驻分支的 _spare buffer 复用假设固定 shape，
+            动态 batch 轴建不出 buffer，故两者互斥（这里直接报错，不静默退回）。
+
+        显存按 k 倍涨：一条轨迹的状态是 (F, C, H, W) 浮点，0.25° 78 通道两帧约
+        648 MB，k 要照着可用显存给，别拿成员总数一把梭。
         """
         if not trajectories:
             raise ValueError("trajectories 为空，没有可跑的轨迹")
@@ -108,11 +134,39 @@ class Rollout:
         if use_gpu and recurrent_transform is not None:
             raise ValueError("GPU 常驻模式暂不支持 recurrent Processor")
 
-        # 每条轨迹一份独立缓冲：forward 可能原地改，且 state=result 回填会替换它。
+        if batch_size < 1:
+            raise ValueError(f"batch_size 必须 >= 1，实际 {batch_size}")
+        if batch_size > 1:
+            if use_gpu:
+                # 不静默退回：这是配置互斥，悄悄跑成逐条会让人以为批量化生效了。
+                raise ValueError(
+                    "batch_size>1 与 gpu_state=True 互斥：GPU 常驻分支（forward_gpu）"
+                    "的 _spare buffer 复用假设固定 shape，动态 batch 轴建不出 buffer。")
+            if not getattr(self.model, "batch_axis_dynamic", False):
+                # 静默退回会让人以为批量化生效了，所以先喊一声。图是静态 batch 时
+                # 喂 k>1 会被 ORT 拒，退回 1 至少让这一趟跑完。
+                log.warning(
+                    "模型未声明 batch_axis_dynamic（导出时 batch 轴不是符号维），"
+                    "batch_size=%d 退回 1；要真多 batch 推理得重导动态 batch 的图。",
+                    batch_size)
+                batch_size = 1
+
+        # 轨迹按 batch_size 分块，每块一次前向。batch_size=1 时每块一条，
+        # states 里每项仍是 (1,F,C,H,W)，与逐轨迹路径逐位等价。
+        chunks = [list(range(start, min(start + batch_size, len(trajectories))))
+                  for start in range(0, len(trajectories), batch_size)]
+
+        # 每块一份独立缓冲：forward 可能原地改，且 state=result 回填会替换它。
+        # 多条用 _cat 不用 _stack：state 已带 batch 维 (1,F,C,H,W)，要拼成
+        # (k,F,C,H,W)，stack 会多出一维变成 6 维、被 ORT 拒。
         if use_gpu:
             states = [self.model.to_gpu(t.state) for t in trajectories]
         else:
-            states = [_copy_state(t.state) for t in trajectories]
+            states = [
+                _copy_state(trajectories[chunk[0]].state) if len(chunk) == 1
+                else _cat([_copy_state(trajectories[i].state) for i in chunk], 0)
+                for chunk in chunks
+            ]
         in_frames = trajectories[0].state.shape[1]
         init_times = [pd.to_datetime(t.init_time) for t in trajectories]
 
@@ -132,32 +186,43 @@ class Rollout:
         for step in range(steps):
             t0 = perf_counter()
             parts = []
-            for index, init_time in enumerate(init_times):
-                valid_time = init_time + pd.Timedelta(
-                    hours=(step + offset) * hour_interval)
+            for chunk_index, chunk in enumerate(chunks):
+                valid_times = [
+                    init_times[index] + pd.Timedelta(
+                        hours=(step + offset) * hour_interval)
+                    for index in chunk
+                ]
+                prev = states[chunk_index]
 
                 if use_gpu:
-                    result = self.model.forward_gpu(
-                        states[index], step, valid_time)
-                    states[index] = result
+                    # batch_size 已强制为 1（见上），chunk 必是单条
+                    result = self.model.forward_gpu(prev, step, valid_times[0])
+                    states[chunk_index] = result
                     parts.append(self.model.to_numpy(result)[0, -1])
                     continue
 
-                result = self.model.forward(states[index], step, valid_time)
-                next_state = self._next_state(
-                    states[index], result, in_frames, windowed)
-                # 末帧 = 本步预报。先取出副本再回填 —— recurrent Processor
-                # （如 zero_channels）是原地改，不复制会把已取出的预报也改掉。
-                pred = next_state[0, -1]
-                if recurrent_transform is not None:
-                    # 有 recurrent 处理器（如 zero_channels）时必须留副本：那一步是原地
-                    # 改，不留副本会把已取出的预报一起改掉。
-                    pred = (pred.clone() if isinstance(pred, torch.Tensor)
-                            else pred.copy())
-                # 没有 recurrent 时 next_state 由 states[index] 持有、本步不会再被写，
-                # 持视图即可 —— 每条轨迹一份 324 MB，51 个成员就是 16.5 GB 白占。
-                parts.append(pred)
-                states[index] = (
+                # 单条喂标量时刻；多条喂时刻列表 —— _scalar_feeds 把后者拼成 (k,) 的
+                # step/hour/doy，正是动态 batch 图要的形状（同一批里各轨迹的小时与
+                # 年积日可以不同，所以逐行给）。
+                result = self.model.forward(
+                    prev, step,
+                    valid_times[0] if len(chunk) == 1 else valid_times)
+                next_state = self._next_state(prev, result, in_frames, windowed)
+
+                # 末帧 = 本步预报，逐轨迹切一份，下标语义与 (n_traj, C, H, W) 数组
+                # 逐位一致。有 recurrent Processor（如 zero_channels）时那一步是原地
+                # 改，必须先留副本再回填，否则会把已取出的预报一起改掉。
+                preds = next_state[:, -1]
+                for row in range(preds.shape[0]):
+                    frame = preds[row]
+                    if recurrent_transform is not None:
+                        frame = (frame.clone() if isinstance(frame, torch.Tensor)
+                                 else frame.copy())
+                    parts.append(frame)
+                # 没有 recurrent 时 next_state 由 states[chunk_index] 持有、本步不会
+                # 再被写，parts 里的视图即可 —— 每条轨迹一份 324 MB，51 个成员就是
+                # 16.5 GB 白占。
+                states[chunk_index] = (
                     recurrent_transform(next_state)
                     if recurrent_transform is not None else next_state)
 

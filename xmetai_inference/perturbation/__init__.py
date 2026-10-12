@@ -38,6 +38,7 @@ from .graph import (resolve_effective_path, select_initializers)
 from .latent import (
     Ar1Driver,
     LatentForcingSpec,
+    LatentStepStream,
     audit_forcing,
     build_basis,
     build_forcing_model,
@@ -68,6 +69,7 @@ __all__ = [
     "Ar1Driver",
     "DEFAULT_EXCLUDE",
     "LatentForcingSpec",
+    "LatentStepStream",
     "NOISE_STRUCTS",
     "Segment",
     "SegmentPlan",
