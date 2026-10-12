@@ -496,6 +496,26 @@ def _guard_segment_model(cls, plan):
             "验证过（换 session 会重置输出 buffer 复用池）。请先用 gpu_state=False 跑分段。")
 
 
+def _graph_member_split(members, graphs):
+    """把 members 个成员摊到 graphs 份扰动图上：均分 + 余数给前面的图。
+
+    集合模型 + 权重扰动（config 的 perturb_graphs）用：成员 m = 第 g 份冻结权重 x
+    该图 session 内的第 j 次前向。返回 [(graph_id, [全局成员号...]), ...]，长度 =
+    graphs、每份非空。例：members=51, graphs=5 -> 11 + 10 + 10 + 10 + 10。
+    """
+    if graphs < 1:
+        raise ValueError(f"graphs 必须 >= 1，拿到 {graphs}")
+    if members < graphs:
+        raise ValueError(f"members({members}) < graphs({graphs})：会有图分不到成员")
+    base, rem = divmod(members, graphs)
+    out, start = [], 0
+    for graph_id in range(graphs):
+        size = base + (1 if graph_id < rem else 0)
+        out.append((graph_id, list(range(start, start + size))))
+        start += size
+    return out
+
+
 def _prepare_member_set(src, spec, count, member_indices, local_rank, world_size):
     """m1a：生成本 rank 那一份成员，然后等齐本 rank 要跑的那些成员。
 
@@ -693,6 +713,56 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
             gc.collect()
         log.info("member_%03d 完成，总耗时 %s",
                  member_id, _fmt_dur(perf_counter() - t_member))
+
+
+def _run_graph_outer(model, processors, dataset_source, writer, args, init_times,
+                     graph_members, save_names, lat, lon, interval, local_rank,
+                     world_size, num_workers=0, rollout_batch=1):
+    """集合模型 + 权重扰动（G 图 x J 成员）的编舞：扰动图在外层，图内成员在内层。
+
+    与 m1a 的成员外层（每成员一份权重、一次一条轨迹）不同：这里的成员来自集合图
+    **图内随机算子**（同一 session 里的一次前向 = 一个成员），权重扰动只提供 G 条
+    独立轴（每图一份冻结权重）。每份扰动图：load -> 复用 _run_plain_block 的
+    members>1 分支（该图的 J 个成员 = 一次 Rollout 的 J 条轨迹，输出落
+    member_<全局号>）-> release。多卡按图切（每个 rank 领 range(rank, G, 卡数)），
+    所以各图的成员永远在同一进程的同一 session 里，不跨进程。
+
+    model.member_index 在此路径下是**图号**（m1a 的 spw.member 自检用的就是它），
+    与全局成员号无关 —— 全局成员号只决定输出目录。
+    """
+    from xmetai_inference.backends.base import _fmt_dur
+
+    total_t0 = perf_counter()
+    release = getattr(model, "release", None)
+    for order, (graph_id, member_ids) in enumerate(graph_members, 1):
+        model.member_index = graph_id
+        t_graph = perf_counter()
+        model.load(args.model)
+        log.info("[%d/%d] 扰动图 m%03d 权重就绪（服务成员 %03d..%03d 共 %d 个），"
+                 "加载耗时 %s",
+                 order, len(graph_members), graph_id,
+                 member_ids[0], member_ids[-1], len(member_ids),
+                 _fmt_dur(perf_counter() - t_graph))
+        _run_plain_block(
+            model, processors, dataset_source, writer, args, member_ids,
+            save_names, lat, lon, interval, local_rank, world_size,
+            members=len(member_ids), total_inits=len(init_times),
+            num_workers=num_workers, rollout_batch=rollout_batch)
+        # 最后一份图不放手：跑完就退出，放了只会让池子提前销毁（与 m1a 同款理由）。
+        if release is not None and order < len(graph_members):
+            release()
+            gc.collect()
+        log.info("扰动图 m%03d 完成（%d 个成员），总耗时 %s",
+                 graph_id, len(member_ids), _fmt_dur(perf_counter() - t_graph))
+    errors = writer.close()
+    if errors:
+        log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))
+        return 1
+    total_members = sum(len(ids) for _, ids in graph_members)
+    log.info("全部完成：扰动图=%d 成员=%d steps=%d output=%s 总耗时=%.1fs%s",
+             len(graph_members), total_members, args.steps, args.out,
+             perf_counter() - total_t0, _pool_summary(model))
+    return 0
 
 
 def _run_plain_block(model, processors, dataset_source, writer, args, member_indices,
@@ -915,6 +985,32 @@ def _worker_main(argv=None):
         # 这里只声明语义；真正的校验（图里必须有 spw/xi）在 create_model / load 里做。
         forecast_type = "ensemble"
     members = args.members if args.members is not None else getattr(cls, "members", 1)
+    # 集合模型 + 权重扰动（perturb_graphs）：成员 = 扰动图 x 图内随机，走图外层编舞
+    # （_run_graph_outer）。只对图内随机的集合模型类有意义 —— 确定性模型的成员
+    # 只能来自权重本身（m1a 的成员外层），配了这里直接拦下。
+    n_graphs = int(getattr(worker_cfg, "perturb_graphs", 0) or 0)
+    graph_outer = perturb_spec is not None and n_graphs > 0
+    if graph_outer:
+        if getattr(cls, "forecast_type", "deterministic") != "ensemble":
+            raise SystemExit(
+                f"perturb_graphs={n_graphs} 只适用于集合模型类（图内随机算子出成员），"
+                f"但 {cls.__name__} 声明 forecast_type="
+                f"{getattr(cls, 'forecast_type', 'deterministic')!r}。"
+                "确定性模型的权重扰动走 m1a（去掉 perturb_graphs 即可）。")
+        if worker_cfg.spw_segments:
+            raise SystemExit(
+                "perturb_graphs 与 spw_segments 不支持组合：分段 rollout 的换权重"
+                "逻辑挂在成员外层编舞上（_run_member_outer 的 on_step）。")
+        if n_graphs > members:
+            raise SystemExit(
+                f"perturb_graphs({n_graphs}) > members({members})：会有图分不到成员。"
+                "要么调小 perturb_graphs，要么调大 members。")
+        if members // n_graphs < 2:
+            raise SystemExit(
+                f"perturb_graphs={n_graphs} / members={members}：每图分不到 2 个成员。"
+                "图外层模式复用 _run_plain_block 的 members>1 分支（成员 = 一次 Rollout "
+                "的多条轨迹），单成员图会落进确定性分支、丢掉 member_NNN/ 子目录"
+                "——要单成员就别用这个模式（走 m1a）。")
     if forecast_type == "deterministic" and members > 1:
         log.warning("模型类 %s 声明确定性，但 members=%d；确定性模型应跑 1 个成员",
                     cls.__name__, members)
@@ -934,28 +1030,45 @@ def _worker_main(argv=None):
     # 故集合（members>1 且成员数 ≥ 卡数）优先按成员切；members < 卡数时按成员
     # 切会有卡分不到任务，退回均衡比较。确定性（members==1）本就只能按起报切。
     n_init = len(init_times)
-    per_rank_init = (n_init + world_size - 1) // world_size
-    per_rank_member = (members + world_size - 1) // world_size
-    cost_by_init = per_rank_init * members
-    cost_by_member = n_init * per_rank_member
-    if members > 1 and members >= world_size:
-        split_by_member = True
-    else:
-        split_by_member = cost_by_init > cost_by_member
-    if not split_by_member:
-        base, rem = divmod(n_init, world_size)
-        start_i = local_rank * base + min(local_rank, rem)
-        span = base + (1 if local_rank < rem else 0)
-        init_times = init_times[start_i:start_i + span]
+    graph_members = None
+    if graph_outer:
+        # 图外层：按**图**切（每个 rank 领 range(rank, G, 卡数) 那几份图、跑全部起报）。
+        # 不走按成员切 —— 一份图的 J 个成员必须在同一进程的同一 session 里连跑，
+        # 拆到不同进程会把「图内第 j 次前向」这个成员身份打散（fgvp_ens 头部的
+        # 待验怀疑：不同 session 的随机序列逐位相同 -> 拆散后成员会重复）。
+        graph_members = [entry for entry in _graph_member_split(members, n_graphs)
+                         if entry[0] % world_size == local_rank]
+        if not graph_members:
+            log.info("本 rank 没有分到扰动图（图数 %d、卡数 %d），退出",
+                     n_graphs, world_size)
+            return 0
         member_indices = list(range(members))
         member_start, member_stride = 0, 1
     else:
-        member_indices = list(range(local_rank, members, world_size))
-        member_start, member_stride = local_rank, world_size
+        per_rank_init = (n_init + world_size - 1) // world_size
+        per_rank_member = (members + world_size - 1) // world_size
+        cost_by_init = per_rank_init * members
+        cost_by_member = n_init * per_rank_member
+        if members > 1 and members >= world_size:
+            split_by_member = True
+        else:
+            split_by_member = cost_by_init > cost_by_member
+        if not split_by_member:
+            base, rem = divmod(n_init, world_size)
+            start_i = local_rank * base + min(local_rank, rem)
+            span = base + (1 if local_rank < rem else 0)
+            init_times = init_times[start_i:start_i + span]
+            member_indices = list(range(members))
+            member_start, member_stride = 0, 1
+        else:
+            member_indices = list(range(local_rank, members, world_size))
+            member_start, member_stride = local_rank, world_size
 
     # 扰动档的「成员」是各自一份冻结权重（= 各自的 onnx session），所以成员必须在外层
     # 循环、数据集在内层；这样任何时刻只有 1 个 session 驻留。详见 _run_member_outer。
-    member_outer = perturb_spec is not None
+    # 图外层（集合模型 + perturb_graphs）不在此列：它的外层是扰动图不是成员，走
+    # _run_graph_outer，复用 _run_plain_block 的「一 session x 多轨迹」。
+    member_outer = perturb_spec is not None and not graph_outer
 
     # 分段 rollout（E3，config 的 spw_segments）：在同一条轨迹里按段更换冻结权重。
     # 它不动「成员在外层」的结构，只在段边界多挂一次 session（见 _run_member_outer 的
@@ -1049,6 +1162,11 @@ def _worker_main(argv=None):
         for spec_k in member_specs:
             _prepare_member_set(args.model, spec_k, members, member_indices,
                                 local_rank, world_size)
+    elif graph_outer:
+        # 图外层：成员集只有 n_graphs 份（每图一份冻结权重），「成员号」= 图号。
+        # 造完本 rank 分到的那几份，缺的等其它 rank（与 m1a 同一套分片协议）。
+        _prepare_member_set(args.model, perturb_spec, n_graphs,
+                            [g for g, _ in graph_members], local_rank, world_size)
     log.info("加载模型：class=%s backend=%s device=%d CUDA_VISIBLE_DEVICES=%s path=%s",
              model_name, model.backend, device_id,
              os.environ.get("CUDA_VISIBLE_DEVICES"), args.model)
@@ -1061,6 +1179,11 @@ def _worker_main(argv=None):
                            else "%d 份" % resident_members))
         log.info("M1a：本 rank 负责 %d 个成员，逐成员加载；常驻 session 池 = %s",
                  len(member_indices), pool_desc)
+    elif graph_outer:
+        log.info("图外层（集合+SPW）：本 rank 负责 %d 份扰动图（%s），逐图加载；"
+                 "每图 %s 个成员由图内随机算子出",
+                 len(graph_members), [g for g, _ in graph_members],
+                 "/".join(str(len(ids)) for _, ids in graph_members))
     else:
         t_load_model = perf_counter()
         model.load(args.model)
@@ -1077,6 +1200,13 @@ def _worker_main(argv=None):
 
     lat, lon = grid_coords(cls.grid)
     writer = _AsyncWriter(args.out, atomic=True)
+
+    if graph_outer:
+        return _run_graph_outer(
+            model, processors, dataset_source, writer, args, init_times,
+            graph_members, save_names, lat, lon, interval, local_rank, world_size,
+            num_workers=dataloader_config.get("num_workers", 0),
+            rollout_batch=worker_cfg.rollout_batch)
 
     if member_outer:
         return _run_member_outer(

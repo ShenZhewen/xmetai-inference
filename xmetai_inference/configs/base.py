@@ -119,6 +119,16 @@ class InferConfig:
     # 解析、校验与段边界的定义见 perturbation.segments.parse_segment_plan。
     # None = 不分段（默认，行为与以前逐位相同）。
     spw_segments: Any = None
+    # perturb_graphs：**集合模型（图内随机算子出成员）+ weight_perturb** 时生效 ——
+    # 把 members 个成员摊到 G 份扰动图上（均分 + 余数给前面的图，如 51/5 = 11+10x4）：
+    # 成员 m = 第 g 份冻结权重 x 该图 session 内的第 j 次前向。编舞是「图在外层
+    # （逐图 load/release）、成员在内层（一次 Rollout 的多条轨迹）」，多卡按**图**切。
+    # 与 m1a（成员 = 权重文件，成员外层）的区别只在编舞，weight_perturb 规格本身不变。
+    #   0  = 缺省，不启用：weight_perturb 走 m1a 语义（要求模型类是确定性的）；
+    #   1  = 扰动一份图服务全部成员（消融臂：「扰动过的 fgvp_ens」）；
+    #   G>1 = 生产形态（如 5 图 x ~10 成员）。要求 G <= members，且模型类必须声明
+    #        forecast_type="ensemble"（图内随机）——确定性模型配了它直接报错。
+    perturb_graphs: int = 0
     # ONNX Runtime 运行旋钮：
     # intra_op_threads：单 session 的算子并行线程数；0 = 不设置（用 ORT 默认）。
     # cudnn_algo_search："" = 后端默认 EXHAUSTIVE；HEURISTIC 能缩短启动预热

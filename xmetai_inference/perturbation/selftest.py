@@ -1810,6 +1810,52 @@ def _case_latent_pt2(work, check):
           "两个后端共用的早退路径")
 
 
+def _case_graph_split(work, check):
+    """集合模型 + 权重扰动的成员摊分（cli._graph_member_split，纯函数）。
+
+    图外层编舞（perturb_graphs）的成员身份全靠这个摊分定义：m = 图 g x 图内序号 j。
+    摊错了不是「少几个成员」——是成员号重复/丢失，评测侧看不出来。这里钉四件事：
+    均分 + 余数给前面的图；全局成员号连续且无重无漏；非法参数被拒；按图切卡
+    （g % 卡数 == rank）时各 rank 的图互不相交且覆盖全部图。
+    """
+    # 惰性导入：selftest 的运行环境不该为了一个纯函数背上 cli 的依赖面。
+    from xmetai_inference.cli import _graph_member_split
+
+    split = _graph_member_split(51, 5)
+    check([len(ids) for _, ids in split] == [11, 10, 10, 10, 10],
+          "51/5 摊成 11+10x4", str([len(ids) for _, ids in split]))
+    all_ids = [m for _, ids in split for m in ids]
+    check(all_ids == list(range(51)),
+          "全局成员号连续且无重无漏", f"头 {all_ids[:3]} 尾 {all_ids[-3:]}")
+    check(all(len(ids) >= 1 for _, ids in split), "每份图非空")
+
+    even = _graph_member_split(50, 5)
+    check([len(ids) for _, ids in even] == [10] * 5, "50/5 整除时均分")
+    single = _graph_member_split(10, 10)
+    check([len(ids) for _, ids in single] == [1] * 10,
+          "10/10 允许每图 1 成员（摊分本身不设下限，「每图至少 2」是 cli 的配置校验）")
+
+    for bad in ((51, 0), (51, -1), (3, 5)):
+        try:
+            _graph_member_split(*bad)
+        except ValueError:
+            check(True, f"非法参数 {bad} 被拒（ValueError）")
+        else:
+            check(False, f"非法参数 {bad} 被拒（ValueError）", "没有抛")
+
+    # 按图切卡（cli 的 graph_members 过滤条件）：G=5、卡数=8 时 rank 5..7 空手，
+    # rank 0..4 各领一图；并起来正好是全部图、互不相交。
+    world_size = 8
+    claims = {rank: [g for g in range(5) if g % world_size == rank]
+              for rank in range(world_size)}
+    covered = sorted(g for gs in claims.values() for g in gs)
+    check(covered == list(range(5)), "按图切卡：并集覆盖全部图", str(covered))
+    check(sum(len(gs) for gs in claims.values()) == len(covered),
+          "按图切卡：各 rank 的图互不相交")
+    check(all(not claims[rank] for rank in (5, 6, 7)),
+          "图数 < 卡数时多余 rank 领空（cli 打「没有分到图」退出）")
+
+
 CASES = (
     ("无损改写（sigma->0 与源权重逐位相同）", _case_equivalence),
     ("扰动冻结与注入方差定律", _case_randomness),
@@ -1822,6 +1868,7 @@ CASES = (
     ("判决页的判据层（p 插值 / k 折算 / 平坦度 / 判据分类 / 门槛）", _case_verdict),
     ("潜空间 AR(1) 强迫（等价性 / 数值 / 结构 / 驱动侧）", _case_latent),
     ("潜空间 AR(1) 强迫的 pt2 后端（fx 回溯 / 属性喂 xi / 列序）", _case_latent_pt2),
+    ("集合模型+SPW 的成员摊分与按图切卡（perturb_graphs）", _case_graph_split),
 )
 
 

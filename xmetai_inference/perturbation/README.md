@@ -3299,6 +3299,56 @@ dtype       torch.float16
 
 ---
 
+## 2O. 集合模型 + SPW：图外层编舞（`perturb_graphs`，2026-10-12）
+
+把 m1a 的冻结权重叠到**集合图**（图内随机算子出成员，`iwc_gssp_im.onnx`）上。动机：
+fgvp_ens 的 51 个成员全押在图内随机这一条轴上，而坑 1 实测「不同 session 的随机序列
+逐位相同」意味着多卡拆成员后每个进程只有一套随机序列——fgvp_ens.py 文件头那条
+待验怀疑（51 成员可能只有 ~8 个自由度）正是「FGVP 集合 spread 只有 AIFS 的 1/4」的
+头号嫌疑。SPW 在这里提供**第二条独立轴**：
+
+    成员 m = 第 g 份扰动图（冻结权重）× 该图 session 内的第 j 次前向（图内随机）
+
+即使所有 session 的图内随机流逐位相同，不同权重图出的成员照样不同——成员多样性
+不再赌跨进程 RNG 分歧。
+
+**机制与分工**（与 m1a 的差异全在编舞层，`WeightPerturbSpec` 规格本身一字未动）：
+
+| | m1a（成员外层） | 图外层（本节） |
+| --- | --- | --- |
+| 成员身份 | 一份冻结权重 = 一个成员 | (扰动图, 图内前向序号) 二元组 |
+| session 数 | 51 份（每成员一份） | G 份（每图一份） |
+| 成员集磁盘 | 51 × 每份扰动字节 | G × 每份扰动字节（51/5 ≈ 1/5） |
+| 外层循环 | 成员 | 扰动图 |
+| 前向总量 | 起报 × 51 × steps | 同左（一个不多） |
+| 多卡切法 | 按成员 | 按图（一图的成员永不跨进程） |
+
+* 配置开关：`configs/base.py` 的 `perturb_graphs`（0 = 缺省 m1a 语义；1 = 消融臂
+  「扰动过的 fgvp_ens」；G>1 = 生产档）。校验：模型类必须 `forecast_type="ensemble"`、
+  `members >= 2G`（每图至少 2 成员，防单成员图落进确定性分支丢 `member_NNN/` 目录）、
+  与 `spw_segments` 互斥。
+* 摊分：`cli._graph_member_split(members, graphs)` 均分 + 余数给前面的图
+  （51/5 = 11+10x4），全局成员号连续无重无漏 —— selftest 第 12 节钉死。
+* 编舞：`cli._run_graph_outer` 逐图 load/release，内层复用 `_run_plain_block` 的
+  members>1 分支（一 session × J 条轨迹，含 rollout_batch 前向批）；`model.member_index`
+  在此路径下是**图号**，m1a 的 `spw.member` 加载期自检原样复用。
+* 首个配方：`configs/fgvp_ens_spw.py`（51 成员 / 5 图 / 29 起报 20250702-0730 /
+  60 步 / 5 变量，与 S2B 生产档同窗口）。**注意其 groups / sigma_full 是从确定性
+  gdn2 图抄的占位值**：集合图是 Mamba 骨干，组结构没探过、σ 也没在「自带图内离散度」
+  的图上标定过 —— 开跑前先 `$P groups <集合图>` + `$P probe`，见该 config 文件头的
+  ⚠ 三件事。
+
+**未验/待做**（按序）：
+
+1. fgvp_ens 原档的零成本旧账（文件头那条 member_000..003 逐字节比对）——它决定
+   (g, j) 两轴是否耦合（各图共享同一套图内噪声序列）：耦合时方案仍成立，但
+   「两条独立轴」的解读要收窄成「一条随机轴 + G 份权重轴」；
+2. 集合图的组结构与 σ 标定（上面 ⚠ 三件事的 1、2）；
+3. smoke → 正式 → `$P check` / `$P spread` 与 fgvp_ens 原档并排，看 1/4 欠离散
+   是否被第二条轴抬起来。
+
+---
+
 ## 3. 图上到底改了什么
 
 对每个被选中的权重张量 `W`（节点名前缀 `spw/NNNN_<名字>`）：
@@ -3883,6 +3933,7 @@ xmetai-infer --model fgvp_spw_prod_s2b
 | `../configs/fgvp_spw_ab.py` | **A/B 协议**：`SPW_AB` 选变体（A-D 第一轮、E-H 第二轮已跑完；**T/S/V = 第三轮：同预算只换注入结构**、**E3 = 第四轮：分段 rollout**；I..M 已删）。`SPW_AB=A` 即原 M1a 基线入口 |
 | `../configs/fgvp_spw_prod_s2b.py` | **生产跑（S2B 配方）**：A/B 的 S2B 臂放大到 51 成员 / 9 起报（`latent_mixer` + channel + σ_full=0.027，见文件头）。**取代了原 `fgvp_spw_prod.py`（F 配方，已于 2026-09-24 删除；协议存档见 2F 节）** |
 | `../configs/fgvp_ar1.py` | **潜空间 AR(1) 强迫的 5 个臂**（`SPW_AR1=A32\|A1\|A32T1\|A32T0\|W32`，见 **2N.5**；其余照抄 F，`W32` 复用 F 的成员集） |
+| `../configs/fgvp_ens_spw.py` | **集合模型 + SPW 首个配方**（51 成员 / 5 扰动图 / 29 起报，见 **2O**；⚠ groups/σ 是占位值，开跑前先 groups+probe） |
 | `D:\xmetai-evaluation-v2\report\spw_F_vs_ens_ref` | **外部独立评测**（v2 框架的 CRPS/SSR 口径裁判）：评的是本 README 的**变体 F**，与 `fgvp_spw_vs_ens_ref`（评 M3）配对构成 m3 vs m1a 的裁判侧对照，复盘见 **2H 节** |
 | `../backends/onnx.py` | `load()` 按机制分流（m3 生成/命中缓存、m1a 找成员模型）+ 加载期自检；`release()` 供 m1a 逐成员换权重 |
 | `../runner.py` | `Rollout` 逐轨迹前向——M3 靠它天然拿到不同成员；M1a 的成员是独立模型，由 cli 的 `_run_member_outer` 在外层循环 |
