@@ -341,8 +341,11 @@ class OnnxInferModel(BaseInferModel):
             "补齐帧数。"
         )
 
-    def _latent_step_stream(self, step):
-        """潜空间 AR(1) 的驱动状态机：返回本步第几条轨迹该拿的行号（None = 不强迫）。
+    def _latent_step_stream(self, step, width=1):
+        """潜空间 AR(1) 的驱动状态机：返回本步本块**起始**轨迹该拿的行号（None = 不强迫）。
+
+        `width` = 本次 forward 堆了几条轨迹（rollout_batch）。返回的 index 配合
+        `ar1.row(index, width)` 取 [width, T, R] 一次喂进图。缺省 1 = 逐轨迹调用。
 
         实现在 perturbation.latent.LatentStepStream（onnx / pt2 后端共享——这段逻辑出过
         A32 接线事故，两份拷贝比一次受控共享危险）。完整语义、以及原接线错误的判决
@@ -355,7 +358,8 @@ class OnnxInferModel(BaseInferModel):
             forcing, step,
             n_targets=self._latent_n_targets,
             member_index=getattr(self, "member_index", 0),
-            hour_interval=getattr(self, "hour_interval", None))
+            hour_interval=getattr(self, "hour_interval", None),
+            width=width)
 
     def forward(self, x, step, valid_time):
         feeds = {"input": _as_numpy_onnx(x)}
@@ -363,11 +367,14 @@ class OnnxInferModel(BaseInferModel):
             for k, v in _scalar_feeds(valid_time, step).items():
                 if k in self._input_names:
                     feeds[k] = v
-        row = self._latent_step_stream(step)
+        # 一次 forward 堆了几条轨迹 = batch 维。rollout_batch=1 时恒为 1（旧行为逐位不变）；
+        # >1 时块内 k 条轨迹要的是「同 index 起、横跨 k 行」的独立 ξ，不是相邻的 k 行。
+        width = int(x.shape[0])
+        row = self._latent_step_stream(step, width=width)
         if row is not None:
-            # 本步第 row 条轨迹的 xi（[1, T, R]）。递推已移到 step 变化处整批推进一次，
-            # 不再逐 forward 调用 advance —— 逐轨迹调用下那样会把整批推进 n 次/步。
-            feeds[self.latent_forcing.input_name] = self._latent_stream.ar1.row(row)
+            # 本步从 row 起 width 条轨迹的 xi（[width, T, R]）。递推已移到 step 变化处整批
+            # 推进一次，不再逐 forward 调用 advance —— 逐轨迹调用下那样会把整批推进 n 次/步。
+            feeds[self.latent_forcing.input_name] = self._latent_stream.ar1.row(row, width)
         # 输出完整滑动窗口 (1, in_frames, C, H, W)：输入 [t-1,t] → 输出 [t,t+1]，
         # 末帧才是本步预报。基类 run 会取 state[:, -1] 当预报、用完整 state
         # 回填（state = result），与官方 inference.py 的 `new_input = model.run(...)`

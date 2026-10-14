@@ -14,6 +14,10 @@
     xi_t 由驱动侧的 AR(1) 过程给出（`xi_{t+1} = rho*xi_t + sqrt(1-rho^2)*eps_t`，
     rho = exp(-dt/tau)）。与 weight_perturb **正交、可叠加**；成员之间的差别只来自 xi 的
     种子，所以同一份图可以服务全部成员（不必落盘 51 份权重）。见 latent.py。
+  * **noise_scale — 图内自带噪声的幅度**（第三条腿，只对**集合图**有意义：成员由
+    图内随机算子给出的那种图）。`σ × k` 等价于把 `prior_perturb.logvar.bias` 整幅平移
+    `2·ln k`（σ = exp(logvar/2)，图上实测），权重只动一个 initializer。与上两条正交。见
+    noise_scale.py。
 
 入口：
   * 配置面：configs/*.py 里的 `weight_perturb={...}`（见 spec.WeightPerturbSpec）
@@ -50,6 +54,14 @@ from .latent import (
     resolve_stack_path,
     resolve_targets,
 )
+from .noise_scale import (
+    DEFAULT_FACTOR,
+    DEFAULT_TENSOR,
+    default_scaled_path,
+    format_noise_scale_report,
+    scale_builtin_noise,
+    verify_structure as verify_noise_scale,
+)
 from .segments import Segment, SegmentPlan, parse_segment_plan
 from .weights import (
     build_member_set,
@@ -68,6 +80,8 @@ from .weights import (
 __all__ = [
     "Ar1Driver",
     "DEFAULT_EXCLUDE",
+    "DEFAULT_FACTOR",
+    "DEFAULT_TENSOR",
     "LatentForcingSpec",
     "LatentStepStream",
     "NOISE_STRUCTS",
@@ -79,8 +93,10 @@ __all__ = [
     "build_forcing_model",
     "build_member_set",
     "default_forcing_path",
+    "default_scaled_path",
     "format_forcing_audit",
     "format_member_report",
+    "format_noise_scale_report",
     "inject_forcing",
     "lag1_autocorr",
     "member_base_path",
@@ -95,9 +111,11 @@ __all__ = [
     "resolve_member_path",
     "resolve_stack_path",
     "resolve_targets",
+    "scale_builtin_noise",
     "select_initializers",
     "set_dir_for",
     "verify_member_set",
+    "verify_noise_scale",
     "run_e2e",
     "run_check",
 ]

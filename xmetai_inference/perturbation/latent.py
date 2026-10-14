@@ -133,6 +133,20 @@ def _rank_entropy(spec, member_index, slot):
     return [int(spec.seed or 0), 7919, int(member_index or 0), int(slot or 0)]
 
 
+def _world_size() -> int:
+    """卡数。读法与 cli 一致（cli 给每个 worker 都设了 WORLD_SIZE），退回 1。
+
+    只在 `demean_members` 打开时用到：本地重放全体成员时要复现**真实**成员的流，
+    而真实成员的流 = `(seed, 7919, m, m % world_size)`（cli 按 `range(rank, members,
+    world_size)` 切成员，`slot` 取的是 rank）。卡数不对，重放出来的就不是那 51 条流，
+    均值踢扣不干净。
+    """
+    try:
+        return int(os.environ.get("WORLD_SIZE", "1") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 @dataclass
 class LatentForcingSpec(SpecBase):
     """一次潜空间 AR(1) 强迫的规格。
@@ -152,6 +166,25 @@ class LatentForcingSpec(SpecBase):
     grid           空间基用的 (rows, cols)；None = 自动探测（从 patch_embed 推）。
     seed           驱动侧随机流的种子。实际用的是 (seed, member_index, slot)。
     hour_interval  一步多少小时（算 ρ 用）。0 = 由调用方从 config 填。
+    amp_profile    时变幅度 a(t)：((step, 倍数), ...) 的分段线性折线，step = 0 起的模式步
+                   （一步 6h）。None = 恒 1，与原行为**逐位相同**。两端外推取端点值。
+                   **只在驱动侧乘出口 ξ，不进 budgets()** —— 与 tau_days 同理（见 budgets
+                   的说明），所以换曲线复用同一份图，不触发 85 MB 改写。
+                   为什么需要这个自由度：σ 是个常数，而"让集合校准所需的有效 σ"随时效
+                   单调上涨（07-02 实测 6h→360h 要涨约 3.5 倍，中段还在爬），一个标量
+                   给不出曲线；同时 σ 的边际收益在长时效递减（响应指数 p 从 ≈1.0 掉到
+                   0.75），所以尾端的补偿必须比线性更陡。
+    demean_members 跨成员去均值的成员总数。0 = 关（**与改动前逐位相同**）；= N 时驱动侧
+                   在本地重放 m = 0..N-1 全体成员的 ξ 流（种子逐个与真实成员相同），
+                   出口 ξ 减去全体样本均值。
+                   **为什么需要**：ξ 是每个成员**独立**抽的，所以 51 个成员 ξ 的样本均值
+                   不为零（sd ≈ 1/√N）。集合平均场 = 确定性场 + 这个均值踢，而 RMSE 是
+                   二次量 ⇒ 踢一次赔一次：实测同一批内 360h 集合平均 RMSE 随 σ 单调变差
+                   （σ=0 → 784.9、0.04 → 795.7、0.08 → 801.4）。这就是「想要离散度就得
+                   赔平均场精度」那笔交易。去均值把这条耦合拆掉：集合平均场 ≡ 确定性场
+                   （到一阶），RMSE 与 σ 解耦，σ 才可以放心开到校准所需的量。
+                   **只在出口扣，不写回 state**（同 a(t) 的理由）。不进 budgets() ——
+                   纯驱动侧，复用同一份图。
     input_name     新增的图输入名（一般不用改）。
     cache_dir      改写后的 .onnx 落盘目录。**默认必须是源图所在目录**：外部数据
                    （.data）引用要被 onnxruntime 接受，必须落在模型目录内（坑 6）。
@@ -171,6 +204,8 @@ class LatentForcingSpec(SpecBase):
     grid: Sequence[int] | None = None
     seed: int | None = None
     hour_interval: float = 6.0
+    amp_profile: Sequence[Sequence[float]] | None = None
+    demean_members: int = 0
     input_name: str = FORCING_INPUT
     cache_dir: str | None = None
     verify_on_load: bool = True
@@ -200,8 +235,43 @@ class LatentForcingSpec(SpecBase):
                 raise ValueError(f"latent_forcing.{name} 必须是正整数，实际 {value!r}")
         if self.hour_interval < 0:
             raise ValueError("latent_forcing.hour_interval 不能为负")
+        if int(self.demean_members) < 0:
+            raise ValueError("latent_forcing.demean_members 不能为负（0 = 关）")
+        if int(self.demean_members) == 1:
+            # N=1 时「减全体均值」= 把唯一的成员扣成 0，这不是去均值而是静默关掉强迫。
+            raise ValueError(
+                "latent_forcing.demean_members=1 无意义（单成员减自己的均值 ⇒ ξ 恒 0）。"
+                "要关就用 0。")
+        if self.amp_profile is not None:
+            # 归一化成 ((step, 倍数), ...)：config 里写成列表、元组、list-of-list 都收，
+            # 但内部只认一种形状（amp_at 要按它切片）。
+            knots = tuple((float(s), float(v)) for s, v in self.amp_profile)
+            if not knots:
+                raise ValueError("latent_forcing.amp_profile 不能给空表（不要时给 None）")
+            if any(v < 0 for _, v in knots):
+                raise ValueError(f"latent_forcing.amp_profile 的倍数不能为负，实际 {knots}")
+            if any(b <= a for a, b in zip([s for s, _ in knots],
+                                          [s for s, _ in knots][1:])):
+                raise ValueError(
+                    f"latent_forcing.amp_profile 的 step 必须严格递增，实际 {knots}")
+            self.amp_profile = knots
 
     # ---- 派生量 ----
+
+    def amp_at(self, step: int) -> float:
+        """时变幅度 a(t)：分段线性插值，两端外推取端点值。None → 恒 1（逐位同旧）。"""
+        knots = self.amp_profile
+        if not knots:
+            return 1.0
+        x = float(step)
+        if x <= knots[0][0]:
+            return knots[0][1]
+        if x >= knots[-1][0]:
+            return knots[-1][1]
+        for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
+            if x0 <= x <= x1:
+                return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+        return knots[-1][1]
 
     def rho(self, hour_interval: float | None = None) -> float:
         """一步的 AR(1) 系数：ρ = exp(-Δt/τ)。"""
@@ -211,8 +281,9 @@ class LatentForcingSpec(SpecBase):
         return float(np.exp(-(step_hours / 24.0) / self.tau_days))
 
     def budgets(self) -> dict:
-        """参与**图**指纹的字段。tau/hour_interval 只在驱动侧起作用、不改图，所以不进
-        指纹 —— 换 τ 复用同一份图（两个臂共图是刻意的，省一次 85 MB 改写）。"""
+        """参与**图**指纹的字段。tau/hour_interval/amp_profile 只在驱动侧起作用、不改图，
+        所以不进指纹 —— 换 τ 或换 a(t) 曲线复用同一份图（多个臂共图是刻意的，省一次
+        85 MB 改写）。"""
         return {
             "targets": list(self.targets),
             "sigma": float(self.sigma),
@@ -227,16 +298,26 @@ class LatentForcingSpec(SpecBase):
         }
 
     def describe(self) -> str:
-        return ("latent-ar1 targets=%s sigma=%g tau=%gd rank=%d length_scale=%g"
+        amp = ""
+        if self.amp_profile:
+            amp = " a(t)=%d点 %.2f→%.2f" % (
+                len(self.amp_profile), self.amp_profile[0][1], self.amp_profile[-1][1])
+        demean = "" if int(self.demean_members) <= 1 else " demean=%d成员" % self.demean_members
+        return ("latent-ar1 targets=%s sigma=%g tau=%gd rank=%d length_scale=%g%s%s"
                 % (" | ".join(self.targets), self.sigma, self.tau_days, self.rank,
-                   self.length_scale))
+                   self.length_scale, amp, demean))
 
 
 # 图格式版本：改「图怎么改写」（输入名、节点结构、基的归一化、外部数据落位方式）就
 # +1 -> 指纹变 -> 新文件。v2（2026-09-29）：跨目录落盘改为「.data 就地放进图目录 +
 # location 裸文件名」（见 _localize_external_data），v1 的「相对路径指回源目录」会被
 # onnxruntime 的 realpath 校验拒绝。
-FORCING_FORMAT = 2
+# v3（2026-10-12）：适配**非 gdn2 的图**。v2 的改写链有两个只在 fp32/opset17 上成立的
+# 假设，换个骨干就静默产出**建不了会话**的图，而指纹不变 -> 下次直接复用坏图（第二次
+# 踩到同一个坑才把这条补上）。两处：① `Split` 在 opset>=18 必须显式给 `num_outputs`
+# （13-17 可靠输出个数均分）；② 链尾的 `Mul` 要求增益与目标张量同类型，fp16 图
+# （iwc_gssp_im_fp16）必须在乘之前 `Cast` 到目标类型。
+FORCING_FORMAT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -278,19 +359,25 @@ def resolve_targets(model, spec: LatentForcingSpec) -> list:
     return resolved
 
 
-def _shape_map(model) -> dict:
-    """形状推断：名字 -> 维度列表（dim_value 或 dim_param）。"""
+def _type_map(model) -> dict:
+    """形状+类型推断：名字 -> (维度列表, 元素类型)。dim_value 或 dim_param。"""
     onnx = _onnx()
     try:
         inferred = onnx.shape_inference.infer_shapes(model, strict_mode=False, data_prop=False)
     except Exception:  # noqa: BLE001 - 推断失败不影响显式指定 tokens/channels
         inferred = model
-    shapes = {}
+    out = {}
     for value in list(inferred.graph.value_info) + list(inferred.graph.output):
         dims = value.type.tensor_type.shape.dim
-        shapes[value.name] = [d.dim_value if d.HasField("dim_value") else (d.dim_param or "?")
-                              for d in dims]
-    return shapes
+        out[value.name] = (
+            [d.dim_value if d.HasField("dim_value") else (d.dim_param or "?") for d in dims],
+            int(value.type.tensor_type.elem_type))
+    return out
+
+
+def _shape_map(model) -> dict:
+    """形状推断：名字 -> 维度列表（dim_value 或 dim_param）。"""
+    return {name: dims for name, (dims, _elem) in _type_map(model).items()}
 
 
 def _grid_from_patch_embed(model) -> tuple | None:
@@ -474,6 +561,18 @@ def inject_forcing(onnx, model, targets, basis, spec: LatentForcingSpec) -> int:
     """
     graph = model.graph
     rank = int(spec.rank)
+    # 目标张量的元素类型：图可能是 **fp16**（`iwc_gssp_im_fp16.onnx`），而本链的常量与
+    # spw/xi 输入都是 fp32 —— 直接相乘会被 ORT 判为「T 绑定了两种类型」而拒绝建会话：
+    #   Type parameter (T) of Optype (Mul) bound to different types
+    #   (tensor(float16) and tensor(float)) in node (spw/ar1/t0/MulZ)
+    # gdn2 是 fp32，所以在它上面一直没暴露。修法：链**全程 fp32**（数值上也更稳），
+    # 只在最后往目标类型 Cast 一次；spw/xi 保持 fp32，驱动侧不用动。
+    # 必须在改图**之前**推断（infer_shapes 看的是原图的类型传播）。
+    _types = _type_map(model)
+    target_elem = {}
+    for _name in targets:
+        _elem = _types.get(_name, (None, 0))[1] or onnx.TensorProto.FLOAT
+        target_elem[_name] = _elem
     one_name, one_tensor = _initializer(
         onnx, NODE_PREFIX + "/one", np.ones((1,), dtype=np.float32))
     shape_name, shape_tensor = _initializer(
@@ -484,8 +583,18 @@ def inject_forcing(onnx, model, targets, basis, spec: LatentForcingSpec) -> int:
         [NODE_PREFIX + "_batch", len(targets), rank]))
 
     slices = ["%s/xi_%d" % (NODE_PREFIX, index) for index in range(len(targets))]
+    # `Split` 的属性要求随 opset 变：13-17 可以只给输出个数，靠「均分」推 split 尺寸；
+    # **18 起必须显式给 `split` 输入或 `num_outputs` 属性**，否则 ORT 建会话时直接拒收：
+    #   Node (spw/ar1/Split) Op (Split) [ShapeInferenceError]
+    #   Neither 'split' input nor 'num_outputs' attribute has been given
+    # 而图不一定落在哪个 opset（gdn2 = 17，iwc_gssp_im_fp16 = 18+），所以按图**自己声明的**
+    # 版本决定加不加 —— 无条件加会在 17 及以下变成未识别属性。
+    opset = max((int(entry.version) for entry in model.opset_import
+                 if entry.domain in ("", "ai.onnx")), default=0)
+    split_attrs = {"num_outputs": len(targets)} if opset >= 18 else {}
     split = onnx.helper.make_node(
-        "Split", [spec.input_name], slices, name=NODE_PREFIX + "/Split", axis=1)
+        "Split", [spec.input_name], slices, name=NODE_PREFIX + "/Split", axis=1,
+        **split_attrs)
 
     nodes = list(graph.node)
     added = 0
@@ -522,9 +631,16 @@ def inject_forcing(onnx, model, targets, basis, spec: LatentForcingSpec) -> int:
             onnx.helper.make_node(
                 "Add", [stem + "/field", one_name], [stem + "/gain"],
                 name=stem + "/AddOne"),
-            onnx.helper.make_node(
-                "Mul", [name, stem + "/gain"], [stem + "/out"], name=stem + "/MulZ"),
         ]
+        # fp32 图（gdn2）不加这个节点；fp16 图（iwc_gssp_im_fp16）把增益降下来再乘。
+        gain = stem + "/gain"
+        if target_elem[name] != onnx.TensorProto.FLOAT:
+            chain.append(onnx.helper.make_node(
+                "Cast", [gain], [stem + "/gain_t"], name=stem + "/CastGain",
+                to=target_elem[name]))
+            gain = stem + "/gain_t"
+        chain.append(onnx.helper.make_node(
+            "Mul", [name, gain], [stem + "/out"], name=stem + "/MulZ"))
         nodes[at:at] = chain
         added += len(chain)
     nodes.insert(0, split)
@@ -809,7 +925,8 @@ class Ar1Driver:
     """
 
     def __init__(self, spec: LatentForcingSpec, n_targets: int, member_index: int = 0,
-                 slot: int = 0, batch: int = 1, hour_interval: float | None = None):
+                 slot: int = 0, batch: int = 1, hour_interval: float | None = None,
+                 world_size: int = 1, _build_cohort: bool = True):
         self.spec = spec
         self.n_targets = int(n_targets)
         self.member_index = int(member_index)
@@ -819,16 +936,68 @@ class Ar1Driver:
             np.random.SeedSequence(_rank_entropy(spec, member_index, slot)))
         self.state = self._draw(int(batch))
         self.steps = 0
+        # 时变幅度 a(t)：由 LatentStepStream 在每次 step 变化时设。1.0 = 不缩放。
+        self.amp = 1.0
+        # 跨成员去均值（spec.demean_members）：本地重放**其他**成员的 ξ 流，仅为算均值。
+        # 种子逐个与真实成员相同（member_index=m、slot=m % world_size，见 cli 的成员切分
+        # `range(rank, members, world_size)`），所以自己不动、别人不动时，扣掉的正是真实
+        # 的均值踢。`_build_cohort=False` 是给 cohort 内部那一层的（防无限递归）。
+        self.demean_members = int(getattr(spec, "demean_members", 0) or 0)
+        self.cohort: list = []
+        if _build_cohort and self.demean_members > 1:
+            world = max(1, int(world_size or 1))
+            self.cohort = [
+                Ar1Driver(spec, n_targets, member_index=other, slot=other % world,
+                          batch=batch, hour_interval=hour_interval,
+                          world_size=world, _build_cohort=False)
+                for other in range(self.demean_members) if other != self.member_index
+            ]
 
     def _draw(self, batch: int) -> np.ndarray:
         return self.rng.standard_normal(
             (int(batch), self.n_targets, int(self.spec.rank))).astype(np.float32)
 
+    def _scaled(self, block: np.ndarray) -> np.ndarray:
+        """给出口 ξ 乘 a(t)。amp == 1 时**原样返回**（同一对象、不复制）——没给
+        amp_profile 的臂因此与改动前逐位相同。
+
+        缩放只作用于**出口**，绝不写回 self.state：ξ 的递推必须保持平稳单位方差
+        （`ξ_{t+1} = ρξ_t + √(1-ρ²)ε`），把 a(t) 乘进状态会让它反馈进下一步、
+        变成一条被自身包络驱动的非平稳过程（τ 就不再是相关时间了）。
+        """
+        if self.amp == 1.0:
+            return block
+        return (block * np.float32(self.amp)).astype(np.float32)
+
+    def _slice_raw(self, index: int, width: int = 1) -> np.ndarray:
+        """第 index..index+width 行的**原始** ξ（未去均值、未缩放）。行数不够自动加宽。
+
+        加宽与去均值都要在这里发生：cohort 里的成员必须和本成员**同步加宽**，否则
+        行号对不上，扣的就不是同一批轨迹的均值。
+        """
+        need = int(index) + int(width)
+        if need > self.state.shape[0]:
+            self.state = np.concatenate(
+                [self.state, self._draw(need - self.state.shape[0])], axis=0)
+        return self.state[int(index):need]
+
+    def _export(self, index: int, width: int = 1) -> np.ndarray:
+        """本次要喂进图的 ξ：先跨成员去均值（若开），再乘 a(t)（若开）。"""
+        block = self._slice_raw(index, width)
+        if self.cohort:
+            total = block.astype(np.float64)
+            for driver in self.cohort:
+                total += driver._slice_raw(index, width)
+            block = (block - (total / self.demean_members).astype(np.float32)).astype(np.float32)
+        return self._scaled(block)
+
     def value(self, batch: int) -> np.ndarray:
         """本步要喂进图的 ξ（形状 [batch, T, R]）。"""
         if int(batch) != self.state.shape[0]:
             self.reset(int(batch))
-        return self.state
+        if not self.cohort:
+            return self._scaled(self.state)          # 与改动前逐位相同（同一对象）
+        return self._export(0, self.state.shape[0])
 
     def row(self, index: int, width: int = 1) -> np.ndarray:
         """第 index 条轨迹的 ξ（[width, T, R]）。行 = 一条**独立**的 AR(1) 流，行间
@@ -837,29 +1006,32 @@ class Ar1Driver:
         到不了驱动侧）—— 发号（本步第几条轨迹拿第几行）由 onnx._latent_step_stream
         负责，这里只管取行。
         """
-        need = int(index) + int(width)
-        if need > self.state.shape[0]:
-            self.state = np.concatenate(
-                [self.state, self._draw(need - self.state.shape[0])], axis=0)
-        return self.state[index:need]
+        return self._export(index, width)
 
     def advance(self) -> None:
         noise = self.rng.standard_normal(self.state.shape).astype(np.float32)
         decay = float(np.sqrt(max(0.0, 1.0 - self.rho * self.rho)))
         self.state = (self.rho * self.state + decay * noise).astype(np.float32)
         self.steps += 1
+        for driver in self.cohort:
+            driver.advance()
 
     def reset(self, batch: int | None = None) -> None:
         """重新抽 ξ_0（每条轨迹开始时调用）。种子流不重置 —— 重抽即新轨迹。"""
         if batch is not None:
             self.batch = int(batch)
-        self.state = self._draw(getattr(self, "batch", self.state.shape[0]))
+        width = int(getattr(self, "batch", self.state.shape[0]))
+        self.state = self._draw(width)
         self.steps = 0
+        for driver in self.cohort:
+            driver.reset(width)
 
     def describe(self) -> str:
-        return ("latent-ar1 member=%d slot=%d ρ=%.4f τ=%g 天 sigma=%g rank=%d 步数=%d"
+        amp = "" if self.amp == 1.0 else " a(t)=%.3f" % self.amp
+        demean = "" if not self.cohort else " 去均值/%d成员" % self.demean_members
+        return ("latent-ar1 member=%d slot=%d ρ=%.4f τ=%g 天 sigma=%g rank=%d 步数=%d%s%s"
                 % (self.member_index, self.slot, self.rho, self.spec.tau_days,
-                   self.spec.sigma, self.spec.rank, self.steps))
+                   self.spec.sigma, self.spec.rank, self.steps, amp, demean))
 
 
 class LatentStepStream:
@@ -875,7 +1047,24 @@ class LatentStepStream:
         等价 batched forward 里的一步递推，ρ 按每步 6h 折算），槽位归零；
       * step == 0 = 新的轨迹批（新起报 / 新成员）：全部行重抽 —— 即原 reset 语义
         （重抽不重置随机流，「重抽 = 新轨迹」，整个任务的抽样序列仍可复现）；
-      * 同一步内按调用次序轮流发第 0,1,2... 行（Ar1Driver.row），行数不够自动加宽。
+      * 同一步内按调用次序轮流发第 0,1,2... 行（Ar1Driver.row），行数不够自动加宽；
+      * **一次调用可以吃掉 k 行**（`width=k`，见下），槽位前进 k。
+
+    ---- width：一次 forward 堆了 k 条轨迹（rollout_batch > 1）----
+
+    runner 的 `batch_size=rollout_batch` 会把轨迹切成**连续**区间、每块一次 forward
+    （`chunks = range(0, n, rb)`）。块内 k 条轨迹要的是**同一 index 起、横跨 k 行**的
+    ξ，所以后端得把块宽告诉这里：`width=k` → 返回 index，`slot += k`，后端再
+    `ar1.row(index, k)` 取 `[k, T, R]` 一次喂进去。块起点 = 上一块起点 + 上块宽度，
+    与「rb=1 时第 j 条轨迹拿第 j 行」是同一个映射的推广。
+
+    **不传 width（=1）时与旧行为逐位相同**，所以已经在跑的批次不受影响。
+    width>1 的路径与 rb=1 逐位同流：行是 `Ar1Driver.row` 按需从同一条 rng 流里顺序补出来的，
+    `_draw` 顺序填充（无跨调用缓存），所以「一次抽 k 行」与「抽 k 次每次一行」逐位相同
+    ⇒ **rollout_batch 对集合中性**（回放测试 tmp/ar1_row_replay.py 第 4 条）。
+
+    原接线错误是**相反**方向：width 恒 1 却按 k 条轨迹喂块 ⇒ 块内 k 条轨迹拿到
+    row, row+1, ... 相邻行而不是同一 index 的 k 行，块内成员几乎重复、集合静默欠散。
 
     为什么不覆盖 reset_runtime_state：那是「换 session 之后状态还在不在」的契约
     （cli 的 _guard_segment_model 靠它判断分段 rollout 能不能用），而 xi 的递推本来就在
@@ -899,14 +1088,20 @@ class LatentStepStream:
         self.slot = 0
 
     def __call__(self, forcing, step, *, n_targets, member_index=0,
-                 hour_interval=None):
-        """返回本次 forward 该拿的行号（int），None = 未启用强迫。
+                 hour_interval=None, width=1):
+        """返回本次 forward 该拿的**起始**行号（int），None = 未启用强迫。
 
         forcing / n_targets 由后端给（onnx：图 metadata 里的目标数；pt2：注入时
         记下的目标数）。后端自己先判 None 早退也行 —— 这里再判一次只是保险。
+
+        width = 本次 forward 堆了几条轨迹（rollout_batch），槽位前进 width、由调用方
+        用 ``ar1.row(index, width)`` 取行。缺省 1 = 逐轨迹调用，与旧行为逐位相同。
         """
         if not forcing or int(n_targets) <= 0:
             return None
+        width = int(width)
+        if width < 1:
+            raise ValueError(f"width 必须 >= 1（一次 forward 至少一条轨迹），实际 {width}")
         # 进程 rank 必须计进熵：只开 latent_forcing（没有 m1a 权重）时，集合走的是
         # 「一个 session + 一批轨迹」那条路，member_index 恒为 0，成员身份 = 轨迹批里
         # 的行号。多卡按成员切时每个 rank 跑一部分成员，不把 rank 计进熵的话各 rank 的
@@ -916,7 +1111,8 @@ class LatentStepStream:
         if self.ar1 is None or self.key != key:
             self.ar1 = Ar1Driver(forcing, int(n_targets),
                                  member_index=key[0], slot=rank, batch=1,
-                                 hour_interval=hour_interval)
+                                 hour_interval=hour_interval,
+                                 world_size=_world_size())
             self.key = key
             self.step = None
             self.slot = 0
@@ -931,8 +1127,16 @@ class LatentStepStream:
                 self.ar1.advance()
             self.step = int(step)
             self.slot = 0
+            # 时变幅度 a(t)：只在**出口**缩放 ξ，不进图指纹（同 tau_days）。
+            # 设在这里而不是每次 __call__，是因为同一步内会有多个 width 块反复进来，
+            # 倍数按 step 定一次就够。forcing 理论上必是 spec（上面 rho 已经用了），
+            # 但仍按属性取 —— 拿不到就恒 1，绝不因为一个新字段把老路径弄挂。
+            amp_at = getattr(forcing, "amp_at", None)
+            self.ar1.amp = float(amp_at(self.step)) if amp_at else 1.0
         index = self.slot
-        self.slot += 1
+        # 本次调用吃掉了 width 条轨迹的行；同一步内的下一块从 index+width 起。
+        # 这就是「rb=1 时第 j 条轨迹拿第 j 行」的推广（块起点 = 前几块宽度之和）。
+        self.slot += width
         return index
 
     def release(self):

@@ -52,8 +52,9 @@ from .graph import (
     select_initializers,
     tensor_array,
 )
-from .latent import (Ar1Driver, LatentForcingSpec, _grid_from_patch_embed, build_basis,
-                     build_forcing_model, detect_layout, lag1_autocorr, resolve_targets)
+from .latent import (Ar1Driver, LatentForcingSpec, LatentStepStream,
+                     _grid_from_patch_embed, build_basis, build_forcing_model,
+                     detect_layout, lag1_autocorr, resolve_targets)
 from .spec import NOISE_STRUCTS, WeightPerturbSpec
 from .weights import (
     build_member_set,
@@ -1137,7 +1138,7 @@ _FORCE_RANK = 4
 _FORCE_TARGET = "/latent_mixer/Add_output_0"
 
 
-def _write_forcing_fixture(path, *, patch_embed=False):
+def _write_forcing_fixture(path, *, patch_embed=False, fp16=False):
     """写一张「有潜空间可切」的小图。
 
     非 patch_embed：`x [B,tokens,channels] --Identity--> 目标张量 --Add(head.bias)--> y`。
@@ -1147,20 +1148,28 @@ def _write_forcing_fixture(path, *, patch_embed=False):
     patch_embed=True：再加一个 kernel == stride 的 Conv（名字对齐 FGVP 的 patch_embed）+
     Reshape，用来测「从卷积与输入空间维推 tokens/grid」的那条探测路径；同时把 Conv 的
     4 维输出 `patch` 显式写进 value_info —— 它是「非 3 维目标必须被拒绝」的负例。
+
+    fp16=True：全图 float16。**这一档必须单列**：生产用的集合图就是 fp16
+    （iwc_gssp_im_fp16.onnx），而注入链的常量是 fp32，两边直接相乘会被 ORT 判为
+    「Type parameter (T) of Optype (Mul) bound to different types」而**建不出会话**。
+    修复是链尾往目标类型 Cast 一次（latent.py 的 CastGain）。这个 bug 从 fp32 夹具上
+    完全看不见，所以夹具本身要能出 fp16。
     """
     onnx = _onnx()
     helper, TensorProto = onnx.helper, onnx.TensorProto
     rng = np.random.default_rng(11)
     tokens, channels = _FORCE_TOKENS, _FORCE_CHANNELS
     rows, cols = _FORCE_GRID
+    dtype = np.float16 if fp16 else np.float32
+    elem = TensorProto.FLOAT16 if fp16 else TensorProto.FLOAT
 
     inits = [onnx.numpy_helper.from_array(
-        (rng.standard_normal(channels).astype(np.float32) * 0.1), "head.bias")]
+        (rng.standard_normal(channels).astype(dtype) * 0.1), "head.bias")]
     value_info = []
     if patch_embed:
         inits += [
             onnx.numpy_helper.from_array(
-                (rng.standard_normal((channels, 3, 2, 2)).astype(np.float32) * 0.1),
+                (rng.standard_normal((channels, 3, 2, 2)).astype(dtype) * 0.1),
                 "backbone.patch_embed.weight"),
             onnx.numpy_helper.from_array(
                 np.asarray([0, tokens, channels], dtype=np.int64), "flatten.shape"),
@@ -1173,19 +1182,19 @@ def _write_forcing_fixture(path, *, patch_embed=False):
                              name="/latent_mixer/Add"),
         ]
         inputs = [helper.make_tensor_value_info(
-            "img", TensorProto.FLOAT, [1, 3, rows * 2, cols * 2])]
+            "img", elem, [1, 3, rows * 2, cols * 2])]
         value_info.append(helper.make_tensor_value_info(
-            "patch", TensorProto.FLOAT, [1, channels, rows, cols]))
+            "patch", elem, [1, channels, rows, cols]))
     else:
         nodes = [helper.make_node("Identity", ["x"], [_FORCE_TARGET],
                                   name="/latent_mixer/Add")]
         inputs = [helper.make_tensor_value_info(
-            "x", TensorProto.FLOAT, ["B", tokens, channels])]
+            "x", elem, ["B", tokens, channels])]
     nodes.append(helper.make_node(
         "Add", [_FORCE_TARGET, "head.bias"], ["y"], name="/latent_mixer/head/Add"))
     graph = helper.make_graph(
         nodes, "spw_latent_selftest", inputs,
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, ["B", tokens, channels])],
+        [helper.make_tensor_value_info("y", elem, ["B", tokens, channels])],
         inits, value_info=value_info)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
     model.ir_version = 8
@@ -1290,6 +1299,45 @@ def _case_latent(work, check):
           "同一个 xi 两次前向**逐位相同**（图里没有随机算子 —— 与 m3 的分水岭）")
     check(not np.allclose(got, other),
           "换一个 xi 输出就变（随机性来自驱动侧喂进来的 xi）")
+
+    # 5b) fp16 图：注入链的常量是 fp32，必须在链尾 Cast 一次才建得出会话。
+    #     生产用的集合图就是 fp16，而这个 bug 在 fp32 夹具上完全看不见 —— 所以夹具
+    #     得有 fp16 档，且要同时钉住「会话建得起来」与「数值真的乘上了增益」。
+    src16 = _write_forcing_fixture(osp.join(work, "latent_fp16.onnx"), fp16=True)
+    forced16 = build_forcing_model(src16, _forcing_spec(sigma=sigma),
+                                   osp.join(work, "latent_fp16_forced.onnx"),
+                                   verbose=False)
+    model16 = load_model(forced16)
+    casts = [node for node in model16.graph.node if node.name == "spw/ar1/t0/CastGain"]
+    check(len(casts) == 1
+          and next(a.i for a in casts[0].attribute if a.name == "to") == onnx.TensorProto.FLOAT16,
+          "fp16 图的注入链尾部有且只有一次 Cast(to=fp16)"
+          "（链全程 fp32，只在乘目标之前降下来）",
+          f"找到 {len(casts)} 个 CastGain")
+    x16 = feeds["x"].astype(np.float16)
+    zero16 = build_forcing_model(src16, _forcing_spec(sigma=0.0),
+                                 osp.join(work, "latent_fp16_zero.onnx"), verbose=False)
+    source16 = _run(src16, {"x": x16})[0]
+    check(np.array_equal(_run(zero16, {"x": x16,
+                                       "spw/xi": np.zeros((1, 1, _FORCE_RANK),
+                                                         dtype=np.float32)})[0], source16),
+          "fp16 图的 sigma=0 空转也与源图**逐位相同**（Cast 不改变恒等的增益 1）")
+    baked16 = {entry.name: entry for entry in model16.graph.initializer}
+    field16 = np.einsum("br,rn,rc->bnc", xi[:, 0, :],
+                        onnx.numpy_helper.to_array(baked16["spw/ar1/t0/Vt"]),
+                        onnx.numpy_helper.to_array(baked16["spw/ar1/t0/Ut"]))
+    # 参考按图里的**每一步**都舍入到 fp16 重算（乘增益 -> Cast -> 加偏置），这样比的是
+    # 同一条算术链，而不是「fp32 算完再降精度」——后者会把 fp16 的舍入差记到实现头上。
+    gain16 = (1.0 + field16).astype(np.float16)
+    bias16 = onnx.numpy_helper.to_array(baked16["head.bias"])
+    expected16 = ((source16 - bias16) * gain16 + bias16).astype(np.float16)
+    got16 = _run(forced16, {"x": x16, "spw/xi": xi})[0]
+    check(got16.dtype == np.float16,
+          "fp16 图的前向仍是 fp16 进出（Cast 只作用于增益，不动主干精度）",
+          f"得到 {got16.dtype}")
+    check(np.allclose(got16, expected16, rtol=5e-3, atol=1e-3),
+          "fp16 图上乘进去的增益 == numpy 参考（增益没被 Cast 丢掉或算成 1）",
+          f"最大偏差 {np.abs(got16.astype(np.float32) - expected16.astype(np.float32)).max():.3e}")
 
     # 6) 结构：目标的所有消费者都改接到强迫链，且只改一次
     check("spw/xi" in [value.name for value in model_f.graph.input],
@@ -1403,6 +1451,45 @@ def _case_latent(work, check):
     batched.reset()
     check(int(batched.steps) == 0 and not np.allclose(before, batched.value(3)),
           "reset 重抽 xi_0 并把步数归零（新轨迹 = 新的噪声相位）")
+
+    # 8b) 驱动状态机的**块宽**：rollout_batch>1 时一次 forward 堆 k 条轨迹，驱动必须
+    #     一次吃掉 k 行。宽度恒 1 的旧接线会被 ORT 静默广播（[1,T,R] 的 ξ 配 batch=k 的
+    #     state 不报错），块内 k 条轨迹共用相邻行 ⇒ 集合静默欠散。这里只查驱动侧发出的
+    #     行号序列——它不依赖模型，是这条链上唯一能在合成图上钉死的环节。
+    def row_plan(rb, steps=3, n_traj=12):
+        """按 runner 的调用序列（外层 step、内层按 rb 切连续块）回放，记下每块拿到的行号。"""
+        stream = LatentStepStream()
+        plan = np.zeros((steps, n_traj), dtype=int)
+        for step in range(steps):
+            for start in range(0, n_traj, rb):
+                width = min(rb, n_traj - start)
+                index = stream(spec, step, n_targets=1, member_index=0, width=width)
+                plan[step, start:start + width] = np.arange(index, index + width)
+        return plan
+
+    plan_one, plan_six = row_plan(1), row_plan(6)
+    check(np.array_equal(plan_one, plan_six),
+          "块宽 6 与逐轨迹（rb=1）拿到的行号序列逐位相同"
+          "（行按需从同一条流顺序补出 ⇒ rollout_batch 对 ξ 中性）",
+          f"rb=6 首步行号 {plan_six[0][:8]}...")
+    check(np.array_equal(plan_six[0], np.arange(12)),
+          "rb=6 时同一步内 12 条轨迹拿到 12 个互不相同的行号（没有共用行 = 成员没重复）",
+          f"得到 {plan_six[0]}")
+    stream = LatentStepStream()
+    starts = (stream(spec, 0, n_targets=1, member_index=0, width=6),
+              stream(spec, 0, n_targets=1, member_index=0, width=6))
+    check(starts == (0, 6), "同一步内第二块的起始行号 = 首块宽度（槽位按宽度前进）",
+          f"得到 {starts}")
+    check(stream.ar1.row(6, 6).shape == (6, 1, _FORCE_RANK),
+          "row(index, width) 直接给出 [width, 目标数, rank]，可整块喂进图"
+          "（图里 spw/xi 的 batch 轴是符号维）",
+          f"得到 {stream.ar1.row(6, 6).shape}")
+    try:
+        stream(spec, 0, n_targets=1, member_index=0, width=0)
+        ok = False
+    except ValueError as error:
+        ok = "width" in str(error)
+    check(ok, "width=0 被明确拒绝（发不出行却不报错 = 静默错位）")
 
     # 9) 注入到「没有消费者」的目标上必须报错，不能静默落一张坏图
     try:

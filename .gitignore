@@ -39,3 +39,6 @@ dist/
 .idea/
 .claude/
 .vscode/
+
+# ===== 本地暂存/探针目录（分析脚本、投跑 yaml、残档；含明文口令，不进 Git）=====
+/tmp/

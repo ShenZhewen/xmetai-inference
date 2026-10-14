@@ -12,6 +12,7 @@
     python -m xmetai_inference.perturbation verdict F S T V E3      # 判决页（零推理）
     python -m xmetai_inference.perturbation latent build model.onnx --tau-days 3   # 潜空间 AR(1)
     python -m xmetai_inference.perturbation latent audit model.ar1-xxxxxxxxxx.onnx
+    python -m xmetai_inference.perturbation noise-scale model.onnx --k 2.0   # 图内噪声幅度 σ×k
 
 `groups` 用来挑注入点：打印每个名字前缀的张量数、元素数、权重能量占比，
 按能量降序，方便对着论文的「张量组 / 尺度」两阶段消融选候选。
@@ -42,6 +43,8 @@ from .graph import (
 )
 from .latent import (DEFAULT_LENGTH_SCALE, LatentForcingSpec, audit_forcing,
                      build_forcing_model, format_forcing_audit)
+from .noise_scale import (DEFAULT_FACTOR, DEFAULT_TENSOR, format_noise_scale_report,
+                          scale_builtin_noise)
 from .spec import DEFAULT_EXCLUDE, WeightPerturbSpec
 from .verdict import DEFAULT_BASE, DEFAULT_PREFIX, DEFAULT_VAR
 
@@ -336,6 +339,19 @@ def _latent_build_pt2(args, spec) -> int:
     return 0 if report.get("ok") else 1
 
 
+def _cmd_noise_scale(args) -> int:
+    """图内自带噪声的幅度：σ ×k（改 logvar bias 一个 initializer，权重结构一字不动）。
+
+    只对**集合图**有意义 —— 成员的多样性来自图内随机算子的那些图。谱系上它与
+    weight_perturb（改权重）和 latent_forcing（改时间相关）正交，三条可叠。
+    """
+    report = scale_builtin_noise(
+        args.model, k=args.k, tensor=args.tensor, factor=args.factor, out=args.out)
+    for line in format_noise_scale_report(report):
+        print(line)
+    return 0
+
+
 def _cmd_latent(args) -> int:
     """潜空间 AR(1) 强迫：build（给图加 spw/xi）/ audit（看改得对不对）。
 
@@ -585,6 +601,20 @@ def main(argv=None) -> int:
     latent_audit.add_argument("model")
     latent_audit.add_argument("--json", action="store_true", help="打成 JSON")
     latent_audit.set_defaults(func=_cmd_latent)
+
+    noise = sub.add_parser(
+        "noise-scale",
+        help="图内自带噪声的幅度 σ×k（只动 logvar bias 一个 initializer，权重结构不动）")
+    noise.add_argument("model", help="集合图 onnx（成员由图内随机算子给出的那张）")
+    noise.add_argument("--k", type=float, default=2.0,
+                       help="σ 的倍数，默认 2；<1 = 收缩。等价位移 = factor·ln(k)")
+    noise.add_argument("--tensor", default=DEFAULT_TENSOR,
+                       help="σ 的 logvar bias 张量名（默认 %(default)s）")
+    noise.add_argument("--factor", type=float, default=DEFAULT_FACTOR,
+                       help="σ 与 logvar 的换算 σ = exp(logvar/factor)，默认 %(default)s")
+    noise.add_argument("--out", default=None,
+                       help="输出路径；默认源图同目录 <stem>.k<k>.onnx（外部数据要求同目录）")
+    noise.set_defaults(func=_cmd_noise_scale)
 
     args = parser.parse_args(argv)
     return args.func(args)

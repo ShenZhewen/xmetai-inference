@@ -150,6 +150,17 @@ class Pt2InferModel(BaseInferModel):
 
         row = self._latent_step(step)
         if row is not None:
+            if int(state.shape[0]) != 1:
+                # pt2 的 ξ 走 GraphModule 的 **spw_xi 缓冲**（图属性，不是图输入），
+                # 缓冲形状是 [T, R]、没有 batch 轴，塞不进 k 条轨迹的 ξ。这里必须炸：
+                # 按旧接线（width 恒 1）跑下去块内 k 条轨迹会共用同一行，集合静默欠散
+                # 且没有任何报错 —— 正是 LatentStepStream docstring 里那个危险方向。
+                # onnx 后端已支持 width>1（喂 [k,T,R] 图输入），pt2 要支持得先给注入侧
+                # 加 batch 轴。改之前：pt2 + latent_forcing 只能 rollout_batch=1。
+                raise ValueError(
+                    "pt2 后端的潜空间强迫（latent_forcing）不支持 rollout_batch>1："
+                    "ξ 走 spw_xi 缓冲（[T, R]，无 batch 轴），一次 forward 只能喂一条轨迹。"
+                    "请把 config 的 rollout_batch 设为 1（onnx 后端不受此限）。")
             # 本步第 row 条轨迹的 ξ（[1, T, R] float32）→ **就地**写进 [T, R] 的 spw_xi。
             # get_attr 在执行时按名字取当前张量，所以改的是值不是属性；就地改写（而不是
             # setattr 换张量）是必须的 —— 见 load() 里那段（unlift 之后有两个 GraphModule
