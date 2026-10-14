@@ -88,7 +88,7 @@ def _latlon_alignment(latitudes, longitudes, expected_shape):
     expected_lon = (np.arange(nlon, dtype=np.float64) * dlon) % 360.0
     if not np.allclose(lon % 360.0, expected_lon, atol=1e-4):
         diff = np.abs((lon % 360.0 + 180.0) % 360.0 - 180.0)
-        roll = int(np.argmin(diff))
+        roll = (-int(np.argmin(diff))) % nlon
     return flip, roll
 
 
