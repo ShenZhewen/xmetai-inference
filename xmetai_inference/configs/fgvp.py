@@ -24,7 +24,7 @@ cfg = InferConfig(
     model_path=os.environ.get(
         "FGVP_ONNX", "/workspace/tmp/douzsh/models/iwc_fgvp_gdn2_260901.onnx"),
     ops_library=os.environ.get(
-        "FGVP_OPS_LIBRARY", "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.so"),
+        "FGVP_OPS_LIBRARY", "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so"),
     # 统一开关：XMETAI_GPU_STATE="1"/"0" 显式覆盖，未设时用本 config 的默认。
     # 本模型默认必须关（图只出 1 帧，见 models/iwc_fgvp_gdn2.py 的说明）；
     # 即使显式设 1，OnnxInferModel.load 的启动期断言也会拦下。

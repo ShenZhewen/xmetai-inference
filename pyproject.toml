@@ -27,6 +27,17 @@ zarr = [
 onnx = [
     "onnxruntime",
 ]
+# 跑测试：pytest 本体，加上集成测试要用的读数据后端（realdata 档只在这些都在时才跑）。
+# 安装：pip install -e ".[dev]"
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=3.0",
+    "black>=22.0",
+    "ruff>=0.0.250",
+    "zarr",
+    "h5netcdf",
+    "onnxruntime",
+]
 
 [project.scripts]
 xmetai-infer = "xmetai_inference.cli:main"
@@ -37,4 +48,20 @@ include = ["xmetai_inference*"]
 [tool.setuptools.package-data]
 "xmetai_inference" = [
     "weights/README.md",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# --strict-markers：用了没登记的 marker 直接报错，免得打错字的 marker 静默失效
+# （比如 -m realdaat 会「选中 0 个测试」而不是报错）。
+#
+# 默认 `-m 'not realdata'`：光注册 marker 并不会让它们不跑，而 realdata 档会真起一次
+# GPU 推理。有 fixture 的机器上一句 `pytest` 就顺带跑掉，代价太大 —— 所以做成显式
+# opt-in：想跑就 `pytest -m realdata`（命令行给的 -m 会覆盖这里的）。
+addopts = "-v --strict-markers -m 'not realdata'"
+markers = [
+    "realdata: 需要真实模型与切片数据；fixture 目录不齐时整个模块 skip，缺 onnxruntime 等依赖时也 skip",
 ]

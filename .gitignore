@@ -39,3 +39,6 @@ dist/
 .idea/
 .claude/
 .vscode/
+
+# ===== 本地跑集成测试用的 k8s Job（写死了集群内的 pvc/hostPath 和 namespace）=====
+tests/fgvp_realdata_job.yaml
