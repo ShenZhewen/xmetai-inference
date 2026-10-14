@@ -20,6 +20,11 @@ golden 是 8 卡正式跑的；曾怀疑「8 卡拆批后 51 成员只有 8 个�
     越线率达 0.6~0.7%（其余变量最高 2.6e-4，符合高斯预期），tp 的占比线放宽到
     ``_FAIL_FRACTION`` 的 0.05 —— 真实回归会让降水区整片越线（百分之几十），
     与噪声仍隔一个量级。
+  * 批量化层（2026-10-14 加）：配方显式给 ``model_batch=6``（前向批：一次 forward
+    堆 6 条成员轨迹）。集合层顺带就是它的判据 —— 随机算子若按 (1,...) 出噪声再
+    broadcast 到 batch 维，k 行会拿到同一份扰动、成员互异用例立刻红。另有一条用例
+    盯 rank 日志，确认批量化真进了图：图不是动态 batch 轴时 runner 会打一条 WARNING
+    退回 1（这一趟照跑完），那时其余用例照样全绿，却跟批量化毫无关系。
 
 成员目录 0 基（``member_000..050``）。golden 必须挑 fgvp_ens_merged **新 .so 批次**
 （20250721 起）的完整日期 —— 批次混杂，旧批均值对拍可能真红。
@@ -44,6 +49,10 @@ if str(REPO_ROOT) not in sys.path:
 from realdata_common import (ATOL, EXCEED_FRACTION_CLOSE, RTOL, expected_vars,
                              load_fields, steps_in, variables_in)
 
+# runner 侧「批量化生效 / 被退回」的日志标记。**从 runner import，不抄字符串**：
+# 措辞改了这里跟着变，不会退化成一个永远搜不到的旧标记、把这条判据变成假绿。
+from xmetai_inference.runner import BATCH_ACTIVE_MARK, BATCH_FALLBACK_MARK
+
 #: fixture 根。
 DATA_ROOT = Path("/workspace/data/shenzw/inference_test_data/fgvp_ens_test_data")
 
@@ -64,6 +73,11 @@ STEPS = 3
 
 #: 全员 51：集合统计的采样噪声按 √51 缩，测的就是正式配方语义。
 MEMBERS = 51
+
+#: 前向批：一次 forward 堆几条成员轨迹（51 成员 = 9 块：8×6 + 3）。显式写死而不是
+#: 靠配方漂过来 —— 模板是 deepcopy 正式配方（configs/fgvp_ens.py 也是 6），不写的话
+#: 正式配方一改值，这条档会跟着变，覆盖面却没人知道。
+MODEL_BATCH = 6
 
 #: 单卡（cuda_devices 单卡空转，同 fgvp 档顶部说明）。
 GPUS = 1
@@ -147,6 +161,10 @@ cfg.times = "$times"
 cfg.steps = $steps
 cfg.members = $members
 cfg.gpus = $gpus
+# 前向批：本档要证明批量化路径本身没坏（切块 → 一次 forward k 条 → 逐行回填），
+# 所以显式给值，不靠正式配方漂过来（见 MODEL_BATCH 的说明）。图不是动态 batch 轴
+# 时 runner 会打 WARNING 退回 1，由 test_..._model_batch_takes_effect 拦。
+cfg.model_batch = $model_batch
 # worker 设 0 免得 DataLoader 再起子进程。
 cfg.dataloader = {
     "batch_size": 1,
@@ -175,6 +193,7 @@ def _write_config(dest: Path) -> Path:
             times=TIMES,
             steps=STEPS,
             members=MEMBERS,
+            model_batch=MODEL_BATCH,
             gpus=GPUS,
         ),
         encoding="utf-8",
@@ -373,6 +392,20 @@ def run(tmp_path_factory):
     assert run_root.is_dir(), (
         f"产物目录里没有 {INIT_DIR}/，实有：{sorted(p.name for p in out_dir.iterdir())}")
     metrics = _collect(run_root, GOLDEN_ROOT / INIT_DIR)
+
+    # 批量化到底进没进图，只有 rank 日志说得清：单卡走 cli._run_infer 的 gpus<=1 分支，
+    # 日志固定落 <out>/rank_0.log（多卡才是 rank_N.log）。判定放在用例里，不在这里
+    # 断言 —— 免得日志路径一变，四条与批量化无关的用例一起红。
+    log_path = out_dir / "rank_0.log"
+    log_text = (log_path.read_text(encoding="utf-8", errors="replace")
+                if log_path.is_file() else "")
+    metrics["model_batch"] = {
+        "requested": MODEL_BATCH,
+        "log_exists": log_path.is_file(),
+        "active": BATCH_ACTIVE_MARK in log_text,
+        "fallback": BATCH_FALLBACK_MARK in log_text,
+        "log": str(log_path),
+    }
     return metrics, config_path
 
 
@@ -461,3 +494,27 @@ def test_fgvp_ens_no_nan_mismatch(run):
         + "\n".join(f"  step={r['step']:03d} var={r['var']} 不一致点={r['nan_mismatch']}"
                     for r in bad[:20])
     )
+
+
+def test_fgvp_ens_model_batch_takes_effect(run):
+    """批量化层：``model_batch>1`` 必须真进图，不能悄悄退回逐条。
+
+    图不是动态 batch 轴时 runner 只打一条 WARNING 就退回 1（这一趟照跑完，均值/
+    散度/成员互异照样全绿）—— 那时这条档证明的只是「逐条前向」，与批量化无关。
+    所以以 rank 日志为凭：要么看到「生效」，要么看到「退回」，二者必居其一。
+    """
+    metrics, _ = run
+    info = metrics["model_batch"]
+
+    if not info["log_exists"]:
+        pytest.fail(f"rank 日志不在 {info['log']} —— cli 单卡的 --log-file 落点改了？")
+
+    if not info["active"]:
+        pytest.fail(
+            f"model_batch={info['requested']} 没生效"
+            + ("：runner 判定图的输入/输出 batch 轴不是符号维、退回了逐条 —— 要重导"
+               "动态 batch 的图（正式配置当前就是这个值），或把本档 MODEL_BATCH 调回 1"
+               if info["fallback"] else
+               "：日志里既没有「生效」也没有「退回」—— runner 里的判定分支根本没走到"
+               "（日志标记常量被改过？）")
+            + f"\n  日志：{info['log']}")

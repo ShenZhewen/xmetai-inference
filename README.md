@@ -305,6 +305,12 @@ ONNX Runtime 单 session 独占一张卡；支持 GPU 常驻（IOBinding，state
 `config` 的 `gpu_state` 或环境变量 `XMETAI_GPU_STATE` 控制；`windowed_output=False`
 的图（只出一帧）不具备开快路径的条件（启动期会拦下）。
 
+卡内还能再批一层：`config` 的 `model_batch` 让一次 `forward` 堆多条轨迹（`members>1`
+批成员，`members==1` 批起报），省的是逐条前向的调用开销。前提是 ONNX 图导出时输入/
+输出的 batch 轴都是符号维 —— onnx 后端在 `load` 时实测，不满足就打一条 WARNING 退回 1
+（这一趟照跑完）。它与 `gpu_state=True` 互斥，配了直接报错；与 `dataloader.batch_size`
+**不是一回事**：那个是 Dataset 一次装几个起报（I/O 批）。
+
 ## 源码评测工具
 
 本项目定位为推理库，PyPI 包只安装 `xmetai-infer`，不安装评测命令。单档评测、集合
@@ -340,6 +346,9 @@ store）**全部从推理 config 读取**，与推理天然同源，换配置用
 ## 已知限制与注意事项
 
 - `windowed_output=False` 的图（IWC FGVP GDN2、FengQing）只出预报帧，不能开 GPU 常驻。
+- `model_batch>1` 要求图的输入/输出 batch 轴都是符号维（导出时就定死），不能与
+  `gpu_state=True` 同用；`forward` 里写死 batch=1 的模型类（FengQing、Pangu）也不支持。
+  有没有真批上以日志为准：进程内会留一行「前向批生效」，退回则是一行 WARNING。
 - 自定义算子 `.so` 与 onnxruntime 版本 ABI 绑定，跨环境（尤其容器）运行前要确认。
 - 权重/数据路径写在 config 里（多为服务器绝对路径），换机器用环境变量覆盖。
 - NetCDF4/HDF5 非线程安全，输出写盘为单线程串行；写失败按 step 兜底存 `.npy`。

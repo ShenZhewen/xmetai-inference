@@ -110,6 +110,16 @@ class InferConfig:
     hour_interval: int = 0                  # 时间步长小时（0 = 读模型类的 hour_interval）
     members: int = 0                         # 集合成员数（0 = 读模型类的 members）
     vars: str = ""                           # 输出变量，逗号分隔（空 = 保存全部通道）
+    # 前向批：一次 forward 堆几条轨迹（1 = 逐条前向，缺省，与历史行为一致）。
+    # ⚠ 与 dataloader 的 batch_size **不是一个东西**：那个是 Dataset 一次装几个
+    # 起报（I/O 批），这个是**前向批**。members>1 时批的是成员，members==1 时批的
+    # 是起报。前提（不满足不会静默算错：前两条在 runner 里挡掉，第三条图自己会拒）：
+    #   * 图导出时输入/输出的 batch 轴都是符号维 —— onnx 后端 load 时实测后置
+    #     batch_axis_dynamic，没置位就打 WARNING 退回 1，这一趟照跑完；
+    #   * 不能与 gpu_state=True 同用（配置互斥，直接报错，不静默退回）；
+    #   * 一批里各轨迹的时刻可以不同（step/hour/doy 按 (k,) 逐行喂）。
+    # 显存按此倍数涨：0.25° 78 通道 2 帧，一条轨迹的状态约 648 MB，照可用显存给。
+    model_batch: int = 1
     gpu_mem: float = 0.7                     # 显存占用比例
     log_level: str = "INFO"                  # 控制台日志级别
     gpus: int = 1                            # 卡数（>1 时按起报时间分摊到各卡）

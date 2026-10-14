@@ -30,6 +30,25 @@ log = logging.getLogger(__name__)
 
 _PROGRESS_INTERVAL = 5   # 每隔多少步打一条完整进度行（多卡时 \r 会互相覆盖）
 
+#: model_batch 生效 / 退回的日志标记。集成档（tests/integration 的 fgvp_ens 档）
+#: import 这两个常量来判「批量化到底有没有进图」—— 图是静态 batch 轴时 runner 只打
+#: 一条 WARNING 就退回 1，这一趟照跑完，其余用例照样绿，却跟批量化无关。
+BATCH_ACTIVE_MARK = "前向批生效"
+BATCH_FALLBACK_MARK = "模型未声明 batch_axis_dynamic"
+
+#: 已经打过的 model_batch 提示，按 key 在进程内去重。集合路径下每个起报新建一个
+#: Rollout 实例（cli.py 里 Rollout(...) 在起报循环内），不去重的话同一条提示会被
+#: 打「起报数」遍（348 个起报 = 348 行噪音，正好盖住真正要看的那行）。
+_batch_notices = set()
+
+
+def _notice_once(key, level, message, *args):
+    """同一条 model_batch 提示在一个进程里只打一次。"""
+    if key in _batch_notices:
+        return
+    _batch_notices.add(key)
+    log.log(level, message, *args)
+
 
 def _copy_state(value):
     """numpy 用 copy()，torch 用 clone()。"""
@@ -43,6 +62,13 @@ def _stack(values, axis=0):
     if values and isinstance(values[0], torch.Tensor):
         return torch.stack(values, dim=axis)
     return np.stack(values, axis)
+
+
+def _cat(values, axis=0):
+    """torch 用 torch.cat，numpy 用 np.concatenate。"""
+    if values and isinstance(values[0], torch.Tensor):
+        return torch.cat(values, dim=axis)
+    return np.concatenate([np.asarray(v) for v in values], axis=axis)
 
 
 @dataclass
@@ -79,13 +105,32 @@ class Rollout:
         return getattr(self.processing, f"process_{stage}")
 
     def run(self, trajectories, steps, hour_interval=6, on_step=None,
-            progress=True, progress_label=""):
+            progress=True, progress_label="", model_batch=1):
         """跑 steps 步，每步对全部轨迹各前向一次。
 
         on_step(step_index, step_state) 每步回调一次，step_state 形状
         (n_trajectories, C, H, W)，顺序与传入的 trajectories 一致。传了 on_step
         就走流式（内存不随 steps 增长）；不传则把 (n_traj, steps, C, H, W) 全攒
         在内存里返回。
+
+        ``model_batch`` 是一次 forward 最多堆几条轨迹（缺省 1 = 逐条前向，与历史
+        行为逐位一致）。>1 时把轨迹按块 _cat 成 (k, F, C, H, W) 一次喂给模型，
+        GPU 算力占用明显不同（Mamba 这类顺序扫描骨干尤其吃这个）。三个前提：
+
+          * 图导出时输入/输出的 batch 轴都是符号维（动态）—— 模型层用
+            ``batch_axis_dynamic`` 声明，没声明就自动退回 1（见下）；
+          * 不能与 gpu_state=True 同用（配置互斥，直接报错，不静默退回）；
+          * 各轨迹的时刻可以不同 —— step/hour/doy 按 (k,) 向量喂，同一批里
+            多成员、多起报都成立。但 forward override 里写死 batch=1 的模型类
+            （fengqing / pangu）不支持：它们拿到 k>1 的状态会在前向里炸形状/类型
+            （不会静默算错，但报错信息里看不出是 model_batch 惹的），别给它们开。
+
+        显存按 k 倍涨：一条轨迹的状态是 (F, C, H, W) 浮点，0.25° 78 通道两帧约
+        648 MB，k 要照着可用显存给。
+
+        生效还是退回，进程内各留一行日志（``BATCH_ACTIVE_MARK`` /
+        ``BATCH_FALLBACK_MARK``），只打一次 —— 集合路径下每个起报都会新起一个
+        Rollout，打多了是噪音。
 
         返回流式时为 None，否则为堆叠结果。
         """
@@ -104,11 +149,53 @@ class Rollout:
         if use_gpu and recurrent_transform is not None:
             raise ValueError("GPU 常驻模式暂不支持 recurrent Processor")
 
-        # 每条轨迹一份独立缓冲：forward 可能原地改，且 state=result 回填会替换它。
+        if model_batch < 1:
+            raise ValueError(f"model_batch 必须 >= 1，实际 {model_batch}")
+        if model_batch > 1:
+            if use_gpu:
+                # 不静默退回：这是配置互斥，悄悄跑成逐条会让人以为批量化生效了。
+                raise ValueError(
+                    "model_batch>1 与 gpu_state=True 互斥：GPU 常驻分支"
+                    "（forward_gpu）的 _spare buffer 复用假设固定 shape，"
+                    "动态 batch 轴建不出 buffer。")
+            if not getattr(self.model, "batch_axis_dynamic", False):
+                # 静默退回会让人以为批量化生效了，所以先喊一声。图是静态 batch 时
+                # 喂 k>1 会被 ORT 拒，退回 1 至少让这一趟跑完。
+                _notice_once(
+                    ("fallback", type(self.model).__name__),
+                    logging.WARNING,
+                    BATCH_FALLBACK_MARK +
+                    "（导出时 batch 轴不是符号维），model_batch=%d 退回 1；"
+                    "要真多 batch 推理得重导动态 batch 的图。",
+                    model_batch)
+                model_batch = 1
+            else:
+                # 生效也留一行：批量化是「静默加速」，日志里没有痕迹的话，跑完只
+                # 能靠墙钟时间猜它有没有生效（集成档就是靠这行判的）。
+                _notice_once(
+                    ("active", type(self.model).__name__, model_batch),
+                    logging.INFO,
+                    BATCH_ACTIVE_MARK +
+                    "：一次 forward 最多 %d 条轨迹（图的输入/输出 batch 轴都是符号维）",
+                    model_batch)
+
+        # 轨迹按 model_batch 分块，每块一次前向。model_batch=1 时每块一条，
+        # 与逐轨迹路径逐位等价。
+        chunks = [list(range(start, min(start + model_batch, len(trajectories))))
+                  for start in range(0, len(trajectories), model_batch)]
+
+        # 每块一份独立缓冲：forward 可能原地改，且 state=result 回填会替换它。
+        # 多条用 _cat 不用 _stack：state 已带 batch 维 (1,F,C,H,W)，要拼成
+        # (k,F,C,H,W)，stack 会多出一维。
         if use_gpu:
+            # model_batch>1 已在上面挡掉，块必是单条，下标与轨迹一一对应
             states = [self.model.to_gpu(t.state) for t in trajectories]
         else:
-            states = [_copy_state(t.state) for t in trajectories]
+            states = [
+                _copy_state(trajectories[chunk[0]].state) if len(chunk) == 1
+                else _cat([_copy_state(trajectories[i].state) for i in chunk], 0)
+                for chunk in chunks
+            ]
         in_frames = trajectories[0].state.shape[1]
         init_times = [pd.to_datetime(t.init_time) for t in trajectories]
 
@@ -128,26 +215,38 @@ class Rollout:
         for step in range(steps):
             t0 = perf_counter()
             parts = []
-            for index, init_time in enumerate(init_times):
-                valid_time = init_time + pd.Timedelta(
-                    hours=(step + offset) * hour_interval)
+            for chunk_index, chunk in enumerate(chunks):
+                valid_times = [
+                    init_times[index] + pd.Timedelta(
+                        hours=(step + offset) * hour_interval)
+                    for index in chunk
+                ]
 
                 if use_gpu:
                     result = self.model.forward_gpu(
-                        states[index], step, valid_time)
-                    states[index] = result
+                        states[chunk_index], step, valid_times[0])
+                    states[chunk_index] = result
                     parts.append(self.model.to_numpy(result)[0, -1])
                     continue
 
-                result = self.model.forward(states[index], step, valid_time)
-                next_state = self._next_state(
-                    states[index], result, in_frames, windowed)
-                # 末帧 = 本步预报。先取出副本再回填 —— recurrent Processor
-                # （如 zero_channels）是原地改，不复制会把已取出的预报也改掉。
-                pred = next_state[0, -1]
-                parts.append(
-                    pred.clone() if isinstance(pred, torch.Tensor) else pred.copy())
-                states[index] = (
+                prev = states[chunk_index]
+                # 单条块喂标量时刻（与逐条路径逐位一致）；多条块喂时刻列表 ——
+                # _scalar_feeds 把后者拼成 (k,) 的 step/hour/doy，正是动态
+                # batch 图要的形状（同一批里各轨迹的时刻可以不同，所以逐行给）。
+                result = self.model.forward(
+                    prev, step,
+                    valid_times[0] if len(chunk) == 1 else valid_times)
+                next_state = self._next_state(prev, result, in_frames, windowed)
+                # 末帧 = 本步预报，逐轨迹切一份，下标语义与 (n_traj, C, H, W)
+                # 数组一致。先取副本再回填 —— recurrent Processor（如
+                # zero_channels）是原地改，不复制会把已取出的预报也改掉。
+                preds = next_state[:, -1]
+                for row in range(preds.shape[0]):
+                    frame = preds[row]
+                    parts.append(
+                        frame.clone() if isinstance(frame, torch.Tensor)
+                        else frame.copy())
+                states[chunk_index] = (
                     recurrent_transform(next_state)
                     if recurrent_transform is not None else next_state)
 

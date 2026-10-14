@@ -657,6 +657,7 @@ def _worker_main(argv=None):
                     hour_interval=interval,
                     on_step=on_batch_step,
                     progress=False,
+                    model_batch=worker_cfg.model_batch,
                 )
             else:
                 for batch_index, init in enumerate(batch_inits):
@@ -695,6 +696,7 @@ def _worker_main(argv=None):
                         on_step=on_step,
                         progress=False,
                         progress_label=f"[rank {local_rank}/{world_size}] {init:%m%d%H}",
+                        model_batch=worker_cfg.model_batch,
                     )
 
             writer.flush()

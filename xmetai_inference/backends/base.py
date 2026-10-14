@@ -153,6 +153,11 @@ class BaseInferModel(ABC):
     # 回填处理的模型应保持 gpu_state=False。
     gpu_state = False
 
+    # 一次 forward 能不能堆多条轨迹（model_batch>1）：图导出时输入/输出的 batch
+    # 轴都得是符号维。onnx 后端在 load 时实测后置位；缺省 False = 不支持，
+    # Rollout 会打 WARNING 把 model_batch 退回 1（不静默算错）。pt2 后端不置位。
+    batch_axis_dynamic = False
+
     def to_gpu(self, x):
         """numpy 初始 state -> GPU 载体（gpu_state=True 时实现）。"""
         raise NotImplementedError

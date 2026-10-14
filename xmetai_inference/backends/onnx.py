@@ -145,6 +145,17 @@ class OnnxInferModel(BaseInferModel):
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())
+        # 能不能一次吃多条轨迹（model_batch>1）：state 输入（喂料时键名固定为
+        # "input"）与输出的 batch 轴**都**得是符号维。任何一个静态，喂 k>1 都不
+        # 成立 —— 输入静态会被 ORT 直接拒，输出静态则批次对不上。标量（shape 为
+        # 空）一律当静态。
+        _inputs = self.session.get_inputs()
+        _state_input = next((i for i in _inputs if i.name == "input"), _inputs[0])
+        _in_shape = list(getattr(_state_input, "shape", None) or [])
+        _out_dim = list(getattr(self.session.get_outputs()[0], "shape", None) or [])
+        self.batch_axis_dynamic = (
+            bool(_in_shape) and bool(_out_dim)
+            and isinstance(_in_shape[0], str) and isinstance(_out_dim[0], str))
         self._check_gpu_state_frames()
         # 输出 OrtValue 复用池：forward_gpu 把用完的输入 state 回收为下一个输出 buffer，
         # 避免每步 ortvalue_from_shape_and_type 分配/释放 618MB 显存。首个调用时才新建。
