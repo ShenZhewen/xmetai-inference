@@ -83,7 +83,7 @@ MODEL_REGISTRY = {
         "xmetai_inference.models.fuxi21_pt2",
         "Fuxi21Pt2Model",
     ),
-"iwc_fgvp_gdn2_onnx": (
+    "iwc_fgvp_gdn2_onnx": (
         "xmetai_inference.models.iwc_fgvp_gdn2",
         "IwcFgvpGdn2Model",
     ),
