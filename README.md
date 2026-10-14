@@ -73,8 +73,6 @@
 │   ├── models/              # 具体模型与按需加载注册表 MODEL_REGISTRY
 │   ├── configs/             # 内置完整运行配方
 │   └── logging_util.py      # 推理日志配置
-├── util/                    # 源码附带评测工具，不进入 PyPI wheel
-├── scripts/                 # Bash 推理启动脚本（旧部署方式）
 └── model_artifacts/         # 本地模型产物，整个目录不上传 Git
 ```
 
@@ -309,17 +307,13 @@ ONNX Runtime 单 session 独占一张卡；支持 GPU 常驻（IOBinding，state
 
 ## 源码评测工具
 
-本项目定位为推理库，PyPI 包只安装 `xmetai-infer`，不安装评测命令。仓库根目录的
-`util/` 是开发者内部工具，下载源码后使用，详细参数见 `util/README.md`：
+本项目定位为推理库，PyPI 包只安装 `xmetai-infer`，不安装评测命令。单档评测、集合
+评测、两次输出互比这几件工具**已移出本仓库**（去 `xmetai-evaluation`），不再随源码
+分发 —— 这里只保留推理链本身。
 
-```bash
-python util/eval_single_util.py    # 评预置 config（默认 fengqing ）的输出
-python util/eval_ens_util.py       # 评 fuxi_ens 的输出
-python util/compare_outputs.py run_new run_old   # 两次预测互比，判断结果是否一致
-```
-
-评测默认值（`--forecast`、`--vars`、单位换算、实况 store）**全部从推理 config 读取**，
-与推理天然同源；换配置用 `XMETAI_EVAL_CONFIG`，覆盖实况 store 用 `--stores`。
+它们的设计里有一条值得保留：评测默认值（`--forecast`、`--vars`、单位换算、实况
+store）**全部从推理 config 读取**，与推理天然同源，换配置用 `XMETAI_EVAL_CONFIG`。
+这是「评测和推理不会各说各话」的保证。
 
 ## 模型契约与单位
 

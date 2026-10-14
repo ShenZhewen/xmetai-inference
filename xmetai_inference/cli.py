@@ -60,8 +60,8 @@ def _output_init_dir(init):
 
     按天起报（每天 00Z）时目录就是干净的 YYYYMMDD；同日多时次才带上小时，
     避免互相覆盖。注意：起报间隔混用（如既有 00Z 又有 12Z）会产生 8 位与
-    10 位并存的目录名，下游按目录名解析时要能同时吃两种——
-    util/eval_single_util.py 的 _parse_init_dir 已兼容。
+    10 位并存的目录名，下游按目录名解析时要能同时吃两种 —— 判据用
+    ``^\\d{8}(\\d{2})?$``，按长度选 ``%Y%m%d`` 还是 ``%Y%m%d%H``。
     """
     return init.strftime("%Y%m%d" if init.hour == 0 and init.minute == 0 else "%Y%m%d%H")
 

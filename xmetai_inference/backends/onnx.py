@@ -29,10 +29,10 @@ def _preload_onnxruntime_lib():
     「libonnxruntime.so.1: cannot open shared object file」。
 
     ``LD_LIBRARY_PATH`` 只在进程启动时被链接器读取，运行中改 ``os.environ`` 无效，
-    所以那条路必须靠外部脚本（见 ``scripts/run.sh``）。这里换个办法：用
+    所以那条路必须靠外部脚本在启动前设好环境变量。这里换个办法：用
     ``RTLD_GLOBAL`` 先把版本化的库 dlopen 进本进程。dlopen 解析依赖时会先按 SONAME
     查已加载的库，命中就不再走文件系统搜索 —— 于是直接
-    ``python -m xmetai_inference`` 也能跑，不必套 run.sh。
+    ``python -m xmetai_inference`` 也能跑，不必在启动脚本里设 LD_LIBRARY_PATH。
 
     失败一律静默：这只是让「不设 LD_LIBRARY_PATH 也能跑」，真正的报错留给
     register_custom_ops_library 抛（它的信息更准确）。

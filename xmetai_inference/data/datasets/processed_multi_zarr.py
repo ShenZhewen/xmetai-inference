@@ -168,8 +168,7 @@ def create_processed_multi_zarr_dataset(
     dataset = RawMultiZarrTensorDataset(base, positions, processors)
     # 曾经还产出 input_space / unit_scales / preprocessed 三项，但 DatasetSource
     # 收下后全项目无人读取（单位换算已由 processors 里的 unit_convert 完成），
-    # 已随字段一起移除。需要换算系数的地方直接读 config，见
-    # util/eval_common.defaults_from_config。
+    # 已随字段一起移除。需要换算系数的地方直接读 config。
     metadata = {
         "channel_names": model_names,
         "latitudes": aligned_lat,

@@ -22,8 +22,8 @@ class DatasetSource:
       ``static_source`` 工厂从不设置它，``load_static_state()`` 必然抛异常
 
     需要单位换算系数的地方（如评测要与推理对齐）应直接读 config 的
-    ``dataset.processors[unit_convert].scales``（见 util/eval_common.py 的
-    ``defaults_from_config``），而不是从这里取 —— 那样才是同一个出处。
+    ``dataset.processors[unit_convert].scales``，而不是从这里取 ——
+    那样才是同一个出处。
     """
 
     dataset: Any
