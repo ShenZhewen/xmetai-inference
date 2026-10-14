@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""fgvp_ens：FGVP 的 Mamba 骨干集合预报版本（51 成员，FP32 导出）。
+"""fgvp_ens：FGVP 的集合预报版本（51 成员，FP32 导出，骨干自带随机轴出成员）。
+
+权重是 20261008 导出的 iwc_gssp_im（模型类 iwc_fgvp_mamba_ens_onnx 沿用旧名，
+输入契约不变）。⚠ 该 onnx 带 .data 外部权重，两个文件必须在同一目录，挪权重要
+一起挪。
 
 骨架抄 fuxi_ens（集合路径），dataset processors 抄 fgvp single（同为 IWC 族、
 同一套 era5_foundation_store2）。与 fgvp single 的差别只有三处：
@@ -21,8 +25,13 @@ FGVP_ENS_DYNAMIC_STORES = [
 
 cfg = InferConfig(
     name="fgvp_ens",
-    model_path="/workspace/tmp/douzsh/models/iwc_mamba_260909.onnx",
-    ops_library="/workspace/tmp/douzsh/models/xmetai_onnx_plugins.so",
+    model_path="/workspace/tmp/douzsh/models/20261008/iwc_gssp_im.onnx",
+    # 2026-10-09 换成 GPT 优化过的算子实现（对方称 4x 提速）。旧的
+    # xmetai_onnx_plugins.so 留着做回滚与数值对照，别删。
+    # ⚠ 文件名里的 ort1_24 = 按 ONNX Runtime 1.24 构建，跨环境先对版本：
+    #   python -c "import onnxruntime; print(onnxruntime.__version__)"
+    #   对不上就别用，加载或运行期会崩（ABI 绑定）。
+    ops_library="/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so",
     # 必须 False：图只出预报那一帧（单步型），GPU 常驻分支直接 state=result 回填、
     # 不经过 _next_state 的滑窗，且 _spare buffer 复用假设输入输出同形。见模型类
     # docstring。OnnxInferModel.load 的启动期断言会拦这个组合。
