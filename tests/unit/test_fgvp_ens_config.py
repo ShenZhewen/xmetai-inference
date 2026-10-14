@@ -12,10 +12,8 @@ import pytest
 from xmetai_inference.configs.base import InferConfig, load_config, parse_times
 from xmetai_inference.models import get_model_class
 
-#: 通道名去层号（规则同 test_fgvp_config.py）。
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
 
-#: 本 config 声明落盘的 5 个变量。
 EXPECTED_VARS = {"z500", "u200", "v200", "msl", "tp"}
 
 

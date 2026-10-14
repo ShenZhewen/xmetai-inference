@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """ONNX Runtime 后端（CUDAExecutionProvider）。
 
-通用 ONNX 加载 + 一步前向。这里只放后端机制（session 建立、显存调优、run），
-模型特定的东西（喂料、取帧、归一化）由各模型子类覆盖。
+只放后端机制（session 建立、显存调优、run）；模型特定的喂料、取帧、归一化由子类覆盖。
 """
 import os
 
@@ -22,20 +21,10 @@ def _as_numpy_onnx(value):
 def _preload_onnxruntime_lib():
     """预加载 libonnxruntime.so.1，让自定义算子 .so 能解析到它。
 
-    自定义算子库（xmetai_onnx_plugins.so）编译时链接的是 SONAME
-    ``libonnxruntime.so.1``，但 pip 装的 onnxruntime 在 ``capi/`` 下只有版本化文件
-    （如 ``libonnxruntime.so.1.24.4``），既没有 ``libonnxruntime.so.1`` 软链、该目录
-    也不在 ``LD_LIBRARY_PATH`` 上。于是 ``register_custom_ops_library`` 报
-    「libonnxruntime.so.1: cannot open shared object file」。
-
-    ``LD_LIBRARY_PATH`` 只在进程启动时被链接器读取，运行中改 ``os.environ`` 无效，
-    所以那条路必须靠外部脚本在启动前设好环境变量。这里换个办法：用
-    ``RTLD_GLOBAL`` 先把版本化的库 dlopen 进本进程。dlopen 解析依赖时会先按 SONAME
-    查已加载的库，命中就不再走文件系统搜索 —— 于是直接
-    ``python -m xmetai_inference`` 也能跑，不必在启动脚本里设 LD_LIBRARY_PATH。
-
-    失败一律静默：这只是让「不设 LD_LIBRARY_PATH 也能跑」，真正的报错留给
-    register_custom_ops_library 抛（它的信息更准确）。
+    算子库的 SONAME 是 ``libonnxruntime.so.1``，而 pip 装的 onnxruntime 在 ``capi/``
+    下只有版本化文件、该目录也不在 ``LD_LIBRARY_PATH`` 上；且 LD_LIBRARY_PATH 只在
+    进程启动时被链接器读取，运行中改 os.environ 无效，所以这里用 RTLD_GLOBAL 先把库
+    dlopen 进本进程。失败一律静默，真正的报错留给 register_custom_ops_library。
     """
     import ctypes
     import glob
@@ -72,18 +61,14 @@ class OnnxInferModel(BaseInferModel):
     """ONNX Runtime 后端（CUDAExecutionProvider）。"""
     backend = "onnx"
     use_cpu_initializers = True
-    # 自定义算子库路径（.so）。某些模型（如 GatedDeltaNet 骨干）用了非标准算子，
-    # 必须在建 session 前注册对应 plugin；None = 标准模型无需注册。子类覆盖此属性。
+    # 自定义算子库路径（.so），必须在建 session 前注册；None = 标准模型无需注册（子类覆盖）。
     ops_library = None
 
     def _make_session(self, path):
         """建一个 ONNX InferenceSession（路径校验 + 选项 + provider + 自定义算子）。
 
-        从 load 抽出，让多会话模型（如 Pangu 的 6h + 24h）能复用同一套配置分别建
-        session。只返回会话，不改派生属性（_pred_name/_out_shape/_input_names）。
+        只返回会话，不改派生属性（_pred_name/_out_shape/_input_names）。
         """
-        # 防御：把 JSON 误当成模型传进来时，直接给明确提示，而不是让 ORT 报晦涩的
-        # "Protobuf parsing failed"。--model / 权重文件应指向 .onnx 文件。
         if not os.path.exists(path):
             raise FileNotFoundError(f"模型文件不存在：{path}")
         if path.lower().endswith(".json"):
@@ -116,8 +101,8 @@ class OnnxInferModel(BaseInferModel):
             "arena_extend_strategy": "kSameAsRequested",
             "cudnn_conv_use_max_workspace": "0",
             "do_copy_in_default_stream": "1",
-            # 卷积算法穷举搜索：首次推理慢一点，换来每层最优 kernel（之后缓存）。零精度损失。
-            # 注意这是 CUDA EP 的 provider option，之前误放成 session config entry 是无效的。
+            # 卷积算法穷举搜索：首次推理慢、之后走 kernel 缓存；零精度损失。必须作 CUDA EP
+            # 的 provider option，放成 session config entry 无效。
             "cudnn_conv_algo_search": "EXHAUSTIVE",
         }
         # 只在能拿到真实显存上限时才限制；拿不到（无 torch / 无 CUDA）就干脆不写 gpu_mem_limit。
@@ -130,8 +115,7 @@ class OnnxInferModel(BaseInferModel):
         if "CUDAExecutionProvider" in ort.get_available_providers():
             providers.append(("CUDAExecutionProvider", cuda_opts))
         providers.append(("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}))
-        # 自定义算子：注册 .so 后才能建 session（否则报「is not a registered function/op」）。
-        # .so 必须与当前 onnxruntime 版本 ABI 匹配，跨环境（尤其容器）运行要先确认。
+        # .so 必须与当前 onnxruntime 版本 ABI 匹配，跨环境（尤其容器）运行前先确认。
         if self.ops_library:
             if not os.path.exists(self.ops_library):
                 raise FileNotFoundError(f"自定义算子库不存在：{self.ops_library}")
@@ -145,10 +129,8 @@ class OnnxInferModel(BaseInferModel):
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())
-        # 能不能一次吃多条轨迹（model_batch>1）：state 输入（喂料时键名固定为
-        # "input"）与输出的 batch 轴**都**得是符号维。任何一个静态，喂 k>1 都不
-        # 成立 —— 输入静态会被 ORT 直接拒，输出静态则批次对不上。标量（shape 为
-        # 空）一律当静态。
+        # 能否一次吃多条轨迹：state 输入（键名固定 "input"）与输出的 batch 轴都得是
+        # 符号维（任一静态则 k>1 不成立）；标量（shape 空）一律当静态。
         _inputs = self.session.get_inputs()
         _state_input = next((i for i in _inputs if i.name == "input"), _inputs[0])
         _in_shape = list(getattr(_state_input, "shape", None) or [])
@@ -162,14 +144,11 @@ class OnnxInferModel(BaseInferModel):
         self._spare = None
 
     def _check_gpu_state_frames(self):
-        """gpu_state=True 的前提是「图输出帧数 == 输入帧数」，加载时就查。
+        """gpu_state=True 的前提是「图输出帧数 == 输入帧数」，加载期就查。
 
-        GPU 常驻分支（base.run 的 forward_gpu）绕过子类的 forward override，
-        也绕过 numpy 分支里的帧数校验（base.py 的 state.shape[1] != in_frames）。
-        对「图只出 1 帧、靠 forward override 手工补成 in_frames 帧」的模型
-        （如 iwc_fgvp_gdn2），开 GPU 常驻会把 1 帧当完整 state 回填给需要
-        in_frames 帧的图，且 forward_gpu 里的 _spare buffer 复用还假设输入输出
-        同形。两者都不会报错，只会算错。所以在加载期直接拦下。
+        GPU 常驻分支绕过子类的 forward override（也绕过 numpy 分支的帧数校验），对靠
+        override 补帧的模型（如 iwc_fgvp_gdn2）会把 1 帧当完整 state 回填，且 _spare
+        复用假设输入输出同形 —— 不报错、只算错。
         """
         if not self.gpu_state:
             return
@@ -177,10 +156,8 @@ class OnnxInferModel(BaseInferModel):
         if not expected or expected <= 1:
             return
         shape = self._out_shape
-        # 只在能确定「图输出 5D 且帧维为 1」时才拦——这是 forward override 补齐
-        # 帧数的确凿特征（iwc_fgvp_gdn2）。其余情况（动态轴是字符串、维数不是 5、
-        # 帧维是别的值）一律放过：本函数的目的是拦已知的静默错误，不是猜测未知
-        # 图的布局，误伤一个能跑的模型比漏拦更糟。
+        # 只在能确定「图输出 5D 且帧维为 1」（靠 override 补帧的确凿特征）时拦截；
+        # 其余一律放过 —— 宁可漏拦也不误伤能跑的模型。
         if not shape or len(shape) != 5 or shape[1] != 1:
             return
         raise ValueError(
@@ -200,23 +177,18 @@ class OnnxInferModel(BaseInferModel):
                 if k in self._input_names:
                     feeds[k] = v
         # 输出完整滑动窗口 (1, in_frames, C, H, W)：输入 [t-1,t] → 输出 [t,t+1]，
-        # 末帧才是本步预报。基类 run 会取 state[:, -1] 当预报、用完整 state
-        # 回填（state = result），与官方 inference.py 的 `new_input = model.run(...)`
-        # 一致。这里原样返回完整输出，不再只切末帧。
+        # 末帧才是本步预报；这里原样返回完整输出，不切末帧。
         return self.session.run([self._pred_name], feeds)[0]
 
     # ---- GPU 常驻（IOBinding）：state 全程待在 GPU，只在落盘时搬回 CPU ----
-    # 相比 forward（每步 numpy H2D + D2H），forward_gpu 用 OrtValue 绑定输入/输出到
-    # 显存，省掉每步的 H2D/D2H 与 ORT 反复分配显存的开销。仅当模型前后处理/回填都
-    # 是恒等（如 FuXi-Ens）时启用，见 gpu_state。
+    # 仅当模型前后处理/回填都是恒等（如 FuXi-Ens）时启用，见 gpu_state。
     def to_gpu(self, x):
         return ort.OrtValue.ortvalue_from_numpy(
             _as_numpy_onnx(x), "cuda", self.device_id)
 
     def forward_gpu(self, state, step, valid_time):
-        # 输出 buffer 复用：上一步 run 用完的输入 state 已在 _spare 里，直接拿它当输出。
-        # 输入 state 与本步输出是不同 OrtValue（spare 是上一拍回收的另一个 buffer），
-        # run 读输入、写输出不会重叠。shape 与 _out_shape 一致（模型输入输出同形）。
+        # 输出 buffer 复用：_spare 是上一拍回收的另一个 buffer，与本步输入的 state 不是
+        # 同一个 OrtValue，run 读写不重叠。shape 与 _out_shape 一致（输入输出同形）。
         out = self._spare if self._spare is not None else \
             ort.OrtValue.ortvalue_from_shape_and_type(
                 self._out_shape, np.float32, "cuda", self.device_id)
@@ -229,7 +201,6 @@ class OnnxInferModel(BaseInferModel):
                     binding.bind_cpu_input(k, v)
         binding.bind_ortvalue_output(self._pred_name, out)
         self.session.run_with_iobinding(binding)
-        # 输入 state 已被 run 读完，回收为下一个输出 buffer。
         self._spare = state
         return out
 

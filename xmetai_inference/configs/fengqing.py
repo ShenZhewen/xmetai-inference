@@ -1,28 +1,18 @@
 # -*- coding: utf-8 -*-
-"""FengQing V1.5Beta (pre-normalized ONNX) deterministic inference config.
+"""FengQing V1.5Beta (pre-normalized ONNX) 确定性推理配置。
 
-Input data:
-  * Upper-air (era5_pl) and surface (era5_sfc) fields come from
-    era5_foundation_store2 6-hourly Zarr.
-  * tp comes from a dedicated supplementary store
-    era5.202501-202607.c1.p25.h6.v1.zarr: 6-hour accumulation in m. The model
-    expects 6-hour accumulation in mm, so unit_convert multiplies tp by 1000.
-    (The old sfc store's tp is 1h accumulation in m; listing the new tp store
-    first shadows it via MultiZarrDataset's first-match channel lookup.)
-  * Input normalization is done in the data layer (normalize_fengqing). The
-    ONNX graph emits a normalized *residual*; reconstructing the physical field
-    and re-normalizing for the next step stays in the model class (it needs the
-    previous frame + residual std), so model_processing remains empty.
+输入来自 era5_foundation_store2 的 pl + sfc（6h Zarr）；tp 走补充 store（6h 累积 m，
+unit_convert ×1000 转 mm）。输入归一化在数据层，ONNX 图出归一化残差，反演留在模型类
+（需要上一帧 + residual std），故 model_processing 只留输出端 denormalize。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
-# 服务器路径写死：直接 `python cli.py --config fengqing` 启动。
+# 服务器绝对路径：直接 `python cli.py --config fengqing` 启动。
 FENGQING_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/FengQing"
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
-# tp 用官方补充数据集（6h 累积 m）并放在最前：MultiZarrDataset 用 xr.concat 拼
-# channel 且按 channel_values.index(v) 取「第一个同名」通道（multi_zarr_dataset.py），
-# 所以新 tp store 排最前，旧 sfc store 里的 tp 会被顶掉、不再被选中。
+# 顺序敏感：MultiZarrDataset 按 channel_values.index(v) 取「第一个同名」通道，
+# 新 tp store（6h 累积 m）排最前，旧 sfc store 里的 tp 会被顶掉。
 TP_ROOT = "/workspace/data/liujunjie/era5_tp_zarr"
 FENGQING_STORES = [
     TP_ROOT + "/era5.202501-202607.c1.p25.h6.v1.lon180.zarr",
@@ -58,41 +48,25 @@ cfg = InferConfig(
         "drop_last": False,
     },
 
-    # 分层：输入归一化在 dataset.processors（normalize_fengqing），反归一化在这里。
-    # 模型层只做「一步前向 + 残差反演」，全程留在归一化空间，不碰 mean。
+    # 输入归一化在 dataset.processors（normalize_fengqing），反归一化在这里。
     model_processing=ModelProcessingConfig(
         input=[],
         recurrent=[],
         output=[{"name": "denormalize_fengqing"}],
     ),
 
-    # 框架整体连通性测试：2 卡 × batch 2 × 预报 15 天，起报按天（每天 00Z）。
-    #
-    # 起报数必须 = gpus × batch_size = 4，理由是 cli.py 的多卡切分逻辑：
-    # members=1 时 cost_by_init 恒 ≤ cost_by_member，所以永远「按起报时间切」。
-    # 起报数 < gpus 会让部分 rank 分不到任务直接退出（2 卡只有 1 卡干活）；
-    # 起报数 = 4 时每卡拿 2 个，恰好凑成 1 个 batch，batch 维才真的被走到。
-    #
-    # `:24` 是起报**间隔**（每天一个起报），与 steps/hour_interval 的预报步长
-    # 无关。显式写出来：cli.py:207 调 parse_times 时没传 hour_interval，缺省
-    # 恰好也是 24，但别依赖这个巧合。
+    # 起报数必须 = gpus × batch_size = 4（cli 按起报时间切；起报数 < gpus 时部分
+    # rank 分不到任务直接退出）。`:` 后是起报间隔，与 steps/hour_interval 无关。
     times="2025010200..2025122800:24",
-    # steps 与 hour_interval 是两个独立概念，别和起报间隔混在一起：
-    #   hour_interval=6  模型每步推进 6h —— 这是**模型契约**（FengQing 类属性
-    #                    也是 6），改成 24 会让数据层按 24h 取历史窗（模型要的是
-    #                    T-6h 和 T 两帧，会变成 T-24h 和 T），rollout 的
-    #                    valid_time 也会跟着错。不可改。
-    #   steps=60         预报 60 步 = 360h = 15 天
-    #   times 的 `:24`   起报间隔，每天一个起报日
+    # hour_interval=6 是模型契约（FengQing 类属性同为 6），不可改：改成 24 会让
+    # 数据层按 24h 取历史窗、rollout 的 valid_time 也跟着错。
     steps=60,          # 预报时长 15 天 = 60 × 6h
     hour_interval=6,
-    # 确定性模型必须为 1：cli.py 按 members==1 才走 run_batch（残差反演路径）；
-    # >1 会落到基类 run() → 继承的 OnnxInferModel.forward()，喂错键名（"input"）。
+    # 确定性模型必须为 1：>1 会落到基类成员路径，喂错键名（"input"）。
     members=1,
     vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl,tp",
     gpus=2,
     cuda_devices="0,1",
-    # 独立目录：不复用 fengqing_single_output2（那里是单起报的旧结果）。
     # eval 时必须显式传 --forecast 指向这里，否则会评到默认目录的旧数据。
     output_dir="/workspace/data/shenzw/fengqing_output",
 )

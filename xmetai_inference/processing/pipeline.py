@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
 """模型侧处理管线：Dataset batch 透传、自回归回填与输出反变换。
 
-取代旧的 build_input.py——那个把「单位换算 / 通道重排 / 网格翻转滚动 /
-装张量」全塞在一个函数里的"规则引擎"。输入侧前处理已于 2026-09 全部迁往
-dataset.processors（DataLoader worker 里经 tensor_processors.py 执行），旧的
-State 装配路径（geometry/channel_order/unit_convert/attach_static 等 state
-Processor、Normalize 输入阶段与 TensorAssembler）随之移除；模型侧只保留两个阶段：
-
+只有两个阶段：
   recurrent（回填）—— 自回归循环 state=result 回填前执行（如诊断通道清零）
   output（输出）  —— 落盘前把模型工作空间还原成物理量（denormalize）
 
-热路径全程 torch tensor：denormalize/zero_channels 不做 numpy 往返；numpy 只
-保留在归一化统计量加载和最终 xarray/netCDF 落盘等边界处。
+热路径全程 torch tensor，不做 numpy 往返；numpy 只保留在归一化统计量加载和
+最终 xarray/netCDF 落盘等边界处。
 """
 import logging
 import os
@@ -46,9 +41,7 @@ class Processor:
     子类必须声明 stage（"recurrent" / "output"）并实现
     process_array(value) -> value（copy-in / copy-out）。
 
-    model_cls / model_path 由 build_pipeline 注入：处理器从中自取所需契约
-    （zero_channels 取 model_cls.output_channels，denormalize 取模型旁的
-    mean.nc/std.nc）。data_source 预留给需要数据源元数据的未来处理器。
+    model_cls / model_path / data_source 由 build_pipeline 注入。
     """
 
     def __init__(self, model_cls=None, data_source=None, model_path=None, **kwargs):
@@ -155,15 +148,11 @@ class Denormalize(_ArrayStatsProcessor):
 class DenormalizeFengqing(Processor):
     """FengQing 归一化空间 → 物理量（与数据层 ``normalize_fengqing`` 互逆）。
 
-    FengQing 的统计量与 ``Denormalize`` 用的 mean.nc/std.nc 不同构，所以单独一个
-    处理器而不是复用：
-      * mean 是**逐像素**的（65,H,W）/（5,H,W），不是每通道标量；
-      * std 是每通道（65,1）/（5,1）；
+    统计量与 ``Denormalize`` 的 mean.nc/std.nc 不同构：
+      * mean 逐像素（65,H,W）/（5,H,W），不是每通道标量；std 逐通道（65,1）/（5,1）；
       * upper 与 surface 分两套文件（upper_mean/upper_std、mean_pre/std_pre）。
 
-    只做 ``x·std + mean``。tp 的非负钳位已在模型 forward 里于归一化空间完成
-    （见 FengqingPreOnnxModel.load 的 _tp_floor_norm），这里不重复；
-    BaseInferModel.to_dataset 落盘前还有一道 tp clamp 兜底。
+    只做 ``x·std + mean``；tp 的非负钳位在模型 forward 里完成，这里不重复。
     """
 
     stage = "output"
@@ -220,22 +209,13 @@ class DenormalizeFengqing(Processor):
 
 @register("zero_channels")
 class ZeroChannels(Processor):
-    """自回归回填前把指定诊断通道置成**归一化空间的 0**。
+    """自回归回填前把指定诊断通道置成**归一化空间的 0**（不是物理量清零）。
 
-    注意「清零」在这里指的是归一化空间取 0，不是物理量清零——两者只在个别
-    通道上恰好重合。这是有意的：对齐官方预归一化 input.nc（该文件里
-    ssr/ssrd/fdir/ttr/tp 五个通道在归一化空间精确为 0）。
-
-    以 fuxi21 为例（configs/fuxi21.py 的 normalize + 本处理器 + denormalize 三处联动）：
-      * tp   —— mean=0/std=1（identity z-score）且输入侧做过 log1p，
-                而 log1p(0)=0 恰好精确，所以归一化空间的 0 就是物理 0，两种
-                解释重合；
-      * ssr/ssrd/fdir/ttr —— mean/std 量级 600~1400（6h Wh/m²），归一化空间
-                的 0 对应 physical = mean，即**气候态均值，不是零**。
-
-    因此这里必须写字面 0.0。若改成「物理清零」（先反归一化、置 0、再归一化）
-    会偏离官方行为；若 tp 的 mean/std 不再是 0/1，字面 0.0 对 tp 的物理含义
-    也会随之改变。改动本处理器或那套 mean/std 前请先确认这两个前提。
+    对齐官方预归一化 input.nc（其中 ssr/ssrd/fdir/ttr/tp 在归一化空间精确为 0），
+    所以必须写字面 0.0 —— 改成「物理清零」会偏离官方行为。fuxi21 下 tp 的
+    mean=0/std=1 且输入侧 log1p 过，归零恰好同时是物理 0；辐射
+    ssr/ssrd/fdir/ttr 的 mean/std 量级 600~1400（6h Wh/m²），归一化 0 对应的
+    物理量是 mean（气候态均值）。
     """
 
     stage = "recurrent"
@@ -276,10 +256,9 @@ def build_pipeline(input_specs, model_cls, data_source, model_path=None,
     """config 的 Processor 列表 → ProcessingPipeline（recurrent + output 两阶段）。
 
     ``input_specs``（``model_processing.input``，旧配置的 ``pre_processors``）
-    **必须为空**：输入侧前处理由 dataset.processors 在 DataLoader worker 里完成，
-    模型侧不再有输入阶段。这个参数保留只为在误配时给出明确报错 —— 它是配置面的
-    兼容检查，不是可用的扩展点。recurrent/output 每项是处理器名（字符串）或
-    ``{name: str, ...kwargs}``，缺省为空。
+    **必须为空**：输入侧前处理由 dataset.processors 在 DataLoader worker 里完成。
+    该参数只为误配时报错保留，不是可用的扩展点。recurrent/output 每项是处理器名
+    （字符串）或 ``{name: str, ...kwargs}``，缺省为空。
     """
     if input_specs:
         raise ValueError(
@@ -319,8 +298,7 @@ def build_pipeline(input_specs, model_cls, data_source, model_path=None,
 def build_dataset_batch(batch, verbose=False):
     """DataLoader batch → (inputs, init_times)。
 
-    dataset.processors 已在 DataLoader worker 里完成全部输入前处理，这里只做
-    类型/形状校验和起报时间解析；inputs 保持 [B,T,C,H,W] tensor 不进 numpy。
+    只做类型/形状校验和起报时间解析；inputs 保持 [B,T,C,H,W] tensor 不进 numpy。
     """
     values = _as_torch(batch["inputs"], dtype=torch.float32)
     if values.ndim != 5:

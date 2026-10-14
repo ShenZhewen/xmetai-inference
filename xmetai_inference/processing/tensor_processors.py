@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Config-driven tensor preprocessors for dataset inputs.
 
-Each processor is torch.Tensor -> torch.Tensor and is selected by name from a
-dataset ``processors`` list. ``build_tensor_processors`` is the only entry point
-that configuration uses; no branching by input-space strings is needed here.
+Each processor is torch.Tensor -> torch.Tensor of shape [T, C, H, W] and is
+selected by name from a dataset ``processors`` list; ``build_tensor_processors``
+is the only entry point configuration uses.
 """
 from __future__ import annotations
 
@@ -39,8 +39,7 @@ class TensorProcessor:
     """Base class for config-driven tensor preprocessors.
 
     Subclasses receive ``context`` plus processor-specific config keys and must
-    implement ``process(value)``. Input/output are torch.Tensor with shape
-    [T, C, H, W], which keeps the configured chain composable.
+    implement ``process(value)``; input/output shape is [T, C, H, W].
     """
 
     def __init__(self, context: TensorProcessorContext, **kwargs):
@@ -107,26 +106,16 @@ def aligned_coordinates(latitudes, longitudes, expected_shape):
 # ---------------------------------------------------------------------------
 # ERA5 单位约定参考（写 config 的 unit_convert.scales 时据此推导）
 # ---------------------------------------------------------------------------
-# era5_foundation_store2 的原生单位与采样约定（这是 ERA5 数据的固有性质，与模型
-# 无关，原先散落在已删除的 loaders/ 包里）：
+# era5_foundation_store2 的原生单位与采样约定（ERA5 数据固有性质，与模型无关）：
 #
-#   通道                     store 原生单位        备注
-#   z/t/u/v/w                m²/s², K, m/s        无需换算
-#   q                        kg/kg                FuXi 系要 g/kg（×1000）；
-#                                                 FengQing 要 kg/kg（不换算）
-#   ssr/ssrd/fdir/ttr        J/m²，**1h 累积**     → Wh/m² 需 ÷3600
-#   tp                       m，**1h 累积**        → mm 需 ×1000
+#   z/t/u/v/w           m²/s², K, m/s    无需换算
+#   q                   kg/kg            FuXi 系要 g/kg（×1000），FengQing 不换算
+#   ssr/ssrd/fdir/ttr   J/m² 1h 累积     → Wh/m² 需 ÷3600
+#   tp                  m 1h 累积        → mm 需 ×1000
 #
-# 关键点：这几个累积场在 store 里是「1h 累积」，而 time step 是 6h。所以模型要
-# 「每步(6h)累积」时，除物理单位换算外还要再 ×6（累积窗口换算）。两者相乘才是
-# config 里该写的系数：
-#
-#   tp   → 6h 累积 mm ：1000 (m→mm)   × 6 = 6000.0
-#   辐射 → 6h Wh/m²   ：1/3600 (J→Wh) × 6 = 6/3600
-#
-# 这就是为什么 configs/fengqing.py 写 tp: 6000.0、configs/fuxi21.py 写
-# ssr: 6.0/3600.0 —— 不是随手凑的数，是「物理单位 × 累积窗口」两步的乘积。
-# 各 config 显式写出最终系数（不在这里做隐式二次换算），这张表只作推导依据。
+# 累积场在 store 里是 1h 累积、而 time step 是 6h，模型要「每步(6h)累积」，故
+# config 里写的系数 = 物理单位换算 × 6：tp → 1000×6 = 6000.0，辐射 → 6/3600
+# （即 configs/fengqing.py 的 tp 与 configs/fuxi21.py 的 ssr）。
 
 
 @register_tensor_processor("unit_convert")
@@ -134,7 +123,7 @@ class TensorUnitConvert(TensorProcessor):
     """Channel-wise multiplicative unit conversion.
 
     ``scales`` 按通道基名匹配（``_base_name``：z500→z、t2m→t2m），未列出的通道
-    系数为 1.0。系数怎么推导见上方 ERA5 单位约定参考。
+    系数为 1.0；系数推导见上方 ERA5 单位约定参考。
     """
 
     def __init__(self, context: TensorProcessorContext, scales=None, **kwargs):
@@ -159,11 +148,7 @@ class TensorUnitConvert(TensorProcessor):
 
 @register_tensor_processor("geometry")
 class TensorGeometry(TensorProcessor):
-    """Lat north->south and lon 0:360 alignment.
-
-    Alignment is computed lazily in ``process``; the constructor only keeps the
-    coordinates and target shape.
-    """
+    """Lat north->south and lon 0:360 alignment（在 ``process`` 里惰性计算）。"""
 
     def __init__(self, context: TensorProcessorContext, expected_shape=None, **kwargs):
         super().__init__(context=context, **kwargs)
@@ -262,11 +247,10 @@ class TensorNormalize(TensorProcessor):
 
 
 def _resolve_fengqing_mean_std_dir(model_path, mean_std_dir=None):
-    """Parse the FengQing mean/std directory.
+    """解析 FengQing mean/std 目录。
 
-    Priority: explicit ``mean_std_dir`` > env ``FENGQING_MEAN_STD_DIR`` >
-    ``mean_std`` directory relative to the model file (searched up two parents,
-    mirroring the model layer's ``_find_artifact``).
+    优先级：显式 ``mean_std_dir`` > 环境变量 ``FENGQING_MEAN_STD_DIR`` >
+    模型文件上两级的 ``mean_std/``。
     """
     if mean_std_dir:
         return os.fspath(mean_std_dir)
@@ -288,12 +272,10 @@ def _resolve_fengqing_mean_std_dir(model_path, mean_std_dir=None):
 
 @lru_cache(maxsize=4)
 def _load_fengqing_stats(model_path, mean_std_dir=None):
-    """Load FengQing per-pixel normalization stats -> (mean, std).
+    """Load FengQing per-pixel normalization stats -> (mean, std)。
 
-    Returns mean of shape (70, H, W) and std of shape (70, 1): the first 65
-    channels (upper air) come from upper_mean/upper_std, the last 5 (surface)
-    from mean_pre/std_pre. Cached so the data-layer normalize and any output-
-    side processor share one in-process copy.
+    mean shape (70, H, W)、std shape (70, 1)：前 65 通道(upper air) 来自
+    upper_mean/upper_std，后 5 通道(surface) 来自 mean_pre/std_pre。
     """
     directory = Path(_resolve_fengqing_mean_std_dir(model_path, mean_std_dir))
     upper_mean = np.load(directory / "upper_mean.npy").astype(np.float32)
@@ -325,10 +307,9 @@ def _load_fengqing_stats(model_path, mean_std_dir=None):
 class TensorNormalizeFengqing(TensorProcessor):
     """FengQing per-pixel normalization: ``(x - mean) / std`` over ``[T,70,H,W]``.
 
-    The first 65 channels (upper air) use upper_mean(65,H,W)/upper_std(65,1);
-    the last 5 (surface) use mean_pre(5,H,W)/std_pre(5,1). mean is per-pixel,
-    std is per-channel, matching the FengQing pre-ONNX contract. Non-finite
-    results are zeroed, mirroring the model's former ``_normalize_initial``.
+    前 65 通道(upper air) 用 upper_mean(65,H,W)/upper_std(65,1)，后 5 通道
+    (surface) 用 mean_pre(5,H,W)/std_pre(5,1)；mean 逐像素、std 逐通道。
+    非有限结果置 0。
     """
 
     def __init__(self, context, mean_std_dir=None, **kwargs):

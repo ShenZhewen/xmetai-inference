@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
-"""torch.export (.pt2) 后端。
+"""torch.export (.pt2) 后端：export 加载 + dtype/输入名推断 + 跑 module。
 
-通用 PT2 加载 + 一步前向。这里只做后端机制（export 加载、dtype/输入名推断、跑 module），
-**不含任何模型特定归一化**——mean/std、tp 的 log1p/expm1 等全部由统一
-Processor 管线处理。
-
-热路径为 torch in / torch out：forward 直接接收并返回同一 device 上的 torch.Tensor，
-不再每步做 numpy↔torch 转换。
+不含任何模型特定归一化（mean/std、tp 的 log1p/expm1 等归统一 Processor 管线）。
+热路径 torch in / torch out：forward 直接进出同一 device 上的 torch.Tensor。
 """
 import os
 
@@ -72,8 +68,7 @@ class Pt2InferModel(BaseInferModel):
             state = torch.as_tensor(x)
         state = state.to(device=self._device, dtype=self._dtype)
 
-        # hour 用官方 FuXi-2.1 的分钟精度归一化：(hour*60+minute)/1440，与官方
-        # data_util.prepare_features 的 tod 一致；doy 同理。
+        # hour 用分钟精度归一化：(hour*60+minute)/1440；doy 同理用 day_of_year/365。
         times = [valid_time] if np.ndim(valid_time) == 0 else list(valid_time)
         tod = [(value.hour * 60 + value.minute) / 1440.0 for value in times]
         feats = {
@@ -92,9 +87,8 @@ class Pt2InferModel(BaseInferModel):
         with torch.no_grad():
             result = self._module(*args)
 
-        # 完整输出 (1,in_frames,C,H,W) → 保持 device 上的 torch tensor；
-        # 末帧是本步预报，完整 state 用于 state=result 回填（与官方一致）。
-        # 落盘时统一由 BaseInferModel.to_dataset 再做唯一一次 D2H。
+        # 完整输出 (1,in_frames,C,H,W) 保持为 device 上的 torch tensor；末帧是本步预报，
+        # 完整 state 用于 state=result 回填。落盘时由 to_dataset 做唯一一次 D2H。
         return result.float()
 
     def describe(self):

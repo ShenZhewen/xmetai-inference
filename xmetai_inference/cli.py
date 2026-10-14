@@ -2,10 +2,6 @@
 # -*- coding: utf-8 -*-
 """统一推理入口：配置加载、多卡调度、自回归推理与 NetCDF 输出。
 
-推理后端（BaseInferModel）拆到 xmetai_inference.backends 包、各模型子类拆到
-xmetai_inference.models 包，数据源拆到 xmetai_inference.data 包；本文件负责
-读取配置、启动多卡 worker，并完成输出选择、异步写盘和主流程编排。
-
 用法：
     xmetai-infer --model fuxi_ens
     xmetai-infer --model fgvp --times 2025010700..2025020500:24
@@ -15,12 +11,10 @@ xmetai_inference.models 包，数据源拆到 xmetai_inference.data 包；本文
 输出目录（确定性 members=1）：{out}/{起报目录}/{预测步序号3位}.nc
 00 UTC 起报目录使用 YYYYMMDD；其他时次使用 YYYYMMDDHH，避免同日多时次互相覆盖。
 
-多卡时，主进程使用同一个 inference.py 的内部 --worker 模式启动独立子进程，并通过
-CUDA_VISIBLE_DEVICES 隔离单卡。ONNX Runtime 单个 session 只使用一张卡；加速来自
-把集合成员或起报次数分配给不同进程，不是让单次 forward 跨卡执行。
-
-推理是 step 外层、member 内层：每算完一个 step 的全体成员就异步丢给后台线程
-落盘，GPU 不等磁盘写；netCDF4/HDF5 非线程安全，所以只用一个 writer 线程串行写。
+多卡：主进程用内部 --worker 模式起独立子进程，按 CUDA_VISIBLE_DEVICES 单卡隔离；
+ONNX Runtime 单个 session 只用一张卡，加速来自把成员/起报分给不同进程，不是单次
+forward 跨卡。推理是 step 外层、member 内层，落盘只用一个 writer 线程串行写
+（netCDF4/HDF5 非线程安全）。
 """
 import argparse
 import gc
@@ -58,10 +52,8 @@ log = logging.getLogger(__name__)
 def _output_init_dir(init):
     """00 UTC 用 YYYYMMDD，其他起报时次保留 YYYYMMDDHH。
 
-    按天起报（每天 00Z）时目录就是干净的 YYYYMMDD；同日多时次才带上小时，
-    避免互相覆盖。注意：起报间隔混用（如既有 00Z 又有 12Z）会产生 8 位与
-    10 位并存的目录名，下游按目录名解析时要能同时吃两种 —— 判据用
-    ``^\\d{8}(\\d{2})?$``，按长度选 ``%Y%m%d`` 还是 ``%Y%m%d%H``。
+    起报间隔混用会产生 8 位与 10 位并存的目录名，下游按目录名解析时要能同时吃
+    两种 —— 判据用 ``^\\d{8}(\\d{2})?$``，按长度选 ``%Y%m%d`` 还是 ``%Y%m%d%H``。
     """
     return init.strftime("%Y%m%d" if init.hour == 0 and init.minute == 0 else "%Y%m%d%H")
 
@@ -87,11 +79,9 @@ def _resolve_output_indices(channels, requested):
 
 
 def _select_netcdf_engine():
-    """挑选可用的最快 NetCDF 写引擎：netcdf4 > h5netcdf > scipy（兜底）。
-
-    避免 scipy/NETCDF3——它写大数组极慢且有 2GB/变量上限。注意 xarray 的引擎名
-    是小写，但 Python 导入名大小写不同（netCDF4 大写 F、h5netcdf 全小写），
-    探测要按导入名来。返回 (engine, netcdf_format)。
+    """挑选可用的最快 NetCDF 写引擎：netcdf4 > h5netcdf > scipy（兜底，写大数组
+    极慢且有 2GB/变量上限）。返回 (engine, netcdf_format)；xarray 引擎名小写、
+    导入名大小写不同（netCDF4 / h5netcdf），探测按导入名。
     """
     for eng, import_name in (("netcdf4", "netCDF4"), ("h5netcdf", "h5netcdf")):
         try:
@@ -123,8 +113,7 @@ class _AsyncWriter:
             path = os.path.join(self.save_dir, fname)
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                # 不压缩（与参考实现最终结论一致）：zlib 压缩 281MB/步耗时数秒，
-                # 裸写 ~500MB/s，推理不等磁盘；引擎用 netcdf4 避免 scipy/NETCDF3 慢路径。
+                # 不压缩：zlib 压 281MB/步要数秒、裸写 ~500MB/s，推理不等磁盘。
                 ds.to_netcdf(path, engine=self.engine, format=self.netcdf_format)
             except Exception as e:  # noqa: BLE001
                 self.errors.append(e)
@@ -146,9 +135,8 @@ class _AsyncWriter:
     def flush(self):
         """阻塞直到队列里所有待写文件都落盘完成。
 
-        关键：netCDF4/HDF5 非线程安全。写线程在写输出 NetCDF 时，若主线程同时
-        读下一轮起报的输入 NetCDF，两个线程并发访问 HDF5 会触发 C 层段错误。
-        所以进入下一个 build_input 前必须先 drain 写队列，让读写彻底串行。
+        netCDF4/HDF5 非线程安全：写线程与主线程并发访问会触发 C 层段错误，所以进入
+        下一个 build_input 前必须先 drain，让读写彻底串行。
         """
         self.q.join()
 
@@ -293,9 +281,7 @@ def _run_infer(cfg, overrides):
         log_files.append(log_file)
 
     status = 0
-    # 主进程心跳：rank 的日志全在各自文件里（--no-console-log），没有心跳的话
-    # 控制台在 spawn 完到全部退出之间一行不出，看起来像冻住。每 30 秒报一次
-    # 还有哪些 rank 活着、已运行多久。
+    # 主进程心跳：每 30 秒报一次还在跑的 rank（rank 日志都在各自文件里）。
     from time import sleep as _sleep
 
     from xmetai_inference.backends.base import _fmt_dur as _fmt_dur_main
@@ -307,8 +293,8 @@ def _run_infer(cfg, overrides):
         statuses = [
             (rank, process.poll()) for rank, process in enumerate(processes)
         ]
-        # rank 一死立刻报告（含退出码与日志路径），不等全部结束——OOM kill 是
-        # SIGKILL，rank 自己的日志戛然而止，主进程这里是唯一的告警点。
+        # rank 一死立刻报告：OOM kill 是 SIGKILL，rank 自己的日志会戛然而止，
+        # 主进程这里是唯一的告警点。
         for rank, code in statuses:
             if code is None or rank in reported:
                 continue
@@ -466,8 +452,7 @@ def _worker_main(argv=None):
         console=not args.no_console_log,
         rank=f"{local_rank}/{world_size}",
     )
-    # 多卡时 inference.py 已用 CUDA_VISIBLE_DEVICES 隔离每个进程，device 恒为 0；
-    # 单进程想指定别的卡仍可用 --device 覆盖。
+    # 多卡时靠 CUDA_VISIBLE_DEVICES 隔离，device 恒为 0；单进程可用 --device 覆盖。
     device_id = args.device if args.device is not None else 0
 
     # 每个 worker 重新加载同一 config，确保外部 Model/Dataset 在多进程中可用。
@@ -495,16 +480,11 @@ def _worker_main(argv=None):
                     cls.__name__, members)
     init_times = _init_times(args, interval)
 
-    # 多卡分工：把「起报时间 × 成员」的任务摊给各卡，有两种切法——
-    #   按起报切：每个 rank 跑一部分起报、全部成员；
-    #   按成员切：每个 rank 跑一部分成员、全部起报。
-    # 均衡上两种切法通常只差几个百分点，但内存上差异巨大：Rollout 给每条轨迹
-    # 持有独立 state 拷贝（~645MB/条），按起报切每卡要挂全部 members 条
-    # （51 成员 ≈ 33GB/卡），按成员切只挂 ceil(members/world_size) 条
-    # （4 卡 51 成员 ≈ 8GB/卡）。实测按起报切曾把 pod 的 cgroup 内存限额顶穿、
-    # 两个 rank 被 OOM kill（SIGKILL，rank 日志无 traceback 直接断）。
-    # 故集合（members>1 且成员数 ≥ 卡数）优先按成员切；members < 卡数时按成员
-    # 切会有卡分不到任务，退回均衡比较。确定性（members==1）本就只能按起报切。
+    # 多卡分工：按起报切（每 rank 一部分起报、全部成员）或按成员切（每 rank 一部分
+    # 成员、全部起报）。Rollout 给每条轨迹持有独立 state 拷贝（~645MB/条），按起报
+    # 切每卡要挂全部 members 条（51 成员 ≈ 33GB/卡，曾把 pod 的 cgroup 顶穿、rank
+    # 被 OOM kill），按成员切只挂 ceil(members/world_size) 条。故集合（members>1 且
+    # 成员数 ≥ 卡数）按成员切，其余按均衡比较。
     n_init = len(init_times)
     per_rank_init = (n_init + world_size - 1) // world_size
     per_rank_member = (members + world_size - 1) // world_size
@@ -597,7 +577,6 @@ def _worker_main(argv=None):
     log.info("模型加载完成：%s，耗时 %s",
              model.describe(), _fmt_dur(perf_counter() - t_load_model))
 
-    # 输出变量选择：--vars 指定则用，否则保存全部。
     requested = [v for v in args.vars.split(",") if v.strip()] if args.vars else None
     channels = list(cls.output_channels)
     save_indices = _resolve_output_indices(channels, requested)
@@ -615,7 +594,7 @@ def _worker_main(argv=None):
                  "每个 worker 要重新打开 zarr 并读满一个 batch，可能较慢）...",
                  dataloader_config.get("num_workers", 0))
         t_fetch = perf_counter()
-        # 注意：循环体内已有局部 batch_index（按 batch_inits 枚举），这里用
+        # 循环体内已有局部 batch_index（按 batch_inits 枚举），这里用
         # data_batch_index 区分，避免遮蔽/改绑。
         for data_batch_index, batch in enumerate(dataset_source):
             fetch_dur = perf_counter() - t_fetch
@@ -626,7 +605,6 @@ def _worker_main(argv=None):
 
             # 确定性（members==1）：每个起报一条轨迹，一次 Rollout 跑完整个 batch。
             # 集合（members>1）：每个起报单独一次 Rollout，成员即轨迹。
-            # 两者用的是同一个循环，区别只在「轨迹怎么构造」和「输出落到哪」。
             if members == 1:
                 def on_batch_step(step, step_state, batch_inits=batch_inits):
                     step_idx = step + 1
@@ -679,9 +657,8 @@ def _worker_main(argv=None):
                                 raw=(step_state[local_index], step, init),
                             )
 
-                    # 成员即轨迹：全部共享同一初始态（扰动来自图内随机算子），
-                    # init_time 相同。多卡按成员切时 member_indices 已是本 rank
-                    # 自己那份，所以这里只造本 rank 的轨迹。
+                    # 成员即轨迹，共享同一初始态（扰动来自图内随机算子）；
+                    # member_indices 已是本 rank 那份。
                     Rollout(model, processors).run(
                         [
                             Trajectory(

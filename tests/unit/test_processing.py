@@ -136,7 +136,6 @@ def test_normalize_rejects_bad_stats(tmp_path, mean, std, channels, match):
 
 
 def test_normalize_rejects_mean_std_length_mismatch(tmp_path):
-    # mean/std 两个文件通道数不同，要分别写
     xr.DataArray(np.array([1.0, 2.0], dtype="f4"), dims=["channel"],
                  coords={"channel": ["a", "b"]}).to_netcdf(tmp_path / "mean.nc")
     xr.DataArray(np.array([2.0, 4.0, 8.0], dtype="f4"), dims=["channel"],

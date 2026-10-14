@@ -2,21 +2,14 @@
 """fuxi（fuxi21 / FuXi-2.1）真实数据档：真 .pt2 在切片数据上跑一遍，和标准答案对拍。
 
 配方是 ``configs/fuxi21.py`` 的 deepcopy 派生，落成临时 ``.py`` 喂 CLI，只覆盖
-fixture 特有项；mean.nc/std.nc 不用单独覆盖 —— 按模型所在目录解析，模型指到
-fixture 统计量就跟着过去。
+fixture 特有项；mean.nc/std.nc 按模型所在目录解析，跟着模型过去。
 
-判 PASS 两层（fuxi2.1 在 GPU 上不可逐位复现，2026-09-07 / 2026-10-14 实测）：
-第 1 步差异只在高空通道（0.1~0.2% 场变率、exceed_frac 压在 CLOSE 线上），地面
-逐位相同；第 2 步起第 1 步的噪声经 ``state=result`` 回填污染**全部**通道（地面
-超容差占比 0.5~0.7 而幅度仅 ~0.3% 场变率，高空第 3 步 diff_over_std 到 0.9%
-贴住 DIFFER 的 1% 物理线，tp 0.29）。第 2 步起没有干净门槛可言，所以：
+判 PASS 两层（fuxi2.1 在 GPU 上不可逐位复现）：第 1 步（``STRICT_STEP``）按变量判档
+—— 地面 CLOSE（理应逐位一致，红就是真回归），高空放宽到 DRIFT（差异只在高空通道，
+0.1~0.2% 场变率）；第 2 步起第 1 步的噪声经 ``state=result`` 回填污染**全部**通道，
+紧门槛必红，故全部步只挂灾难线 ``CATASTROPHE_STD_LIMIT``：max|diff| 超场变率一半
+即红（实测噪声最坏 0.29，0.5 留余量；回填 / zero_channels 级别的回归远在线外）。
 
-  * 第 1 步（``STRICT_STEP``）按变量判档：地面 CLOSE（理应逐位一致，红就是
-    真回归），高空放宽到 DRIFT；
-  * 全部步挂灾难线 ``CATASTROPHE_STD_LIMIT``：max|diff| 超场变率一半即红。
-    实测噪声最坏 0.29，0.5 留余量；回填 / zero_channels 级别的回归远在线外。
-
-已知边界：第 60 步噪声会涨到 0.2~1.2（混沌放大），本档只跑前 ``STEPS`` 步。
 第 1 步全变量就偏 ⇒ 前处理（单位换算 / mean.std 归一化）或时间条件的问题。
 golden 出处记在 golden/PROVENANCE.md；确定性档 ``{YYYYMMDD}/{NNN}.nc`` 平铺。
 
@@ -98,7 +91,7 @@ if _missing:
     )
 
 
-# string.Template 的理由同 fgvp 档：模板里全是花括号。
+# string.Template 的理由同 fgvp 档。
 _CONFIG_TEMPLATE = Template('''\
 # -*- coding: utf-8 -*-
 """fuxi21 真实数据档的推理配方 —— 由 test_fuxi_realdata.py 运行时生成，别手改。"""
@@ -165,7 +158,7 @@ def run(tmp_path_factory):
     out_dir = tmp_path_factory.mktemp("fuxi_realdata")
     print(f"\n[fixture] 本次用的配方：{config_path}")
 
-    # SystemExit 单独接住，理由同 fgvp 档：把前置校验的真正原因从 pytest 栈里捞出来。
+    # SystemExit 单独接住，理由同 fgvp 档。
     try:
         rc = main(["--config", str(config_path), "--out", str(out_dir)])
     except SystemExit as exc:

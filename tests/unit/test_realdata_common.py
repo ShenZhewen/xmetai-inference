@@ -11,8 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# realdata_common 在 tests/integration/ 下（包外共享模块，不带 test_ 前缀），
-# 手动挂进 sys.path。
+# realdata_common 在 tests/integration/ 下（包外共享模块），手动挂进 sys.path。
 _INTEGRATION_DIR = Path(__file__).resolve().parents[1] / "integration"
 if str(_INTEGRATION_DIR) not in sys.path:
     sys.path.insert(0, str(_INTEGRATION_DIR))

@@ -24,13 +24,10 @@ model_artifacts/
     └── runtime/      # 项目实际加载的导出模型及其配套文件
 ```
 
-当前没有导出需求时，可以直接沿用已有模型子目录，不必强制增加 `source/` 和
-`runtime/`。
-
 ## 导出模型
 
-导出不是修改模型参数，而是在原模型外包装固定的 Tensor 处理，再保存为项目支持的
-PT2、ONNX 或其他部署格式。例如：
+导出是在原模型外包装固定的 Tensor 处理，再保存为项目支持的 PT2、ONNX 或其他部署
+格式。例如：
 
 ```text
 物理量 Tensor
@@ -62,8 +59,8 @@ Loader、NetCDF/Zarr 读取、网格适配、日期调度、多卡分配和结�
 | FengQing V1.5Beta | `fengqing_pre.onnx` | `mean_std/`、`utils/constant_masks.npy` |
 | Pangu-Weather | `pangu_weather_6.onnx` + `pangu_weather_24.onnx` | 无（归一化烘焙进图）；BY-NC-SA 4.0，商用禁止 |
 
-FuXi-2.1 当前仍由统一 Processor 管线完成归一化、反归一化和 TP 变换，因此
-`mean.nc`、`std.nc` 必须与模型一起保留。
+FuXi-2.1 的归一化、反归一化和 TP 变换由 Processor 管线完成，`mean.nc`、`std.nc`
+必须与模型一起保留。
 
 ## 使用原则
 

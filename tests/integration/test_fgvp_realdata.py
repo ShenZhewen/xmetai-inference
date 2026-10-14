@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """fgvp 真实数据档：真 ONNX 在切片数据上跑一遍，和标准答案对拍。
 
-配方是 ``configs/fgvp.py`` 的 deepcopy 派生，落成临时 ``.py`` 喂 CLI（链路的
-契约是路径不是对象，多卡 worker 还要按 ``--config-source`` 自己再加载一次），
-只覆盖 fixture 特有项。判 PASS 口径：最坏一档 ∈ {IDENTICAL, CLOSE}，分档判据
-冻结在 ``realdata_common``，不要改。不要求逐位相同（GPU 归约次序 / golden 当年
-的 batch / 切片 store 的分块路径都在 CLOSE 范畴内）。
+配方是 ``configs/fgvp.py`` 的 deepcopy 派生，落成临时 ``.py`` 喂 CLI（链路契约是
+路径不是对象），只覆盖 fixture 特有项。判 PASS 口径：最坏一档 ∈ {IDENTICAL, CLOSE}，
+分档判据冻结在 ``realdata_common``，不要改；不要求逐位相同。
 
-已知弱点：golden 的出处（哪个 commit、几张卡）没能确证 —— 本档挡得住**今后**的
-回归（改了代码就红），但不能用来论证「当前结果是对的」。集合档的 golden 已按
-规矩配了 PROVENANCE.md。
+已知弱点：golden 的出处（哪个 commit、几张卡）没能确证 —— 本档挡得住今后的回归，
+但不能用来论证「当前结果是对的」。
 
 跑法：pytest -m realdata tests/integration/test_fgvp_realdata.py
 """
@@ -42,8 +39,8 @@ STEPS = 3
 MEMBERS = 1
 GPUS = 1
 
-# 单卡跑哪张卡由外层 CUDA_VISIBLE_DEVICES 决定：``cli._run_infer`` 只在 gpus>1
-# 时才读 ``cfg.cuda_devices``，写了也没人读，所以这里故意不设这个旋钮。
+# 单卡跑哪张卡由外层 CUDA_VISIBLE_DEVICES 决定：``cli._run_infer`` 只在 gpus>1 时
+# 才读 ``cfg.cuda_devices``，故此处故意不设这个旋钮。
 
 #: 标准答案根。
 GOLDEN_ROOT = DATA_ROOT / "golden"
@@ -73,7 +70,7 @@ if _missing:
     )
 
 
-# string.Template 而非 f-string/format：模板里全是花括号，{} 占位符要全文转义。
+# string.Template 而非 f-string/format：模板里全是花括号。
 _CONFIG_TEMPLATE = Template('''\
 # -*- coding: utf-8 -*-
 """fgvp 真实数据档的推理配方 —— 由 test_fgvp_realdata.py 运行时生成，别手改。"""
@@ -140,10 +137,8 @@ def _write_config(dest: Path) -> Path:
 
 @pytest.fixture(scope="session")
 def run(tmp_path_factory):
-    """跑一次真推理并对拍，整模块共用。返回 ``(产物目录, rows, skipped, 配方路径)``。
-
-    走公开入口 ``xmetai_inference.main(argv)``：配置加载、多卡调度、后台写盘
-    只有 CLI 那一段才经过。
+    """跑一次真推理并对拍，整模块共用（走公开入口 ``main``，配置加载/调度/写盘只有
+    那一段才经过）。返回 ``(产物目录, rows, skipped, 配方路径)``。
     """
     from xmetai_inference import main
 
@@ -152,8 +147,7 @@ def run(tmp_path_factory):
     out_dir = tmp_path_factory.mktemp("fgvp_realdata")
     print(f"\n[fixture] 本次用的配方：{config_path}")
 
-    # SystemExit 单独接住：前置校验失败（缺 .so / 起报不在数据里）的真正原因
-    # 才不会埋在 pytest 内部栈里。
+    # SystemExit 单独接住：前置校验失败的原因才不会埋在 pytest 内部栈里。
     try:
         rc = main(["--config", str(config_path), "--out", str(out_dir)])
     except SystemExit as exc:
@@ -190,8 +184,7 @@ def test_fgvp_matches_golden(run):
 
 
 def test_fgvp_coverage(run):
-    """覆盖面兜底：对拍是「谁少以谁为准、缺的记 skipped」，产物少写一步反而更容易绿，
-    所以步/变量级的跳过一律当失败（起报级容忍）。"""
+    """覆盖面兜底：产物少写一步反而更容易绿，故步/变量级的跳过一律当失败（起报级容忍）。"""
     _, rows, skipped, config_path = run
 
     assert {r["step"] for r in rows} == set(range(1, STEPS + 1)), (

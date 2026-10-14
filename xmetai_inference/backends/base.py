@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
 """推理后端共享运行契约。
 
-两层契约：单步前向 forward（默认循环走它）+ 自回归 run 循环（推理主入口）。
-换后端（ONNX / PT2）只需实现 load + forward 两个方法，框架用默认
-run 循环把它们串起来。数据进入模型前的适配、输出反变换和回填规则由统一 Processor 管线注入，
-后端和模型类不再实现处理钩子。
-
-具体引擎分别位于同目录 onnx.py、pt2.py。引擎不能挂到包根门面 re-export——
-onnx.py 顶层 import onnxruntime，一旦挂上，PT2-only 环境导入任何 backends
-符号都会被拖上 ONNX Runtime；包根 __init__.py 只 re-export BaseInferModel，
-保持 `from xmetai_inference.backends import BaseInferModel` 对外不变。
-
-自 2026-09 起，PT2/ONNX 的 tensor 后端热路径支持 torch.Tensor；numpy 只保留在
-ONNX Runtime、earthkit 或 xarray/netCDF 落盘等必须 numpy 的边界。
+换后端（ONNX / PT2）只需实现 load + forward；数据适配、输出反变换与回填规则由统一
+Processor 管线注入，后端和模型类不实现处理钩子。热路径支持 torch.Tensor，numpy 只留在
+ONNX Runtime、earthkit 或 netCDF 落盘等必须 numpy 的边界。
 """
 import logging
 from abc import ABC, abstractmethod
@@ -70,29 +61,16 @@ def _stack_outputs(outputs, axis):
 
 
 class BaseInferModel(ABC):
-    """所有推理后端的公共基类。
+    """所有推理后端的公共基类：子类实现 load + forward。
 
-    子类只需实现两个方法：
-      load(path)                    —— 加载模型到 self.device_id
-      forward(x, step, valid_time)  —— 一步前向
-
-    forward 的约定：输入 x 为 (1, in_frames, C, H, W) 的 float32 数组/tensor，
-    返回同样 (1, in_frames, C, H, W) 的完整模型输出（末帧是本步预报）。
-    PT2/ONNX 后端可保持 torch 全程待在设备上，框架只在落盘时搬到 CPU；ONNX
-    Runtime 的 legacy 路径仍可返回 numpy，run 循环按实际类型分别处理。
-    这条约定定了，run 就完全不用知道后端是 ONNX 还是 PyTorch；回填用
-    完整输出（state = result），与官方 inference.py 的 `new_input = model.run(...)` 一致。
+    forward 契约：输入 x 为 (1, in_frames, C, H, W) 的 float32 数组/tensor，返回同形状的
+    完整模型输出（末帧是本步预报）。PT2/ONNX 后端可保持 torch 全程待在设备上，框架只在
+    落盘时搬到 CPU；ONNX Runtime 的 legacy 路径仍可返回 numpy。
     """
     backend = "base"
 
-    # 落盘前做非负钳位的通道。原先 to_dataset 里硬编码 `if channel == "tp"`，
-    # 那是模型语义写进了后端基类。做成类属性后各模型可自己声明；缺省 ("tp",)
-    # 是因为四个模型都有 tp 且都需要钳位，行为与原来一致。
-    #
-    # 注意这只是落盘前的兜底 —— 真正的钳位应在各自的输出阶段完成
-    # （fuxi21 的 denormalize.nonnegative、FengQing 在 forward 的归一化空间里）。
-    # 这道兜底的隐患是**掩错**：若某模型漏配反归一化，tp 仍处归一化空间，
-    # np.maximum(arr, 0) 会把负的归一化值削平，输出看着「合理」而不报错。
+    # 落盘前做非负钳位的通道，各模型可通过类属性自行声明。这是兜底：模型漏配
+    # 反归一化时 tp 仍在归一化空间，钳位会把负值削平、输出看着合理而不报错。
     nonnegative_channels = ("tp",)
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
@@ -137,25 +115,19 @@ class BaseInferModel(ABC):
         return self.backend
 
     def reset_runtime_state(self):
-        """自回归轨迹间重置模型持有的跨步内部状态（缺省无操作）。
-
-        Rollout.run 每批轨迹开始前调用一次。多会话/跨步有状态模型（如 Pangu
-        方案B 的 24h 锚点）覆盖此方法清空上一批残留状态，避免状态在轨迹间泄漏，
-        也把常驻内存约束在当前 batch 量级。
+        """自回归轨迹间重置跨步内部状态（缺省无操作），Rollout 每批轨迹开始前调用一次。
         """
         return None
 
     # ------------------------------------------------------------------
-    # GPU 常驻（state 全程待在 GPU，只在落盘时搬回 CPU，省每步 H2D/D2H）
+    # GPU 常驻（state 全程待在 GPU，只在落盘时搬回 CPU）
     # ------------------------------------------------------------------
-    # 子类置 gpu_state=True 并实现 to_gpu / forward_gpu / to_numpy 后，run 循环
-    # 就走 GPU 常驻分支。当前 GPU state 不支持 numpy recurrent transform；需要
-    # 回填处理的模型应保持 gpu_state=False。
+    # 置 gpu_state=True 须实现 to_gpu / forward_gpu / to_numpy。GPU state 不支持
+    # numpy recurrent transform，需要回填处理的模型必须保持 gpu_state=False。
     gpu_state = False
 
-    # 一次 forward 能不能堆多条轨迹（model_batch>1）：图导出时输入/输出的 batch
-    # 轴都得是符号维。onnx 后端在 load 时实测后置位；缺省 False = 不支持，
-    # Rollout 会打 WARNING 把 model_batch 退回 1（不静默算错）。pt2 后端不置位。
+    # 一次 forward 能否堆多条轨迹：图输入/输出的 batch 轴都须是符号维。onnx 后端
+    # load 时实测置位；缺省 False = Rollout 打 WARNING 把 model_batch 退回 1。
     batch_axis_dynamic = False
 
     def to_gpu(self, x):
@@ -173,10 +145,8 @@ class BaseInferModel(ABC):
     def to_dataset(self, step_state, save_names=None, lat=None, lon=None):
         """一步 × 一成员的输出 → xarray Dataset（落盘前最后一步，后端无关入口）。
 
-        默认实现按 onnx/pt2 通道张量语义：step_state 形状 (C,H,W)，用 self.output_channels
-        （模型类的输出通道契约）解码变量名、套 lat/lon 坐标、挑 save_names（None=全部
-        通道）。step_state 可以是 torch.Tensor，也可以沿用 ONNX legacy 的 numpy；
-        这里做唯一一次 tensor→numpy，xarray 需要 numpy 数据。
+        step_state 形状 (C,H,W)，用 self.output_channels 解码变量名、套 lat/lon 坐标；
+        save_names 为 None 表示全部通道。此处做唯一一次 tensor→numpy（xarray 需要 numpy）。
         """
         import xarray as xr
 
@@ -195,13 +165,4 @@ class BaseInferModel(ABC):
             data_vars[channel.upper()] = (("lat", "lon"), arr)
         return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
 
-    # 自回归 rollout 循环已移至 xmetai_inference/runner.py 的 Rollout。
-    #
-    # 原先这里有 run（按 member 循环，124 行）和 run_batch（按 batch 循环，61 行）
-    # 两份平行实现：循环体逐字相同，差别只在「轨迹从哪来」和「返回值形状」，且已
-    # 出现单边演进（帧数校验严格度不同、防别名一边显式 clone 一边靠隐式拷贝、
-    # 进度/ETA 只有 run 有）。Rollout 用统一的「轨迹」概念覆盖两者：集合的成员和
-    # 批量的起报都是一条轨迹。
-    #
-    # 后端/模型类现在只需实现 load + forward（GPU 常驻另需 to_gpu/forward_gpu/
-    # to_numpy），循环、多轨迹、回填、进度归编排层。
+    # 自回归 rollout 循环见 xmetai_inference/runner.py 的 Rollout。

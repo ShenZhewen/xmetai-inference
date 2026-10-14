@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """realdata 集成档的共享原语：读取、对齐、分档、对拍。
 
-刻意不带 ``test_`` 前缀、不 import pytest —— 集合档要复用这批原语，而 import
-任何 ``test_`` 模块都会触发它的模块级 fixture 自检，连坐 skip。
-
-分档阈值从老 ``util/compare_outputs.py`` 原样冻结，**不要改**：改了就是悄悄放宽
-或收紧标准，两个 realdata 档和以前不再可比。
+不带 ``test_`` 前缀、不 import pytest：import 任何 ``test_`` 模块都会触发它的
+模块级 fixture 自检。分档阈值从老 ``util/compare_outputs.py`` 原样冻结，**不要改**。
 """
 import re
 from pathlib import Path
@@ -87,11 +84,8 @@ def load_fields(path: Path, variables):
 
 
 def classify(max_diff, ref_std, exceed_fraction):
-    """给一档判定。
-
-    主判据是超容差点**占比**而非 max|diff| —— float32 的舍入误差与场的量级成正比，
-    单看 max|diff| 分不开「累积舍入」和「真的算出了不同的场」；能分开的是分布。
-    max|diff| 超场自身空间变率 1% 时无论占比多少直接 DIFFER（物理上可分辨）。
+    """给一档判定。主判据是超容差点**占比**而非 max|diff|；max|diff| 超场自身空间
+    变率 1%（``DRIFT_STD_FRACTION``）时无论占比多少直接 DIFFER。
     """
     if max_diff == 0.0:
         return "IDENTICAL"
@@ -105,10 +99,8 @@ def classify(max_diff, ref_std, exceed_fraction):
 
 
 def field_metrics(a, b, rtol=RTOL, atol=ATOL):
-    """两个 (H,W) 场 -> 指标 dict。
-
-    容差 ``|a-b| <= atol + rtol*|b|``（两把尺子满足其一）；NaN 位置不一致单独
-    计数，一侧缺测的格子不进超容差统计。
+    """两个 (H,W) 场 -> 指标 dict。容差 ``|a-b| <= atol + rtol*|b|``；NaN 位置不一致
+    单独计数，一侧缺测的格子不进超容差统计。
     """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -143,8 +135,7 @@ def compare_dirs(root_a: Path, root_b: Path, step_limit=None,
     """两份输出根目录 -> ``(rows, skipped)``。确定性档（无成员维度）专用。
 
     ``rows`` 每个 (起报, step, 变量) 一条；``skipped`` 记只在一侧存在的
-    ``(级别, 什么, 为什么)`` —— 覆盖面断言靠它抓「产物少写了一步反而更容易绿」。
-    变量清单与网格只在第一对文件上探测一次。
+    ``(级别, 什么, 为什么)`` —— 覆盖面断言靠它抓「产物少写一步反而更容易绿」。
     """
     inits_a, inits_b = init_dirs(root_a), init_dirs(root_b)
     if not inits_a:
@@ -187,7 +178,7 @@ def compare_dirs(root_a: Path, root_b: Path, step_limit=None,
 
             fields_a, lat_a, lon_a = load_fields(path_a, names)
             fields_b, lat_b, lon_b = load_fields(path_b, names)
-            # 每步都查网格：对不上说明网格本身变了，逐格相减只会得到一片假「漂移」。
+            # 网格对不上说明网格本身变了，逐格相减只有假「漂移」。
             if lat_a.shape != lat_b.shape or lon_a.shape != lon_b.shape:
                 raise ValueError(f"网格 shape 不一致：{path_a} 与 {path_b}")
             if not (np.allclose(lat_a, lat_b, atol=1e-4)

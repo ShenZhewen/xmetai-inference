@@ -12,18 +12,8 @@ import numpy as np
 class DatasetSource:
     """Runtime view of a Dataset, its DataLoader, and source metadata.
 
-    以下字段已移除（曾经存在但全项目无人读取）：
-
-      ``input_space``   恒为 "physical"，无消费者
-      ``preprocessed``  恒为 True，无消费者
-      ``unit_scales``   + ``SCALE`` 别名：单位换算已由 dataset.processors 的
-                        ``unit_convert`` 在 DataLoader worker 里完成，这里再暴露
-                        一份只会让人以为下游还要自己乘一次
-      ``static_source`` 工厂从不设置它，``load_static_state()`` 必然抛异常
-
-    需要单位换算系数的地方（如评测要与推理对齐）应直接读 config 的
-    ``dataset.processors[unit_convert].scales``，而不是从这里取 ——
-    那样才是同一个出处。
+    需要单位换算系数的地方（如评测要与推理对齐）直接读 config 的
+    ``dataset.processors[unit_convert].scales``，不要从这里取。
     """
 
     dataset: Any

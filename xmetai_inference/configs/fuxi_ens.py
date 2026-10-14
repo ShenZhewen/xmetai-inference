@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """FuXi-Ens 51 成员集合推理配置（era5_foundation_store2 h6）。
 
-集合模型改用 Dataset 批量路径：输入是物理量，ONNX 图内已烘焙归一化；
-Dataset 端只做单位换算和几何对齐，NaN 不填充，直接透传。
+输入是物理量，ONNX 图内已烘焙归一化；Dataset 端只做单位换算和几何对齐，NaN 直接
+透传不填充。
 """
 import os
 
@@ -25,9 +25,7 @@ cfg = InferConfig(
         "FUXI_ENS_ONNX",
         "/workspace/szwCode/xmetai-inference/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
     ),
-    # 统一开关：XMETAI_GPU_STATE="1"/"0" 显式覆盖，未设时用本 config 的默认（开）。
-    # 原来这里是 XMETAI_DISABLE_GPU_STATE（反向语义），与 fgvp 的 ENABLE 方向相反、
-    # 默认值也相反，运维极易设错且不报错，故统一。
+    # 统一开关 XMETAI_GPU_STATE="1"/"0" 覆盖，未设时用本 config 的默认（开）。
     gpu_state=os.environ.get("XMETAI_GPU_STATE", "1") == "1",
     model_class="fuxi_ens_onnx",
     dataset={

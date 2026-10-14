@@ -14,16 +14,13 @@ import pytest
 from xmetai_inference.configs.base import InferConfig, load_config, parse_times
 from xmetai_inference.models import FUXI21_CHANNELS, get_model_class
 
-#: 通道名去层号（规则同 test_fgvp_config.py）。
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
 
-#: 本 config 声明落盘的 12 个变量。
 EXPECTED_VARS = {
     "z500", "q700", "t700", "t850", "u850", "v850",
     "u10m", "v10m", "t2m", "d2m", "msl", "tp",
 }
 
-#: 循环清零的诊断通道（累积型）。
 DIAGNOSTIC_CHANNELS = {"ssr", "ssrd", "fdir", "ttr", "tp"}
 
 

@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
 """模型包：具体模型的固定运行契约。
 
-引擎在 xmetai.backends，模型在 xmetai.models，语义不混：
-  * backends 只提供共享运行契约以及 onnx/pt2 两种执行机制；
-  * MODEL_REGISTRY 是唯一注册表：模型名 → 具体模型类。模型继承对应引擎，只声明
-    通道、网格、时间窗口和输入表示；完整 Processor 流程由 configs 声明。
-
-加新模型三步：
-  1) 新建 models/<name>.py，继承对应引擎（backends.onnx.OnnxInferModel /
-     backends.pt2.Pt2InferModel / …）。
-  2) 在模型类声明 input_channels。
-  3) 在 MODEL_REGISTRY 注册，并新增一份包含完整 Processor 流程的 config。
-
-模型选择主路径：config/CLI 的 model_class → create_model()。
+MODEL_REGISTRY 是唯一注册表：模型名 → 具体模型类；模型只声明通道、网格、时间窗口
+和输入表示，完整 Processor 流程由 configs 声明。模型选择主路径：
+config/CLI 的 model_class → create_model()。
 """
 from importlib import import_module
 
@@ -58,8 +49,8 @@ FENGQING_SFC_VARS = ["tp", "msl", "u10m", "v10m", "t2m"]
 FENGQING_CHANNELS = _expand_channels(
     FENGQING_PL_VARS, FENGQING_LEVELS, FENGQING_SFC_VARS)
 
-# Pangu-Weather：与 FengQing 同为 0.25° 规则网格、同 13 层（1000→50 降序）、
-# 同上层变量序 [z,q,t,u,v]，差别只在地面通道：Pangu 无 tp，= [msl,u10m,v10m,t2m]。
+# Pangu-Weather：13 层（1000→50 降序）、上层变量序 [z,q,t,u,v] 同 FengQing；
+# 地面通道 = [msl,u10m,v10m,t2m]（无 tp）。
 PANGU_LEVELS = FENGQING_LEVELS
 PANGU_PL_VARS = FENGQING_PL_VARS
 PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
@@ -82,7 +73,7 @@ def grid_coords(grid):
     return lat, lon
 
 
-# 模型层：名字 → (模块, 类)。按需导入，避免使用 PT2 时强制安装 ONNX Runtime。
+# 模型层：名字 → (模块, 类)，按需导入。
 MODEL_REGISTRY = {
     "fuxi_ens_onnx": (
         "xmetai_inference.models.fuxi_ens_onnx",

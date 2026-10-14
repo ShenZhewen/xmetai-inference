@@ -1,9 +1,7 @@
 """Raw-reading wrapper around xmetai-core MultiZarrDataset.
 
-This module is responsible for opening the Zarr stores, selecting channels and
-inference positions, and applying a configured tensor processor chain. The
-processors themselves live in ``xmetai_inference.processing.tensor_processors``
-and are selected through ``dataset.processors``.
+Opens the Zarr stores, selects channels and inference positions, and applies the
+tensor processor chain declared in ``dataset.processors``.
 """
 from __future__ import annotations
 
@@ -97,8 +95,7 @@ def create_processed_multi_zarr_dataset(
 ):
     """Create a raw-reading processed MultiZarrDataset.
 
-    Preprocessing is declared in ``dataset.processors`` and applied per sample in
-    ``RawMultiZarrTensorDataset.__getitem__``.
+    前处理由 ``dataset.processors`` 声明，逐样本在 ``__getitem__`` 里执行。
     """
     config = dict(spec)
     dataset_type = config.pop("type", None)
@@ -166,9 +163,6 @@ def create_processed_multi_zarr_dataset(
         latitudes, longitudes, expected_shape
     )
     dataset = RawMultiZarrTensorDataset(base, positions, processors)
-    # 曾经还产出 input_space / unit_scales / preprocessed 三项，但 DatasetSource
-    # 收下后全项目无人读取（单位换算已由 processors 里的 unit_convert 完成），
-    # 已随字段一起移除。需要换算系数的地方直接读 config。
     metadata = {
         "channel_names": model_names,
         "latitudes": aligned_lat,

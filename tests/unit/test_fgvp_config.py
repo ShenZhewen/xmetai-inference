@@ -16,7 +16,6 @@ from xmetai_inference.models import FUXI_ENS_CHANNELS, get_model_class
 #: 通道名去层号（z50 → z），带尾字母（t2m/u10m）和纯字母（ssr/msl/tp）原样。
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
 
-#: 本 config 声明落盘的 11 个变量。
 EXPECTED_VARS = {
     "z500", "q700", "t700", "t850", "u850", "v850",
     "u10m", "v10m", "t2m", "msl", "tp",
@@ -38,8 +37,6 @@ def cfg():
 
 @pytest.fixture(scope="module")
 def model_cls(cfg):
-    # 从 config 自己声明的 model_class 解析，不写死：通道/变量一致性要验的正是
-    # 「这份 config 和它声明的模型对不对得上」，写死名字会让这些用例绿得毫无意义。
     return get_model_class(cfg.model_class)
 
 

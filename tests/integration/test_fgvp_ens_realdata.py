@@ -1,30 +1,22 @@
 # -*- coding: utf-8 -*-
 """fgvp_ens 真实数据档：真 51 成员集合 ONNX 在切片数据上跑一遍，和标准答案统计对拍。
 
-除链路端到端外，还要证明**集合语义没坏**：扰动真的在触发、成员互不相同、
-spread>0 —— FGVP 集合有 under-dispersion 的前科，扰动路径静默死了（随机算子
-没触发 / 没注册）确定性档的测试发现不了。
+除链路端到端外还要证明**集合语义没坏**（扰动在触发、成员互异、spread>0）：FGVP 集合
+的扰动路径静默死了照样全绿，确定性档发现不了。逐成员对拍在原理上不成立（扰动是图内
+随机算子、无 seed）；golden 是 8 卡正式跑的 51 成员，接近独立采样。
 
-逐成员对拍在原理上不成立：扰动是图内随机算子、无 seed，两次跑的 member_000
-必然不同（若哪天可复现了，恰恰说明集合退化 —— 成员互异用例就是抓这个）。
-golden 是 8 卡正式跑的；曾怀疑「8 卡拆批后 51 成员只有 8 个自由度」——
-2026-10-14 首跑排除：若成立 msl 越线率应 ~4%，实测只有 2.6e-4，且 run/golden
-散度吻合到 0.5% ⇒ golden 的 51 成员接近独立采样。
-
-判 PASS 两层：
+判 PASS 三层：
   * 确定性层：51 成员 × 步 × 配方声明变量的覆盖面、NaN 掩码、网格与 golden 一致；
   * 集合层：成员互异、逐变量 spread>0、集合均值对拍 —— 阈值从 golden 自身标定：
-    两次独立 51 成员采样的均值差 ~ N(0, σ·√(2/51))，超 4 倍预测噪声记违规点，
-    违规占比 ≤ 1e-3（与 ``EXCEED_FRACTION_CLOSE`` 同档）；σ≈0 的确定性格点回落
-    RTOL/ATOL。**tp 例外**（2026-10-14 实测后加）：零膨胀重尾让 4σ 线的实测
-    越线率达 0.6~0.7%（其余变量最高 2.6e-4，符合高斯预期），tp 的占比线放宽到
-    ``_FAIL_FRACTION`` 的 0.05 —— 真实回归会让降水区整片越线（百分之几十），
-    与噪声仍隔一个量级。
-  * 批量化层（2026-10-14 加）：配方显式给 ``model_batch=6``（前向批：一次 forward
-    堆 6 条成员轨迹）。集合层顺带就是它的判据 —— 随机算子若按 (1,...) 出噪声再
-    broadcast 到 batch 维，k 行会拿到同一份扰动、成员互异用例立刻红。另有一条用例
-    盯 rank 日志，确认批量化真进了图：图不是动态 batch 轴时 runner 会打一条 WARNING
-    退回 1（这一趟照跑完），那时其余用例照样全绿，却跟批量化毫无关系。
+    两次独立 51 成员采样的均值差 ~ N(0, σ·√(2/51))，超 4 倍预测噪声记违规点，违规
+    占比 ≤ 1e-3（与 ``EXCEED_FRACTION_CLOSE`` 同档）；σ≈0 的确定性格点回落 RTOL/ATOL。
+    **tp 例外**：零膨胀重尾让 4σ 线的实测越线率达 0.6~0.7%（其余变量最高 2.6e-4，
+    符合高斯预期），tp 的占比线放宽到 ``_FAIL_FRACTION`` 的 0.05 —— 真实回归会让
+    降水区整片越线（百分之几十），与噪声仍隔一个量级。
+  * 批量化层：配方显式给 ``model_batch=6``（一次 forward 堆 6 条成员轨迹）。随机算子
+    若按 (1,...) 出噪声再 broadcast 到 batch 维，k 行拿到同一份扰动、成员互异用例
+    立刻红。批量化是否真进图另有一条用例盯 rank 日志：图不是动态 batch 轴时 runner
+    会打一条 WARNING 退回 1（这一趟照跑完，其余用例照样全绿，却跟批量化毫无关系）。
 
 成员目录 0 基（``member_000..050``）。golden 必须挑 fgvp_ens_merged **新 .so 批次**
 （20250721 起）的完整日期 —— 批次混杂，旧批均值对拍可能真红。
@@ -49,8 +41,8 @@ if str(REPO_ROOT) not in sys.path:
 from realdata_common import (ATOL, EXCEED_FRACTION_CLOSE, RTOL, expected_vars,
                              load_fields, steps_in, variables_in)
 
-# runner 侧「批量化生效 / 被退回」的日志标记。**从 runner import，不抄字符串**：
-# 措辞改了这里跟着变，不会退化成一个永远搜不到的旧标记、把这条判据变成假绿。
+# runner 侧「批量化生效 / 被退回」的日志标记。从 runner import 而不抄字符串：措辞
+# 改了这里跟着变，不会退化成一个永远搜不到的旧标记、把判据变成假绿。
 from xmetai_inference.runner import BATCH_ACTIVE_MARK, BATCH_FALLBACK_MARK
 
 #: fixture 根。
@@ -74,9 +66,9 @@ STEPS = 3
 #: 全员 51：集合统计的采样噪声按 √51 缩，测的就是正式配方语义。
 MEMBERS = 51
 
-#: 前向批：一次 forward 堆几条成员轨迹（51 成员 = 9 块：8×6 + 3）。显式写死而不是
-#: 靠配方漂过来 —— 模板是 deepcopy 正式配方（configs/fgvp_ens.py 也是 6），不写的话
-#: 正式配方一改值，这条档会跟着变，覆盖面却没人知道。
+#: 前向批：一次 forward 堆几条成员轨迹（51 成员 = 9 块：8×6 + 3）。显式写死而非靠配方
+#: 漂过来 —— 模板是 deepcopy 的正式配方（configs/fgvp_ens.py 本身就是 6），不写的话
+#: 正式配方一改值这档会跟着变，覆盖面却没人知道。
 MODEL_BATCH = 6
 
 #: 单卡（cuda_devices 单卡空转，同 fgvp 档顶部说明）。
@@ -201,7 +193,7 @@ def _write_config(dest: Path) -> Path:
     return dest
 
 
-# 51 成员 × 3 步 × 5 变量的场 ≈6GB float64，持不住：逐成员流式累计 sum/sumsq/count。
+# 51 成员 × 3 步 × 5 变量的场 ≈6GB float64 持不住，故逐成员流式累计 sum/sumsq/count。
 # float64 累计是必须的：z500 平方和方差比 mean² 小 ~1e-6，float32 舍入会吃掉散度。
 
 def _member_dirs(root: Path) -> dict:
@@ -228,9 +220,9 @@ def _mean_std(sum_, sumsq, count):
 def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
     """两侧 51 成员目录流式对拍，返回 ``{rows, skipped, twins}``。
 
-    ``rows`` 每个 (步, 变量) 一条（均值对拍 + NaN/spread 指标）；``skipped`` 记
-    只在一侧存在的 (成员/步/变量)；``twins`` 记与基准成员 member_000 完全相同的
-    (成员, 步) —— 违规。网格不一致直接抛 ValueError（错位网格逐格相减只有假漂移）。
+    ``rows`` 每个 (步, 变量) 一条（均值对拍 + NaN/spread 指标）；``skipped`` 记只在
+    一侧存在的 (成员/步/变量)；``twins`` 记与 member_000 逐位相同的 (成员, 步)。
+    网格不一致直接抛 ValueError。
     """
     run_members = _member_dirs(run_members_root)
     golden_members = _member_dirs(golden_members_root)
@@ -295,7 +287,7 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
 
             fields_run, lat_r, lon_r = load_fields(path_run, names)
             fields_gold, lat_g, lon_g = load_fields(path_gold, names)
-            # 网格闸（每对查）：对不上说明网格本身变了，逐格相减没有意义。
+            # 网格对不上说明网格本身变了，逐格相减没有意义。
             if lat_r.shape != lat_g.shape or lon_r.shape != lon_g.shape:
                 raise ValueError(f"网格 shape 不一致：{path_run} 与 {path_gold}")
             if not (np.allclose(lat_r, lat_g, atol=1e-4)
@@ -328,7 +320,6 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
             if twin_here:
                 twin_members.append((member_id, step))
 
-    # 收尾：把累计器折成每个 (步, 变量) 一条。
     noise_scale = np.sqrt(2.0 / MEMBERS)   # 两次独立 51 成员采样均值差的 σ 倍率
     rows = []
     for (step, var), slot in sorted(acc.items()):
@@ -393,9 +384,9 @@ def run(tmp_path_factory):
         f"产物目录里没有 {INIT_DIR}/，实有：{sorted(p.name for p in out_dir.iterdir())}")
     metrics = _collect(run_root, GOLDEN_ROOT / INIT_DIR)
 
-    # 批量化到底进没进图，只有 rank 日志说得清：单卡走 cli._run_infer 的 gpus<=1 分支，
-    # 日志固定落 <out>/rank_0.log（多卡才是 rank_N.log）。判定放在用例里，不在这里
-    # 断言 —— 免得日志路径一变，四条与批量化无关的用例一起红。
+    # 批量化进没进图只有 rank 日志说得清：单卡走 cli._run_infer 的 gpus<=1 分支，日志
+    # 固定落 <out>/rank_0.log（多卡才是 rank_N.log）。判定放在用例里，免得日志路径一变
+    # 连坐四条与批量化无关的用例。
     log_path = out_dir / "rank_0.log"
     log_text = (log_path.read_text(encoding="utf-8", errors="replace")
                 if log_path.is_file() else "")
@@ -499,9 +490,9 @@ def test_fgvp_ens_no_nan_mismatch(run):
 def test_fgvp_ens_model_batch_takes_effect(run):
     """批量化层：``model_batch>1`` 必须真进图，不能悄悄退回逐条。
 
-    图不是动态 batch 轴时 runner 只打一条 WARNING 就退回 1（这一趟照跑完，均值/
-    散度/成员互异照样全绿）—— 那时这条档证明的只是「逐条前向」，与批量化无关。
-    所以以 rank 日志为凭：要么看到「生效」，要么看到「退回」，二者必居其一。
+    图不是动态 batch 轴时 runner 只打一条 WARNING 就退回 1，这一趟照跑完、均值/散度/
+    成员互异照样全绿 —— 那时这条档与批量化无关。故以 rank 日志为凭：「生效」或
+    「退回」必有其一。
     """
     metrics, _ = run
     info = metrics["model_batch"]

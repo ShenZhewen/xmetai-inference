@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """FengQing V1.5Beta (precipitation ONNX) 模型契约。
 
-图输入（4 个键，非官方 12 输入 —— 这是重导过的图）：
+图输入（4 个键，非官方 12 输入的重导图）：
   upper              : [1, 130, 721, 1440] = 2 帧 × 65 通道（帧优先）
   surface            : [1,  10, 721, 1440] = 2 帧 ×  5 通道
   temporal_condition : float16 [1, 4]
@@ -10,23 +10,13 @@
   upper   : [1, 65, 721, 1440]
   surface : [1,  5, 721, 1440]
 
-分层：
-  * 输入归一化 → 数据层 dataset.processors ``normalize_fengqing``
-  * 反归一化   → 输出阶段 model_processing.output ``denormalize_fengqing``
-  * 本类只做「一步前向 + 残差反演」，全程留在归一化空间：
-        next_phys = prev_phys + out·res_std
-        prev_phys = prev_norm·std + mean
-        ⟹ next_norm = prev_norm + out·(res_std/std)
-    所以这里只需要 res_std/std 这个每通道常数（图的输出语义，属模型契约），
-    不碰 mean —— 归一化本身不在模型层。
+本类只做「一步前向 + 残差反演」，全程留在归一化空间，只需要每通道的
+res_std/std 常数（图的输出语义）；归一化/反归一化分别由数据层
+``normalize_fengqing`` 与输出层 ``denormalize_fengqing`` 负责。
 
-统计量文件（mean_std/）：
-  upper_mean.npy (65,H,W)   upper_std.npy (65,1)   res_upper_std.npy (65,1)
-  mean_pre.npy   ( 5,H,W)   std_pre.npy   ( 5,1)   res_std_pre.npy   ( 5,1)
 surface 通道序为 tp, msl, u10m, v10m, t2m（与官方 readme 的
 MSLP,U10,V10,T2M,TP 不同，已按 mean_pre.npy 实测确认）。
-spatial_condition 来自 utils/constant_masks.npy（lat 90→-90、lon 0→359.75，
-由珠峰 [247,347] 与马里亚纳 [315,569] 两点定死）。
+spatial_condition 来自 utils/constant_masks.npy（lat 90→-90、lon 0→359.75）。
 """
 from __future__ import annotations
 
@@ -42,10 +32,8 @@ from . import FENGQING_CHANNELS, GRID_025
 
 
 def _temporal_condition(dt):
-    """与官方 FengQing timefeatures('h') 相同的 4 特征编码。
-
-    官方 utils/timefeatures.py 的 freq='h' 给出
-    [HourOfDay, MonthOfYear, DayOfMonth, DayOfYear]，注意第 2 个是月不是星期。
+    """temporal_condition 的 4 特征编码 = [HourOfDay, MonthOfYear, DayOfMonth,
+    DayOfYear]（同官方 timefeatures('h')）；第 2 个是月不是星期。
     """
     return np.asarray(
         [[
@@ -59,12 +47,7 @@ def _temporal_condition(dt):
 
 
 def _find_artifact(model_path, relative_paths):
-    """在模型文件及其父目录中查找工件。
-
-    兼容两种布局：
-      .../FengQing/onnx/fengqing_pre.onnx  →  .../FengQing/mean_std/
-      .../models/fengqing_pre.onnx         →  .../mean_std/
-    """
+    """在模型文件本身及上两级父目录里查找工件（兼容 .../onnx/ 与 .../models/ 两种布局）。"""
     bases = [model_path.parent, model_path.parents[1], model_path.parents[2]]
     for relative in relative_paths:
         for base in bases:
@@ -87,11 +70,10 @@ class FengqingPreOnnxModel(OnnxInferModel):
     members = 1
     # 图只出预报那一帧（不带回显帧），滑窗归 runner.Rollout。
     windowed_output = False
-    # 官方 inference_fengqing.py 的 temporal_condition 取**目标预报时刻**
-    # （valid = init + (step+1)*interval），与 fuxi 系的「输入窗末帧时刻」不同。
-    # 两者都有官方脚本背书，不要「统一」。
+    # 1 = temporal_condition 取**目标预报时刻**（valid = init + (step+1)*interval），
+    # 与 fuxi 系的「输入窗末帧时刻」不同，两者都有官方脚本背书，不要统一。
     valid_time_step_offset = 1
-    # 无 forward_gpu 实现（图要 4 个键、输入输出不同形），GPU 常驻不可用。
+    # 图要 4 个键、输入输出不同形，无 forward_gpu，GPU 常驻不可用。
     gpu_state = False
 
     def load(self, path):
@@ -124,14 +106,11 @@ class FengqingPreOnnxModel(OnnxInferModel):
                 f"res_std shape 不符：upper={res_upper_std.shape} "
                 f"surface={res_std_pre.shape}")
 
-        # 残差反演在归一化空间只需这个比值（见模块 docstring 的推导）：
-        #   next_norm = prev_norm + out·(res_std/std)
+        # 归一化空间残差反演系数：next_norm = prev_norm + out·(res_std/std)
         self._upper_res_ratio = (res_upper_std / upper_std).reshape(1, 65, 1, 1)
         self._surface_res_ratio = (res_std_pre / surface_std).reshape(1, 5, 1, 1)
 
-        # tp 非负钳位：物理空间的 0 对应归一化空间的 -mean/std（FengQing 的 mean
-        # 是逐像素的，所以这是一个 (H,W) 的阈值场，不是标量）。在归一化空间钳位
-        # 与「反归一化→钳位→再归一化」逐位等价，但省掉一次往返。
+        # tp 非负钳位：物理 0 对应归一化 -mean/std；mean 逐像素，故是 (H,W) 阈值场。
         surface_mean = np.load(mean_std_dir / "mean_pre.npy").astype(np.float32)
         if surface_mean.shape != (5, 721, 1440):
             raise ValueError(f"mean_pre shape 不符：{surface_mean.shape}")
@@ -144,7 +123,7 @@ class FengqingPreOnnxModel(OnnxInferModel):
         masks = np.load(masks_path).astype(np.float64)            # (3, 721, 1440)
         if masks.shape != (3, 721, 1440):
             raise ValueError(f"constant_masks shape 不符：{masks.shape}")
-        # 与官方 utils/constant_masks.py 相同的逐掩膜标准化（var 用 ddof=0 + 1e-5）
+        # 逐掩膜标准化，同官方 utils/constant_masks.py（var 用 ddof=0 + 1e-5）
         standardized = []
         for arr in masks:
             flat = arr.reshape(-1)
@@ -158,8 +137,8 @@ class FengqingPreOnnxModel(OnnxInferModel):
     def forward(self, x, step, valid_time):
         """一步前向：归一化量进 / 归一化量出，只出预报那一帧。
 
-        x 形状 (1, 2, 70, H, W)（数据层已归一化）。图要的是帧优先展平的
-        upper[1,130,H,W] 与 surface[1,10,H,W]，所以这里按通道切开再拼帧。
+        x 形状 (1, 2, 70, H, W)（数据层已归一化）；图要帧优先展平的
+        upper[1,130,H,W] 与 surface[1,10,H,W]。
         """
         state = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
         arr = state.detach().cpu().numpy().astype(np.float32)     # (1,2,70,H,W)
@@ -174,8 +153,7 @@ class FengqingPreOnnxModel(OnnxInferModel):
             "spatial_condition": self._spatial_condition,
         })
         out_upper, out_surface = outputs
-        # 输出顺序保险：图的两个输出名是 21993/21994（tracing 未命名），顺序不该
-        # 反，但反了要能自愈而不是静默错位。
+        # 输出顺序保险：两个输出名是 21993/21994（tracing 未命名），反了要能自愈。
         if out_upper.shape[1] != 65 and out_surface.shape[1] == 65:
             out_upper, out_surface = out_surface, out_upper
         if out_upper.shape[1] != 65 or out_surface.shape[1] != 5:

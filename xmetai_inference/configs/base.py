@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
 """推理配置基础设施：InferConfig + load_config()。
 
-配置是普通 dataclass，不是 detectron2 的 LazyConfig/omegaconf —— 推理项目只要
-「运行配方」，用不上训练框架那一堆重依赖（yacs/omegaconf/hydra/iopath）。
-
-职责边界：
-  * 模型契约（通道/单位/网格/时间窗口）折叠进 models 包及各模型类的
-    input_channels/output_channels/grid/history_steps 等类属性，不再靠 spec JSON；
-    config 用 `model_class=` 引用模型类，并完整声明输入、回填和输出 Processor。
-  * config 是「运行配方」：跑哪个模型类、用什么权重、什么起报时间、几张卡、输出到哪。
-
 约定：
+  * 模型契约（通道/单位/网格/时间窗口）折叠进模型类的类属性（input_channels/
+    output_channels/grid/history_steps），config 用 `model_class=` 引用模型类，并
+    完整声明输入、回填和输出 Processor；
   * 每个 xmetai_inference/configs/<name>.py 定义全局变量 `cfg`（InferConfig 实例）；
   * config 里的相对路径（model_path）相对仓库根 ROOT 解析；
-  * 支持环境变量插值：config 里可用 os.environ.get(...) 覆盖默认（如模型路径）。
-  * 起报时间统一用单个 `times` 字段（见 parse_times）。
+  * config 可用 os.environ.get(...) 覆盖默认（如模型路径）；
+  * 起报时间统一用单个 `times` 字段（语法见 parse_times）。
 """
 import importlib.util
 import os
@@ -24,9 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-# 项目根目录（绝对）。优先环境变量，其次从包内 configs/ 向上两级推导。
-# 安装为 wheel 后若权重位于外部目录，应显式设置 XMETAI_INFERENCE_ROOT，
-# 或在配置中通过模型对应的环境变量指定绝对权重路径。
+# 项目根目录（绝对）。可用 XMETAI_INFERENCE_ROOT 覆盖。
 ROOT = os.environ.get("XMETAI_INFERENCE_ROOT") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -93,7 +85,6 @@ class InferConfig:
     model_path: str                          # 模型文件路径（.onnx/.pt2）
     # 内置模型可写注册名；外部 config 可直接传 BaseInferModel 子类。
     model_class: Any = "fuxi_ens_onnx"
-    # Processor 属于模型运行配方，不属于 Dataset/DataLoader。
     model_processing: Any = None
     # 旧配置兼容字段；新配置统一使用 model_processing。
     pre_processors: Any = None
@@ -101,7 +92,6 @@ class InferConfig:
     output_processors: Any = None
     ops_library: str = ""                    # 自定义算子库 .so（空 = 不注册，标准模型）
     gpu_state: Any = None                   # None = 使用模型类默认；True/False 可覆盖
-    # 数据源统一走 xmetai-core Dataset + torch DataLoader 批量读取。
     dataset: Any = None
     dataloader: Any = field(default_factory=dict)
     data_root: str = ""                      # 可选覆盖数据源根目录（保留字段；当前 Dataset 使用绝对路径）
@@ -110,18 +100,12 @@ class InferConfig:
     hour_interval: int = 0                  # 时间步长小时（0 = 读模型类的 hour_interval）
     members: int = 0                         # 集合成员数（0 = 读模型类的 members）
     vars: str = ""                           # 输出变量，逗号分隔（空 = 保存全部通道）
-    # 前向批：一次 forward 堆几条轨迹（1 = 逐条前向，缺省，与历史行为一致）。
-    # ⚠ 与 dataloader 的 batch_size **不是一个东西**：那个是 Dataset 一次装几个
-    # 起报（I/O 批），这个是**前向批**。members>1 时批的是成员，members==1 时批的
-    # 是起报。前提（不满足不会静默算错：前两条在 runner 里挡掉，第三条图自己会拒）：
-    #   * 图导出时输入/输出的 batch 轴都是符号维 —— onnx 后端 load 时实测后置
-    #     batch_axis_dynamic，没置位就打 WARNING 退回 1，这一趟照跑完；
-    #   * 不能与 gpu_state=True 同用（配置互斥，直接报错，不静默退回）；
-    #   * 一批里各轨迹的时刻可以不同（step/hour/doy 按 (k,) 逐行喂）。
-    # 显存按此倍数涨：0.25° 78 通道 2 帧，一条轨迹的状态约 648 MB，照可用显存给。
+    # 前向批：一次 forward 堆几条轨迹（1 = 逐条，与历史行为一致）。与 dataloader 的
+    # batch_size（I/O 批）不是一个东西。需图的输入/输出 batch 轴都是符号维，否则打
+    # WARNING 退回 1；与 gpu_state=True 互斥（直接报错）。
     model_batch: int = 1
-    gpu_mem: float = 0.7                     # 显存占用比例
-    log_level: str = "INFO"                  # 控制台日志级别
+    gpu_mem: float = 0.7                     # 占卡总显存的比例（ORT gpu_mem_limit = total_memory × 此值）
+    log_level: str = "INFO"                  # 控制台日志级别（DEBUG/INFO/WARNING/ERROR）
     gpus: int = 1                            # 卡数（>1 时按起报时间分摊到各卡）
     cuda_devices: str = "0"                  # 物理卡号，逗号分隔，按序对应各 rank
     output_dir: str = ""                     # 输出目录（空 = 只做输入校验，不跑模型）
@@ -197,7 +181,6 @@ def load_config(path):
         raise SystemExit(f"配置文件不存在：{path}")
     config_dir = os.path.dirname(path)
     if config_dir not in sys.path:
-        # 保留在 sys.path 中：config 导入的本地模型可能在后续按需加载其他同目录模块。
         sys.path.insert(0, config_dir)
     module_name = f"_xmetai_run_config_{abs(hash(path))}"
     spec = importlib.util.spec_from_file_location(module_name, path)
