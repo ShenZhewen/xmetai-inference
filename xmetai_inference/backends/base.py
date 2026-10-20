@@ -1,11 +1,25 @@
 # -*- coding: utf-8 -*-
 """推理后端共享运行契约。
 
-换后端（ONNX / PT2）只需实现 load + forward；数据适配、输出反变换与回填规则由统一
-Processor 管线注入，后端和模型类不实现处理钩子。热路径支持 torch.Tensor，numpy 只留在
-ONNX Runtime、earthkit 或 netCDF 落盘等必须 numpy 的边界。
+两层契约：单步前向 forward（默认循环走它）+ 自回归 run 循环（推理主入口）。
+换后端（ONNX / PT2）只需实现 load + forward 两个方法，框架用默认
+run 循环把它们串起来。数据进入模型前的适配、输出反变换和回填规则由统一 Processor 管线注入，
+后端和模型类不再实现处理钩子。
+
+具体引擎分别位于同目录 onnx.py、pt2.py。引擎不能挂到包根门面 re-export——
+onnx.py 顶层 import onnxruntime，一旦挂上，PT2-only 环境导入任何 backends
+符号都会被拖上 ONNX Runtime；包根 __init__.py 只 re-export BaseInferModel，
+保持 `from xmetai_inference.backends import BaseInferModel` 对外不变。
+
+自 2026-09 起，PT2/ONNX 的 tensor 后端热路径支持 torch.Tensor；numpy 只保留在
+ONNX Runtime、earthkit 或 xarray/netCDF 落盘等必须 numpy 的边界。
+
+后端共享的常驻 session 池（config 的 resident_members）也在本文件——它只持不透明
+session 对象，不 import onnxruntime。
 """
+import collections
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -61,16 +75,45 @@ def _stack_outputs(outputs, axis):
 
 
 class BaseInferModel(ABC):
-    """所有推理后端的公共基类：子类实现 load + forward。
+    """所有推理后端的公共基类。
 
-    forward 契约：输入 x 为 (1, in_frames, C, H, W) 的 float32 数组/tensor，返回同形状的
-    完整模型输出（末帧是本步预报）。PT2/ONNX 后端可保持 torch 全程待在设备上，框架只在
-    落盘时搬到 CPU；ONNX Runtime 的 legacy 路径仍可返回 numpy。
+    子类只需实现两个方法：
+      load(path)                    —— 加载模型到 self.device_id
+      forward(x, step, valid_time)  —— 一步前向
+
+    forward 的约定：输入 x 为 (1, in_frames, C, H, W) 的 float32 数组/tensor，
+    返回同样 (1, in_frames, C, H, W) 的完整模型输出（末帧是本步预报）。
+    PT2/ONNX 后端可保持 torch 全程待在设备上，框架只在落盘时搬到 CPU；ONNX
+    Runtime 的 legacy 路径仍可返回 numpy，run 循环按实际类型分别处理。
+    这条约定定了，run 就完全不用知道后端是 ONNX 还是 PyTorch；回填用
+    完整输出（state = result），与官方 inference.py 的 `new_input = model.run(...)` 一致。
     """
     backend = "base"
+    # 是否支持「确定性模型 -> 集合」的权重扰动注入（SPW）。ONNX 后端实现了两种机制：
+    # m3（图内随机算子，已定格为对照）与 m1a（逐成员冻结权重，主线）。见
+    # xmetai_inference/perturbation/README.md。
+    supports_weight_perturb = False
+    # 是否支持潜空间 AR(1) 强迫（latent_forcing，config 字段）。与权重扰动分开声明：
+    # onnx 后端走 ONNX 图改写（weights/spa.py），pt2 后端走 torch.fx 图改写（weights/spa_pt2.py），
+    # 两个能力互不蕴含。见 xmetai_inference/perturbation/README.md 2N 节。
+    supports_latent_forcing = False
 
-    # 落盘前做非负钳位的通道，各模型可通过类属性自行声明。这是兜底：模型漏配
-    # 反归一化时 tp 仍在归一化空间，钳位会把负值削平、输出看着合理而不报错。
+    # ONNX Runtime 的运行旋钮（PT2 后端也带着，只是不用）。由 config 的
+    # intra_op_threads / cudnn_algo_search 经 create_model 落到实例上。
+    #   intra_op_threads：0 = 让后端自己决定（ORT 会给每个进程吃满物理核；本框架会
+    #     同时起多个 worker 进程，所以命令行会在启动期算成「核数 / worker 数」再传进来）。
+    #   cudnn_algo_search："" = 后端默认（EXHAUSTIVE）。
+    intra_op_threads = 0
+    cudnn_algo_search = ""
+
+    # 落盘前做非负钳位的通道。原先 to_dataset 里硬编码 `if channel == "tp"`，
+    # 那是模型语义写进了后端基类。做成类属性后各模型可自己声明；缺省 ("tp",)
+    # 是因为四个模型都有 tp 且都需要钳位，行为与原来一致。
+    #
+    # 注意这只是落盘前的兜底 —— 真正的钳位应在各自的输出阶段完成
+    # （fuxi21 的 denormalize.nonnegative、FengQing 在 forward 的归一化空间里）。
+    # 这道兜底的隐患是**掩错**：若某模型漏配反归一化，tp 仍处归一化空间，
+    # np.maximum(arr, 0) 会把负的归一化值削平，输出看着「合理」而不报错。
     nonnegative_channels = ("tp",)
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
@@ -78,6 +121,12 @@ class BaseInferModel(ABC):
         self.gpu_mem_fraction = gpu_mem_fraction
         self.processing = None
         self.data_source = None
+        # 权重扰动规格（config 的 weight_perturb）；None = 不加扰动。
+        # 只有声明 supports_weight_perturb=True 的后端会消费它。
+        self.weight_perturb = None
+        # 本实例代表哪个集合成员。m1a 靠它决定加载哪一份成员模型；m3 单会话多轨迹，
+        # 恒为 0。集合推理时由 cli 在每次 load 之前赋成本 rank 当前要跑的成员号。
+        self.member_index = 0
 
     def configure_processing(self, processing, data_source):
         """Bind the configured model processing recipe to this model."""
@@ -115,19 +164,25 @@ class BaseInferModel(ABC):
         return self.backend
 
     def reset_runtime_state(self):
-        """自回归轨迹间重置跨步内部状态（缺省无操作），Rollout 每批轨迹开始前调用一次。
+        """自回归轨迹间重置模型持有的跨步内部状态（缺省无操作）。
+
+        Rollout.run 每批轨迹开始前调用一次。多会话/跨步有状态模型（如 Pangu
+        方案B 的 24h 锚点）覆盖此方法清空上一批残留状态，避免状态在轨迹间泄漏，
+        也把常驻内存约束在当前 batch 量级。
         """
         return None
 
     # ------------------------------------------------------------------
-    # GPU 常驻（state 全程待在 GPU，只在落盘时搬回 CPU）
+    # GPU 常驻（state 全程待在 GPU，只在落盘时搬回 CPU，省每步 H2D/D2H）
     # ------------------------------------------------------------------
-    # 置 gpu_state=True 须实现 to_gpu / forward_gpu / to_numpy。GPU state 不支持
-    # numpy recurrent transform，需要回填处理的模型必须保持 gpu_state=False。
+    # 子类置 gpu_state=True 并实现 to_gpu / forward_gpu / to_numpy 后，run 循环
+    # 就走 GPU 常驻分支。当前 GPU state 不支持 numpy recurrent transform；需要
+    # 回填处理的模型应保持 gpu_state=False。
     gpu_state = False
 
-    # 一次 forward 能否堆多条轨迹：图输入/输出的 batch 轴都须是符号维。onnx 后端
-    # load 时实测置位；缺省 False = Rollout 打 WARNING 把 model_batch 退回 1。
+    # 图能不能一次吃多条轨迹（batch 轴是符号维）。Rollout.run 的 batch_size>1
+    # 依赖它：没声明就退回逐条，免得拿静态 batch 的图去喂 k>1 被 ORT 拒。
+    # 后端在 load 时按图的输入签名实测后置位（见 backends/onnx.py）。
     batch_axis_dynamic = False
 
     def to_gpu(self, x):
@@ -145,8 +200,10 @@ class BaseInferModel(ABC):
     def to_dataset(self, step_state, save_names=None, lat=None, lon=None):
         """一步 × 一成员的输出 → xarray Dataset（落盘前最后一步，后端无关入口）。
 
-        step_state 形状 (C,H,W)，用 self.output_channels 解码变量名、套 lat/lon 坐标；
-        save_names 为 None 表示全部通道。此处做唯一一次 tensor→numpy（xarray 需要 numpy）。
+        默认实现按 onnx/pt2 通道张量语义：step_state 形状 (C,H,W)，用 self.output_channels
+        （模型类的输出通道契约）解码变量名、套 lat/lon 坐标、挑 save_names（None=全部
+        通道）。step_state 可以是 torch.Tensor，也可以沿用 ONNX legacy 的 numpy；
+        这里做唯一一次 tensor→numpy，xarray 需要 numpy 数据。
         """
         import xarray as xr
 
@@ -165,4 +222,111 @@ class BaseInferModel(ABC):
             data_vars[channel.upper()] = (("lat", "lon"), arr)
         return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
 
-    # 自回归 rollout 循环见 xmetai_inference/runner.py 的 Rollout。
+    # 自回归 rollout 循环已移至 xmetai_inference/runner.py 的 Rollout。
+    #
+    # 原先这里有 run（按 member 循环，124 行）和 run_batch（按 batch 循环，61 行）
+    # 两份平行实现：循环体逐字相同，差别只在「轨迹从哪来」和「返回值形状」，且已
+    # 出现单边演进（帧数校验严格度不同、防别名一边显式 clone 一边靠隐式拷贝、
+    # 进度/ETA 只有 run 有）。Rollout 用统一的「轨迹」概念覆盖两者：集合的成员和
+    # 批量的起报都是一条轨迹。
+    #
+    # 后端/模型类现在只需实现 load + forward（GPU 常驻另需 to_gpu/forward_gpu/
+    # to_numpy），循环、多轨迹、回填、进度归编排层。
+
+
+# ---------------------------------------------------------------------------
+# 常驻 session 池（config 的 resident_members）
+# ---------------------------------------------------------------------------
+# 为什么需要它：m1a 的集合是「一个成员一份冻结权重 = 一个 onnx session」。按成员优先
+# 认领时同一个 worker 会在整轮里反复回到同一批成员；按起报优先认领时更极端 —— 每个任务
+# 都换成员。而 ORT 建一次 session 的代价不只是读一遍权重（latent_mixer 下 1.49 GB），
+# 还有一遍 cuDNN 预热（cudnn_conv_algo_search="EXHAUSTIVE" 时每层卷积都要搜一遍 kernel）。
+# 所以「显存够大就别放手」是有真实收益的，这正是 config 里 resident_members 的含义。
+#
+# 额度语义（config 的 resident_members）：
+#   1     缺省 = 一次只驻留 1 份（进来第 2 份就把第 1 份还给 ORT），这是小显存的口径；
+#   N > 1 最多驻留 N 份，第 N+1 份进来时把**最久没用过**的那份换出；
+#   -1    不限（全常驻）。
+#
+# 池子只存不透明对象（真身是 onnxruntime.InferenceSession），**不 import
+# onnxruntime**。为什么键是「解析后的路径」而不是成员号：扰动 / 潜空间强迫的每一份
+# 变体都把指纹烘进了文件名（见 perturbation/），所以「同一个路径」就等于「同一份
+# 权重、同一张图」。用成员号当键反而会错：m3 / latent 是一个 session 服务全部成员
+# （member_index 会变、路径不变），按成员号索引会把同一个 session 存成 51 份。
+def normalize_budget(value):
+    """resident_members -> 池子额度：0 / None / 非法值都当 1（缺省口径），负数 = 不限。"""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return 1
+    if value < 0:
+        return -1
+    return max(1, value)
+
+
+class SessionPool:
+    """路径 -> session 的 LRU 池。额度 1 时退化成「用一个换一个」，与改造前等价。"""
+
+    def __init__(self, budget=1, logger=None):
+        self.budget = normalize_budget(budget)
+        self.log = logger or log
+        self.builds = 0
+        self.hits = 0
+        self.evictions = 0
+        self._items = collections.OrderedDict()
+
+    def acquire(self, key, build):
+        """取 session：命中则复用（返回 hit=True），否则调用 ``build()`` 新建并入池。
+
+        ``build`` 是惰性回调（池子自己不知道 session 怎么造），于是本模块与
+        onnxruntime 完全解耦。
+        """
+        key = os.path.abspath(key)
+        cached = self._items.pop(key, None)
+        if cached is not None:
+            self._items[key] = cached          # 重新入尾 = 这条刚被用过（LRU 更新）
+            self.hits += 1
+            return cached, True
+        session = build()
+        self.builds += 1
+        self._items[key] = session
+        self._evict()
+        return session, False
+
+    def _evict(self):
+        """按额度从 LRU 一端换出；额度 -1 = 不换。"""
+        if self.budget < 0:
+            return
+        dropped = []
+        while len(self._items) > self.budget:
+            dropped.append(self._items.popitem(last=False)[0])
+        if dropped:
+            self.evictions += len(dropped)
+            self.log.info("常驻 session 池已满（额度 %d），换出 %d 份：%s",
+                          self.budget, len(dropped),
+                          "、".join(os.path.basename(item) for item in dropped))
+
+    def purge(self):
+        """清空池子（驻留的 session 全部放开，显存随之归还）。返回清掉的份数。"""
+        count = len(self._items)
+        self._items.clear()
+        return count
+
+    def __contains__(self, key):
+        return os.path.abspath(key) in self._items
+
+    def __len__(self):
+        return len(self._items)
+
+    def keys(self):
+        """驻留中的路径，按 LRU 排序（最久没用过的在前）。"""
+        return list(self._items)
+
+    def stats(self):
+        return {
+            "budget": self.budget,
+            "size": len(self._items),
+            "builds": self.builds,
+            "hits": self.hits,
+            "evictions": self.evictions,
+        }
