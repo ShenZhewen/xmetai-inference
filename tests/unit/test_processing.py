@@ -70,7 +70,7 @@ def test_alignment_rejects_resolution_mismatch():
 
 
 def test_alignment_rolls_offset_lon_to_start_at_zero():
-    """偏移网格要把经度 0 挪到下标 0 —— 曾在此发现 roll 方向反了，修复于 2026-10-14。"""
+    """偏移网格要把经度 0 挪到下标 0（roll 方向不得反）。"""
     lat = np.array([10.0, -10.0])
     lon = np.array([120.0, 240.0, 0.0])
     _, aligned_lon = tp.aligned_coordinates(lat, lon, (2, 3))

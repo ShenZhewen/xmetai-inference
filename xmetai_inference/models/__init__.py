@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
-"""模型包：具体模型的固定运行契约。
+"""模型包：具体模型的固定运行契约（通道 / 网格 / 时间窗口 / 输入表示）。
 
-引擎在 xmetai.backends，模型在 xmetai.models，语义不混：
-  * backends 只提供共享运行契约以及 onnx/pt2 两种执行机制；
-  * MODEL_REGISTRY 是唯一注册表：模型名 → 具体模型类。模型继承对应引擎，只声明
-    通道、网格、时间窗口和输入表示；完整 Processor 流程由 configs 声明。
-
-加新模型三步：
-  1) 新建 models/<name>.py，继承对应引擎（backends.onnx.OnnxInferModel /
-     backends.pt2.Pt2InferModel / …）。
-  2) 在模型类声明 input_channels。
-  3) 在 MODEL_REGISTRY 注册，并新增一份包含完整 Processor 流程的 config。
-
-模型选择主路径：config/CLI 的 model_class → create_model()。
+引擎在 backends，MODEL_REGISTRY 是唯一注册表（模型名 → 模型类），完整 Processor
+流程由 configs 声明。新模型 = 新建 models/<name>.py、继承对应引擎、声明
+input_channels、在 REGISTRY 注册，并加一份 config。
 """
 from importlib import import_module
 
@@ -133,21 +124,9 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
                  cudnn_algo_search="", resident_members=1):
     """按模型名构造推理模型。
 
-    ops_library / gpu_state / weight_perturb / latent_forcing / member_index 属于运行配置，
-    由 config 提供；None 时使用模型类默认值（weight_perturb=None / latent_forcing=None
-    即不加扰动）。
-
-    weight_perturb 与 latent_forcing 是两条正交的「确定性 -> 集合」路径：前者按
-    `W~ = W (x) (1 + sigma*xi)` 改**权重**（仅 ONNX 后端），后者按
-    `z' = z (x) (1 + sigma*U diag(xi_t) V^T)` 改**图**（xi_t 是驱动侧的 AR(1) 过程；
-    ONNX 后端加 `spw/xi` 输入，pt2 后端改写 torch.fx 图 + 模块属性喂 xi）。两者可以
-    同时开（仅 ONNX），config 里同时写就是「冻结的扰动权重 + 时间相关的潜空间强迫」。
-
-    member_index 只在配了 weight_perturb 时有意义：它决定 load() 加载
-    哪一份成员模型。跑集合时同一个实例会被反复 load（每次换一个成员号）；resident_members
-    决定这些 session 在显存里驻留几份——1（缺省）是一换一放，51 个成员 x 3 GB 全挂上去
-    会把显存吃干净；显存够大就调大它（-1 = 全常驻），换回来时不重建 session、不重新预热
-    cuDNN。见 backends/base.py 的 SessionPool 与 cli 的 _run_member_block。
+    weight_perturb（改权重）与 latent_forcing（改图）是两条正交路径，仅 ONNX 可同时开。
+    member_index / resident_members 只在配了 weight_perturb 时有意义：决定 load() 加载
+    哪份成员、session 在显存里驻留几份（-1 = 全常驻）。
     """
     cls = get_model_class(model_name)
     model = cls(device_id=device_id, gpu_mem_fraction=gpu_mem_fraction)

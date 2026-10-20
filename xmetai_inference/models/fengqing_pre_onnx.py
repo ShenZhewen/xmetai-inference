@@ -1,22 +1,13 @@
 # -*- coding: utf-8 -*-
 """FengQing V1.5Beta (precipitation ONNX) 模型契约。
 
-图输入（4 个键，非官方 12 输入的重导图）：
-  upper              : [1, 130, 721, 1440] = 2 帧 × 65 通道（帧优先）
-  surface            : [1,  10, 721, 1440] = 2 帧 ×  5 通道
-  temporal_condition : float16 [1, 4]
-  spatial_condition  : float32 [3, 721, 1440]
-图输出（**归一化残差**，不是全场）：
-  upper   : [1, 65, 721, 1440]
-  surface : [1,  5, 721, 1440]
+图输入 4 键：upper [1,130,721,1440] / surface [1,10,721,1440]（帧优先）、
+temporal_condition [1,4]、spatial_condition [3,721,1440]；输出是**归一化残差**
+（upper [1,65,...] / surface [1,5,...]）。本类只做一步前向 + 残差反演，全程留在
+归一化空间；归一化/反归一化由 normalize_fengqing / denormalize_fengqing 负责。
 
-本类只做「一步前向 + 残差反演」，全程留在归一化空间，只需要每通道的
-res_std/std 常数（图的输出语义）；归一化/反归一化分别由数据层
-``normalize_fengqing`` 与输出层 ``denormalize_fengqing`` 负责。
-
-surface 通道序为 tp, msl, u10m, v10m, t2m（与官方 readme 的
-MSLP,U10,V10,T2M,TP 不同，已按 mean_pre.npy 实测确认）。
-spatial_condition 来自 utils/constant_masks.npy（lat 90→-90、lon 0→359.75）。
+surface 通道序 = tp, msl, u10m, v10m, t2m（以 mean_pre.npy 实测为准，与官方
+readme 不同）。
 """
 from __future__ import annotations
 

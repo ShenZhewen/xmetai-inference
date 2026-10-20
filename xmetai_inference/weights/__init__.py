@@ -1,21 +1,9 @@
 # -*- coding: utf-8 -*-
-"""模型权重与扰动代码（SPW / SPA）。
+"""模型权重与扰动代码：spa.py / spa_pt2.py（潜空间 AR(1) 强迫，ONNX / PT2）
+与 spw.py（权重扰动）。SPA 的推理驱动在 backends/spa.py，由两种后端共用。
 
-2026-10-20 起重构为：
-
-  * `spa.py`      潜空间 AR(1) 强迫（SPA）的 ONNX 版：规格 / 图改写 / 生成 / 审计；
-  * `spa_pt2.py`  同一套 SPA 语义的 PT2（torch.export）版图改写；
-  * `spw.py`      权重扰动（SPW）：规格 / 选张量 / 逐成员冻结权重落盘。
-
-SPA 的**推理驱动**（Ar1Driver / LatentStepStream）不在本包：它在
-`backends/spa.py`，由 ONNX 与 PT2 后端共用。
-
-图内噪声幅度（σ × k，原 `noise_scale.py`）已于 2026-10-20 移除——实测无收益
-（`docs/PAPER.md` §3.3.10 的 `ens_k20`）。
-
-造产物没有命令行：改 `spw.py` / `spa.py` 末尾的 `if __name__ == "__main__"`
-里的字面量，直接 `python -m xmetai_inference.weights.spw`（或 `.spa`）。
-推理、探针、产物检查与评测分析仍在 `perturbation/`。
+造产物改各模块末尾 ``if __name__ == "__main__"`` 里的字面量，直接
+``python -m xmetai_inference.weights.spa``（或 ``.spw``）。
 """
 from .spa import (
     DEFAULT_LENGTH_SCALE,

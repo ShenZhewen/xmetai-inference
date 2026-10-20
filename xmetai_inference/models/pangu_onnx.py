@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Pangu-Weather ONNX 模型（官方四档 1h/3h/6h/24h，方案B 用 6h + 24h）。
+"""Pangu-Weather ONNX 模型（方案B：6h 步进 + 24h 跳步）。
 
-图契约（双输入，无 batch 维）：
-  input           (5, 13, 721, 1440)  上层 [Z, Q, T, U, V] × 13 层（1000→50 降序）
-  input_surface   (4, 721, 1440)      地面 [MSLP, U10, V10, T2M]
-双输出同形：上层 + 地面 两个独立张量（不是单一 69 通道张量）。
-物理量进/出：归一化已烘焙进图，不需要 mean/std。
-单位 = ERA5 原生：z=m²/s²（geopotential，非高度）、q=kg/kg（非 g/kg，不 ×1000）、
-t/t2m=K、u/v/u10m/v10m=m/s、msl=Pa。
-网格 lat 90→-90、lon 0→359.75，= 框架 GRID_025（数据层已把 lon 重排到 [0,360)）。
+双输入 input (5,13,721,1440) / input_surface (4,721,1440)，双输出同形；物理量
+进/出，单位 = ERA5 原生（z=m²/s²、q=kg/kg、msl=Pa），网格 = GRID_025。
 
-方案B（对齐官方 ``inference_iterative.py`` 的 28 步循环）：每步（0-based）推 6h；当
-step+1 能被 4 整除（lead 24h/48h/…）时改用 24h 模型从锚点直接跳 24h，锚点初始 =
-起报态、每次跳步后更新；其余步用 6h 模型从当前态推一步。锚点按 init_time 隔离在
-``self._anchors``，``Rollout.run`` 每批开始前经 ``reset_runtime_state`` 清空，避免跨批
-残留。本模型物理量进/出，config 里 ``model_processing`` 全空。
+每 24h（step+1 能被 4 整除）从锚点用 24h 图直接跳，其余步用 6h 图；锚点按 init_time
+存在 _anchors，Rollout.run 每批前清空。config 的 model_processing 全空。
 """
 from __future__ import annotations
 

@@ -2,25 +2,9 @@
 # -*- coding: utf-8 -*-
 """统一推理入口：配置加载、多卡调度、自回归推理与 NetCDF 输出。
 
-推理后端（BaseInferModel）拆到 xmetai_inference.backends 包、各模型子类拆到
-xmetai_inference.models 包，数据源拆到 xmetai_inference.data 包；本文件负责
-读取配置、启动多卡 worker，并完成输出选择、异步写盘和主流程编排。
-
-用法：
-    xmetai-infer --model fuxi_ens
-    xmetai-infer --model fgvp --times 2025010700..2025020500:24
-    python -m xmetai_inference --model fgvp --out /tmp/output --gpus 1
-
-输出目录（集合 members>1）：{out}/{起报目录}/member_{成员3位}/{预测步序号3位}.nc
-输出目录（确定性 members=1）：{out}/{起报目录}/{预测步序号3位}.nc
-00 UTC 起报目录使用 YYYYMMDD；其他时次使用 YYYYMMDDHH，避免同日多时次互相覆盖。
-
-多卡时，主进程使用同一个 inference.py 的内部 --worker 模式启动独立子进程，并通过
-CUDA_VISIBLE_DEVICES 隔离单卡。ONNX Runtime 单个 session 只使用一张卡；加速来自
-把集合成员或起报次数分配给不同进程，不是让单次 forward 跨卡执行。
-
-推理是 step 外层、member 内层：每算完一个 step 的全体成员就异步丢给后台线程
-落盘，GPU 不等磁盘写；netCDF4/HDF5 非线程安全，所以只用一个 writer 线程串行写。
+用法：xmetai-infer --model fgvp --times 2025010700..2025020500:24
+输出 ``{out}/{起报}/member_{成员3位}/{步号3位}.nc``（确定性省掉 member 层）。
+多卡按成员或起报拆子进程；写盘走单个后台线程（netCDF4/HDF5 非线程安全）。
 """
 import argparse
 import gc
@@ -57,12 +41,9 @@ log = logging.getLogger(__name__)
 # 输出（后端无关）
 # ---------------------------------------------------------------------------
 def _output_init_dir(init):
-    """00 UTC 用 YYYYMMDD，其他起报时次保留 YYYYMMDDHH。
+    """00 UTC 用 YYYYMMDD，其他起报时次保留 YYYYMMDDHH，避免同日多时次互相覆盖。
 
-    按天起报（每天 00Z）时目录就是干净的 YYYYMMDD；同日多时次才带上小时，
-    避免互相覆盖。注意：起报间隔混用（如既有 00Z 又有 12Z）会产生 8 位与
-    10 位并存的目录名，下游按目录名解析时要能同时吃两种——
-    util/eval_single_util.py 的 _parse_init_dir 已兼容。
+    起报间隔混用时两种目录名并存，下游按目录名解析要能同时吃 8 位与 10 位。
     """
     init = pd.Timestamp(init)
     if init.hour == 0 and init.minute == 0:
@@ -91,12 +72,7 @@ def _resolve_output_indices(channels, requested):
 
 
 def _select_netcdf_engine():
-    """挑选可用的最快 NetCDF 写引擎：netcdf4 > h5netcdf > scipy（兜底）。
-
-    避免 scipy/NETCDF3——它写大数组极慢且有 2GB/变量上限。注意 xarray 的引擎名
-    是小写，但 Python 导入名大小写不同（netCDF4 大写 F、h5netcdf 全小写），
-    探测要按导入名来。返回 (engine, netcdf_format)。
-    """
+    """挑选可用的最快 NetCDF 写引擎：netcdf4 > h5netcdf > scipy（兜底）。"""
     for eng, import_name in (("netcdf4", "netCDF4"), ("h5netcdf", "h5netcdf")):
         try:
             importlib.import_module(import_name)
@@ -112,8 +88,8 @@ class _AsyncWriter:
 
     def __init__(self, save_dir, atomic=True):
         self.save_dir = save_dir
-        # 先写隐藏临时名再 os.replace 原子改名：下游（评测、enscheck、别的 worker）
-        # 永远读不到半个文件。前导点让 `*.nc` 通配不会把半成品当产物。
+        # 先写隐藏临时名再 os.replace 原子改名：下游永远读不到半个文件，
+        # 前导点也让 `*.nc` 通配不会把半成品当产物。
         self.atomic = bool(atomic)
         self.q = queue.Queue(maxsize=2)
         self.errors = []
@@ -130,8 +106,7 @@ class _AsyncWriter:
             path = os.path.join(self.save_dir, fname)
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                # 不压缩（与参考实现最终结论一致）：zlib 压缩 281MB/步耗时数秒，
-                # 裸写 ~500MB/s，推理不等磁盘；引擎用 netcdf4 避免 scipy/NETCDF3 慢路径。
+                # 不压缩：zlib 压缩单步要数秒，裸写 ~500MB/s，推理不必等磁盘。
                 target = path
                 if self.atomic:
                     target = os.path.join(
@@ -158,11 +133,9 @@ class _AsyncWriter:
                 self.q.task_done()
 
     def flush(self):
-        """阻塞直到队列里所有待写文件都落盘完成。
+        """阻塞直到待写文件全部落盘。
 
-        关键：netCDF4/HDF5 非线程安全。写线程在写输出 NetCDF 时，若主线程同时
-        读下一轮起报的输入 NetCDF，两个线程并发访问 HDF5 会触发 C 层段错误。
-        所以进入下一个 build_input 前必须先 drain 写队列，让读写彻底串行。
+        写输出 NetCDF 时主线程若并发读输入 NetCDF，HDF5 会段错误；必须让读写串行。
         """
         self.q.join()
 
@@ -334,9 +307,7 @@ def _run_infer(cfg, overrides):
         log_files.append(log_file)
 
     status = 0
-    # 主进程心跳：rank 的日志全在各自文件里（--no-console-log），没有心跳的话
-    # 控制台在 spawn 完到全部退出之间一行不出，看起来像冻住。每 30 秒报一次
-    # 还有哪些 rank 活着、已运行多久。
+    # 主进程心跳：rank 日志在各自文件里，每 30 秒报一次存活情况，避免控制台像冻住。
     from time import sleep as _sleep
 
     from xmetai_inference.backends.base import _fmt_dur as _fmt_dur_main
@@ -348,8 +319,7 @@ def _run_infer(cfg, overrides):
         statuses = [
             (rank, process.poll()) for rank, process in enumerate(processes)
         ]
-        # rank 一死立刻报告（含退出码与日志路径），不等全部结束——OOM kill 是
-        # SIGKILL，rank 自己的日志戛然而止，主进程这里是唯一的告警点。
+        # rank 一死立刻报告：OOM kill 是 SIGKILL，rank 自己的日志会戛然而止。
         for rank, code in statuses:
             if code is None or rank in reported:
                 continue
@@ -474,11 +444,9 @@ def _fmt_index_ranges(indices):
 
 
 def _graph_member_split(members, graphs):
-    """把 members 个成员摊到 graphs 份扰动图上：均分 + 余数给前面的图。
+    """把 members 个成员均分到 graphs 份扰动图上（余数给前面的图），每份非空。
 
-    集合模型 + 权重扰动（config 的 perturb_graphs）用：成员 m = 第 g 份冻结权重 x
-    该图 session 内的第 j 次前向。返回 [(graph_id, [全局成员号...]), ...]，长度 =
-    graphs、每份非空。例：members=51, graphs=5 -> 11 + 10 + 10 + 10 + 10。
+    成员 m = 第 g 份冻结权重 × 该图 session 内的第 j 次前向。返回 [(graph_id, [成员号])]。
     """
     if graphs < 1:
         raise ValueError(f"graphs 必须 >= 1，拿到 {graphs}")
@@ -496,19 +464,16 @@ def _graph_member_split(members, graphs):
 def _prepare_member_set(src, spec, count, member_indices, local_rank, world_size):
     """m1a：生成本 rank 那一份成员，然后等齐本 rank 要跑的那些成员。
 
-    分片（``range(rank, count, world_size)``）必须互不相交：`perturbed.mNNN.data` 是直接以
-    "wb" 打开的，两个 rank 同时造同一个成员会写出交错的字节（不报错，只是权重错）。
-    cli 对集合强制「members >= 卡数时按成员切」，正常情况下本 rank 要跑的就是本 rank
-    造的那一份，不会有等待；只有成员比卡还少时才会等别的 rank 把剩下的造完。
+    分片 ``range(rank, count, world_size)`` 必须互不相交：成员文件是直接 "wb" 打开的，
+    两个 rank 同时造同一个成员会写出交错字节且不报错。
     """
     # 惰性导入：backends.base 顶层 import torch，而 --help / 配置清单这条路不该被拖上 torch。
     from xmetai_inference.backends.base import _fmt_dur
     from xmetai_inference.weights.spw import build_member_set, member_exists
 
     shard = list(range(local_rank, count, world_size))
-    # 只造本 rank 分片里**还不在盘上**的那些。build_member_set 是确定性的（同名即同内容），
-    # 但它不做存在性检查就直接重写 perturbed.mNNN.data——所以这里必须自己过滤，否则「先造 5 个
-    # 再补到 51」会把已有的 5 个白算一遍（FGVP 上每组几十 GB 的读写）。
+    # 只造本 rank 分片里还不在盘上的：build_member_set 不查存在性就直接覆盖，
+    # 不过滤会把已有的成员重算一遍（每组几十 GB 的读写）。
     todo = [i for i in shard if not member_exists(src, spec, i)]
     if todo:
         t0 = perf_counter()
@@ -539,11 +504,7 @@ def _prepare_member_set(src, spec, count, member_indices, local_rank, world_size
 
 
 def _pool_summary(model):
-    """常驻 session 池的计数摘要（收尾日志用）。
-
-    只有 ONNX 后端的 m1a 会真的往池子里放第二份 session（一份 session 服务全部成员时
-    没有第二份可驻留），别的后端返回空串，让调用方把日志拼成一句。
-    """
+    """常驻 session 池的计数摘要（收尾日志用）；没有新建过 session 时返回空串。"""
     stats = getattr(model, "pool_stats", None)
     if stats is None:
         return ""
@@ -560,17 +521,9 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
                       world_size):
     """m1a 的集合编排：成员在外层、数据集在内层（每个成员把数据集走一遍）。
 
-    为什么成员要在外层：m1a 的成员不是「同一 session 里的另一条轨迹」，而是另一份
-    onnx 权重。51 个 session 同时驻留会按 ~3 GB/份吃光显存，所以缺省一次只挂一个成员
-    （config 的 resident_members=1，跑完立即释放）；显存够大就把 resident_members 调大，
-    池子按 LRU 留 N 份，换回来时不重建 session、不重预热 cuDNN。代价是把数据集迭代
-    len(member_indices) 遍——相对于一遍的算力，每遍的装载 IO 很小；而且 Rollout 本来
-    就是逐轨迹 batch=1 前向，「成员内层」并不会因为批起来而更快，所以这个换法不损失
-    吞吐。
-
-    成员内的循环体与非集合的确定性路径逐字相同（同样是一次 Rollout 跑完整个 batch 的
-    起报），区别只在输出落到 member_<NNN>/ 子目录——所以下游的产物体检（enscheck）和
-    评测脚本不需要区分 m3 / m1a。
+    每个成员是另一份冻结权重（另一个 session），同时驻留多份会吃光显存，
+    所以缺省一换一放（resident_members）；调大则按 LRU 常驻，省去重建与 cuDNN 预热。
+    成员内循环与非集合路径相同，输出只落到 member_<NNN>/ 子目录。
     """
     from xmetai_inference.backends.base import _fmt_dur
 
@@ -591,11 +544,7 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
 def _run_member_block(model, processors, dataset_source, writer, args, init_times,
                       member_indices, save_names, lat, lon, interval, local_rank,
                       world_size, model_batch=1):
-    """成员外层的一段编舞 = 上面那个「成员循环」本身（不含收尾的 close 与总结）。
-
-    逐成员跑完 ``member_indices``（每个成员一份冻结权重，进来前先 load），逐帧写盘并
-    flush。调用方负责开跑前的准备与跑完的收尾。
-    """
+    """逐成员跑完 member_indices：每人先 load，再逐 batch 走一遍数据集并 flush。"""
     from xmetai_inference.backends.base import _fmt_dur
     from xmetai_inference.runner import Rollout, Trajectory
 
@@ -665,17 +614,10 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
 def _run_graph_outer(model, processors, dataset_source, writer, args, init_times,
                      graph_members, save_names, lat, lon, interval, local_rank,
                      world_size, num_workers=0, model_batch=1):
-    """集合模型 + 权重扰动（G 图 x J 成员）的编舞：扰动图在外层，图内成员在内层。
+    """集合模型 + 权重扰动的编舞：扰动图在外层，图内成员在内层。
 
-    与 m1a 的成员外层（每成员一份权重、一次一条轨迹）不同：这里的成员来自集合图
-    **图内随机算子**（同一 session 里的一次前向 = 一个成员），权重扰动只提供 G 条
-    独立轴（每图一份冻结权重）。每份扰动图：load -> 复用 _run_plain_block 的
-    members>1 分支（该图的 J 个成员 = 一次 Rollout 的 J 条轨迹，输出落
-    member_<全局号>）-> release。多卡按图切（每个 rank 领 range(rank, G, 卡数)），
-    所以各图的成员永远在同一进程的同一 session 里，不跨进程。
-
-    model.member_index 在此路径下是**图号**（m1a 的 spw.member 自检用的就是它），
-    与全局成员号无关 —— 全局成员号只决定输出目录。
+    每份扰动图 load 后复用 _run_plain_block 的 members>1 分支；多卡按图切。
+    model.member_index 在此路径下是图号，全局成员号只决定输出目录。
     """
     from xmetai_inference.backends.base import _fmt_dur
 
@@ -717,10 +659,8 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
                      total_inits, num_workers=0, model_batch=1):
     """确定性 / 同 session 集合的一段编舞：数据集在内层遍历，逐 batch 落盘并 flush。
 
-    与 m1a 的成员外层相反：这里的「成员」是同一次 Rollout 里的多条轨迹（m3 的图内随机
-    算子、或 latent_forcing 的潜空间强迫），一份 session 服务全部成员。members==1 时
-    每个起报一条轨迹、输出落 ``{起报}/{步号}.nc``；members>1 时每个成员一条轨迹、输出落
-    ``{起报}/member_{成员3位}/{步号}.nc``。返回跑完的起报条数。
+    members==1：每起报一条轨迹，输出 ``{起报}/{步号}.nc``；members>1：每成员一条轨迹，
+    输出 ``{起报}/member_{成员3位}/{步号}.nc``。返回跑完的起报条数。
     """
     from xmetai_inference.backends.base import _fmt_dur
     from xmetai_inference.runner import Rollout, Trajectory
@@ -738,9 +678,7 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
             log.info("首个 batch 就绪：state 形状 %s，装载+前处理耗时 %s",
                      tuple(state.shape), _fmt_dur(fetch_dur))
 
-        # 确定性（members==1）：每个起报一条轨迹，一次 Rollout 跑完整个 batch。
-        # 集合（members>1）：每个起报单独一次 Rollout，成员即轨迹。
-        # 两者用的是同一个循环，区别只在「轨迹怎么构造」和「输出落到哪」。
+        # 确定性：一次 Rollout 跑完整个 batch；集合：每个起报一次 Rollout，成员即轨迹。
         if members == 1:
             def on_batch_step(step, step_state, batch_inits=batch_inits):
                 step_idx = step + 1
@@ -793,9 +731,8 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
                             raw=(step_state[local_index], step, init),
                         )
 
-                # 成员即轨迹：全部共享同一初始态（扰动来自图内随机算子），
-                # init_time 相同。多卡按成员切时 member_indices 已是本 rank
-                # 自己那份，所以这里只造本 rank 的轨迹。
+                # 成员即轨迹：共享同一初始态（扰动来自图内随机算子）；
+                # member_indices 已是本 rank 那部分。
                 Rollout(model, processors).run(
                     [
                         Trajectory(
@@ -809,10 +746,8 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
                     hour_interval=interval,
                     model_batch=model_batch,
                 on_step=on_step,
-                # 这一个 Rollout 要跑「51 成员 x 60 步」约 3000 次前向（几十分钟），
-                # 关掉进度行等于全程零日志 —— 连首步那条「含 cudnn 穷举搜索、偏慢属正常」
-                # 的提示也一起没了（这条正是为长任务写的，别处成员外层有逐成员日志兜着）。
-                # 逐轨迹的进度行本身是稀疏的（每 5 步一行 + 首步必打），不会刷屏。
+                # 一次 Rollout 几十步 × 全部成员，关掉进度行会全程零日志；
+                # 逐轨迹进度本身稀疏（每 5 步一行），不会刷屏。
                 progress=True,
                 progress_label=f"[rank {local_rank}/{world_size}] {init:%m%d%H}",
                 )
@@ -895,9 +830,7 @@ def _worker_main(argv=None):
 
     # 每个 worker 重新加载同一 config，确保外部 Model/Dataset 在多进程中可用。
     worker_cfg = load_config(args.config_source)
-    # 常驻 session 池的额度（只对 m1a 有意义）。优先级：worker 参数（主进程从 config
-    # 传下来）> config > 1（一换一放）。0 / 缺省在 normalize_budget 里归一到 1，负数
-    # = 不限 —— 显存够大就让成员 session 全常驻，换回来时不重建、不重预热 cuDNN。
+    # 常驻池额度优先级：worker 参数 > config > 1；负数 = 不限。
     resident_members = normalize_budget(
         args.resident_members if args.resident_members is not None
         else getattr(worker_cfg, "resident_members", 1))
@@ -921,19 +854,14 @@ def _worker_main(argv=None):
 
         perturb_spec = WeightPerturbSpec.from_config(worker_cfg.weight_perturb)
     if perturb_spec is not None:
-        # 权重扰动把确定性模型变成集合，这里按集合语义检查成员数。两种机制的「成员」
-        # 含义不同：m3 = 同一 session 里同一初始态的 N 条轨迹（扰动来自图内随机算子）；
-        # m1a = N 份冻结权重，每个成员本身就是一次普通的确定性推理。
+        # 权重扰动把确定性模型变成集合。m3 的成员是同一 session 里的 N 条轨迹；
+        # m1a 的成员是 N 份冻结权重。
         forecast_type = "ensemble"
     if worker_cfg.latent_forcing:
-        # 潜空间 AR(1) 强迫同样把确定性模型变成集合：成员之间的差别来自每步喂进去的 xi
-        # （种子由 member_index 决定），所以同一份图服务全部成员，不必落盘 51 份权重。
-        # 这里只声明语义；真正的校验（图里必须有 spw/xi）在 create_model / load 里做。
+        # 潜空间强迫同样出集合：成员差异来自每步喂入的 xi，同一份图服务全部成员。
         forecast_type = "ensemble"
     members = args.members if args.members is not None else getattr(cls, "members", 1)
-    # 集合模型 + 权重扰动（perturb_graphs）：成员 = 扰动图 x 图内随机，走图外层编舞
-    # （_run_graph_outer）。只对图内随机的集合模型类有意义 —— 确定性模型的成员
-    # 只能来自权重本身（m1a 的成员外层），配了这里直接拦下。
+    # 集合 + perturb_graphs：成员 = 扰动图 × 图内随机，走图外层编舞。
     n_graphs = int(getattr(worker_cfg, "perturb_graphs", 0) or 0)
     graph_outer = perturb_spec is not None and n_graphs > 0
     if graph_outer:
@@ -961,23 +889,15 @@ def _worker_main(argv=None):
                     cls.__name__, members)
     init_times = _init_times(args, interval)
 
-    # 多卡分工：把「起报时间 × 成员」的任务摊给各卡，有两种切法——
-    #   按起报切：每个 rank 跑一部分起报、全部成员；
-    #   按成员切：每个 rank 跑一部分成员、全部起报。
-    # 均衡上两种切法通常只差几个百分点，但内存上差异巨大：Rollout 给每条轨迹
-    # 持有独立 state 拷贝（~645MB/条），按起报切每卡要挂全部 members 条
-    # （51 成员 ≈ 33GB/卡），按成员切只挂 ceil(members/world_size) 条
-    # （4 卡 51 成员 ≈ 8GB/卡）。实测按起报切曾把 pod 的 cgroup 内存限额顶穿、
-    # 两个 rank 被 OOM kill（SIGKILL，rank 日志无 traceback 直接断）。
-    # 故集合（members>1 且成员数 ≥ 卡数）优先按成员切；members < 卡数时按成员
-    # 切会有卡分不到任务，退回均衡比较。确定性（members==1）本就只能按起报切。
+    # 多卡分工有两种切法：按起报切（每 rank 跑部分起报、全部成员）或按成员切。
+    # Rollout 给每条轨迹持有一份 ~645MB state，按起报切会让每卡挂全部成员
+    # （51 成员 ≈ 33GB/卡，实测 OOM）；集合优先按成员切，成员少于卡数时才退回。
+    # 确定性（members==1）只能按起报切。
     n_init = len(init_times)
     graph_members = None
     if graph_outer:
-        # 图外层：按**图**切（每个 rank 领 range(rank, G, 卡数) 那几份图、跑全部起报）。
-        # 不走按成员切 —— 一份图的 J 个成员必须在同一进程的同一 session 里连跑，
-        # 拆到不同进程会把「图内第 j 次前向」这个成员身份打散（fgvp_ens 头部的
-        # 待验怀疑：不同 session 的随机序列逐位相同 -> 拆散后成员会重复）。
+        # 图外层按图切：一份图的 J 个成员必须在同一 session 里连续前向，
+        # 拆到不同进程会把图内成员身份打散。
         graph_members = [entry for entry in _graph_member_split(members, n_graphs)
                          if entry[0] % world_size == local_rank]
         if not graph_members:
@@ -1006,10 +926,7 @@ def _worker_main(argv=None):
             member_indices = list(range(local_rank, members, world_size))
             member_start, member_stride = local_rank, world_size
 
-    # 扰动档的「成员」是各自一份冻结权重（= 各自的 onnx session），所以成员必须在外层
-    # 循环、数据集在内层；这样任何时刻只有 1 个 session 驻留。详见 _run_member_outer。
-    # 图外层（集合模型 + perturb_graphs）不在此列：它的外层是扰动图不是成员，走
-    # _run_graph_outer，复用 _run_plain_block 的「一 session x 多轨迹」。
+    # m1a：成员是各自一份冻结权重，必须成员外层、数据集内层，保证同时只驻留少量 session。
     member_outer = perturb_spec is not None and not graph_outer
 
     if not init_times:
@@ -1085,17 +1002,14 @@ def _worker_main(argv=None):
         _prepare_member_set(args.model, perturb_spec, members, member_indices,
                             local_rank, world_size)
     elif graph_outer:
-        # 图外层：成员集只有 n_graphs 份（每图一份冻结权重），「成员号」= 图号。
-        # 造完本 rank 分到的那几份，缺的等其它 rank（与 m1a 同一套分片协议）。
+        # 图外层：成员集只有 n_graphs 份（每图一份权重），成员号 = 图号。
         _prepare_member_set(args.model, perturb_spec, n_graphs,
                             [g for g, _ in graph_members], local_rank, world_size)
     log.info("加载模型：class=%s backend=%s device=%d CUDA_VISIBLE_DEVICES=%s path=%s",
              model_name, model.backend, device_id,
              os.environ.get("CUDA_VISIBLE_DEVICES"), args.model)
     if member_outer:
-        # m1a：每个成员一套权重，真正的 load 在下面成员循环里逐个做。
-        # resident_members 决定同时驻留几份 session：1 = 一换一放（小显存口径，与改造前
-        # 逐位相同的资源行为）；N > 1 = 池子留 N 份，换回来不再重建、不再重新预热 cuDNN。
+        # m1a：每个成员一套权重，真正的 load 在成员循环里逐个做。
         pool_desc = ("1 份（一换一放）" if resident_members == 1
                      else ("不限（全常驻）" if resident_members < 0
                            else "%d 份" % resident_members))

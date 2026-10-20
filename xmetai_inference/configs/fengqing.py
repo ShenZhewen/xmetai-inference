@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""FengQing V1.5Beta (pre-normalized ONNX) 确定性推理配置。
+"""FengQing V1.5Beta（归一化前移）确定性推理配置。
 
-输入来自 era5_foundation_store2 的 pl + sfc（6h Zarr）；tp 走补充 store（6h 累积 m，
-unit_convert ×1000 转 mm）。输入归一化在数据层，ONNX 图出归一化残差，反演留在模型类
-（需要上一帧 + residual std），故 model_processing 只留输出端 denormalize。
+tp 走补充 store（6h 累积 m，×1000 转 mm）。输入归一化在数据层，图出归一化残差，
+反演在模型类内（需上一帧 + residual std），故 processing 只留输出端 denormalize。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 

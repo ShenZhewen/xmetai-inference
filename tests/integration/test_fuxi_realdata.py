@@ -1,17 +1,9 @@
 # -*- coding: utf-8 -*-
 """fuxi（fuxi21 / FuXi-2.1）真实数据档：真 .pt2 在切片数据上跑一遍，和标准答案对拍。
 
-配方是 ``configs/fuxi21.py`` 的 deepcopy 派生，落成临时 ``.py`` 喂 CLI，只覆盖
-fixture 特有项；mean.nc/std.nc 按模型所在目录解析，跟着模型过去。
-
-判 PASS 两层（fuxi2.1 在 GPU 上不可逐位复现）：第 1 步（``STRICT_STEP``）按变量判档
-—— 地面 CLOSE（理应逐位一致，红就是真回归），高空放宽到 DRIFT（差异只在高空通道，
-0.1~0.2% 场变率）；第 2 步起第 1 步的噪声经 ``state=result`` 回填污染**全部**通道，
-紧门槛必红，故全部步只挂灾难线 ``CATASTROPHE_STD_LIMIT``：max|diff| 超场变率一半
-即红（实测噪声最坏 0.29，0.5 留余量；回填 / zero_channels 级别的回归远在线外）。
-
-第 1 步全变量就偏 ⇒ 前处理（单位换算 / mean.std 归一化）或时间条件的问题。
-golden 出处记在 golden/PROVENANCE.md；确定性档 ``{YYYYMMDD}/{NNN}.nc`` 平铺。
+配方是 configs/fuxi21.py 的 deepcopy 派生，只覆盖 fixture 特有项。fuxi2.1 在 GPU 上
+不可逐位复现：第 1 步按变量判档（地面 CLOSE、高空 DRIFT），第 2 步起噪声经回填扩散到
+全部通道，只挂灾难线；第 1 步全变量就偏 ⇒ 前处理或时间条件的问题。
 
 跑法：pytest -m realdata tests/integration/test_fuxi_realdata.py
 """

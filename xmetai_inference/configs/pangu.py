@@ -1,16 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Pangu-Weather 确定性推理（方案B：6h 步进 + 24h 跳步）。
+"""Pangu-Weather 确定性推理（6h 步进 + 24h 跳步，实现在模型类内）。
 
-模型契约见 models/pangu_onnx.py 模块 docstring（双输入上层 5×13 + 地面 4 通道、
-物理量进/出、图内归一化、q=kg/kg 不 ×1000、z=m²/s² geopotential、网格 = GRID_025）。
-
-数据源 = era5_foundation_store2 的 pl + sfc，**没有** tp 补充 store（Pangu 无降水
-通道）；dataset.processors 只留 geometry（lon 从 [-180,180) 重排到 [0,360)）。
-
-方案B 由模型类在 forward 内实现（step 粒度 6h，第 4 步起用 24h 模型从锚点跳），故这里
-的 steps 是 6h 步数，不是 24h 步数。
-
-License：BY-NC-SA 4.0，商用禁止（见 model_artifacts/Pangu-Weather-main/README.md）。
+故这里 steps 是 6h 步数。数据源为 pl + sfc，无 tp 通道；模型契约见
+models/pangu_onnx.py。
+License：BY-NC-SA 4.0，商用禁止。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 

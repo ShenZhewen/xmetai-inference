@@ -1,67 +1,13 @@
 # -*- coding: utf-8 -*-
-r"""fgvp_spw：**确定性模型 + SPW（权重扰动）** 的标准档 —— 完整自包含。
+r"""fgvp_spw：确定性模型 + SPW（权重扰动，m1a）的标准档。
 
-SPW 有两种用法，本文件是第一种：
-
-  1) **确定性模型 + SPW**（m1a，成员在外层，本文件）
-     扰动 N 份权重 = N 个成员；每份冻结权重要跑完全部起报，每个起报只出 1 条
-     轨迹，一个成员就是一份 onnx。本档 N = ``MEMBERS`` = **51**。
-
-  2) **集合模型 + SPW**（图在外层）
-     成员 = n 份扰动图 x 每份图跑 M 次前向 = n x M，见 ``configs/fgvp_ens_spw.py``。
-     那条路要求模型类 ``forecast_type="ensemble"``，确定性模型配 ``perturb_graphs>0``
-     会直接报错 —— 所以本文件显式写 ``perturb_graphs=0``。
-
----- 配方：S2B，逐字段与 ``fgvp_spw_prod_s2b.py`` 相同 ----
-
-  groups="latent_mixer" + noise_struct="channel" + sigma_full=0.027 + seed=0。
-  这是五轮实验里唯一「两头都不输」的配置（细节与判据见那份 config 的文件头 /
-  perturbation/README 2F 节）。**不要为了不重建权重去改这些字段以外的写法**：
-  groups / sigma_full / balance / exclude / include / min_elements / seed /
-  noise_struct / 源 .onnx 的 size/mtime 都在 ``weights.spw`` 的指纹里。
-
-  指纹一致 ⇒ **直接复用 S2B 那套已落盘的 51 个成员**（member_dir 相同、
-  源模型相同），不重造。反过来，换 ``model_path`` / ``ops_library`` 指向的源文件
-  会改指纹 ⇒ 重造 51 x ~1.49 GB ≈ 76 GB，还要重跑成员权重复现性检查。
-
----- 与生产档 ``fgvp_spw_prod_s2b`` 的差别（只有跑法，没有扰动规格）----
-
-  * 时段：标准两季窗口 —— 夏季 20250702-0730（29 起报）+ 冬季 20251101-1130
-    （30 起报）= **59 起报**。评测侧必须同步；
-  * 4 卡（s2b 是 2 卡），成员按 rank 切 13/13/13/12；
-  * 输出目录另开（``fgvp_spw_std``），与 s2b 的产物、计划标记互不干扰；
-  * ``model_batch=1``：m1a 是「成员外层、起报在内层」，这里批的是**起报**。
-    s2b 的生产跑没有开它；GDN2 这张图的 batch 轴是否是符号维没有核过
-    （后端 load 时实测，静态就 WARNING 退回 1）。要提速先确认动态 batch 再改。
-  * dataloader 收到 2 x 2（s2b 是 4 x 4）：4 个 worker 进程各带一套预取队列，
-    每条样本约 645 MB，4 x 2 x 4 的队列在 4 卡并发下会把主机内存吃满。
-
----- 预算 ----
-
-  输出：59 x 51 x 60 x 20.8 MB ≈ **3.8 TB**（5 变量 z500/u200/v200/msl/tp）。
-  成员权重：复用 S2B 已有集合则不新增；缺失时 51 x 1.49 GB ≈ 76 GB。
-  前向次数：59 x 51 x 60 = 180 540。
-
----- 跑法（服务器）----
-
-    cd /workspace/szwCode/xmetai-inference2
-    nvidia-smi -L                      # 确认真实可见卡号与 cuda_devices 一致
-
-    # smoke：1 起报 / 3 成员 / 6 步，务必给 --out（否则会写进正式目录）
-    xmetai-infer --model fgvp_spw --times 2025070200 --members 3 --steps 6 \
-        --gpus 1 --cuda-devices 0 --out /tmp/smoke_spw
-
-    # 正式
-    xmetai-infer --model fgvp_spw
+扰动 N 份权重 = N 个成员，每个成员是独立 onnx；成员集按指纹复用 S2B 那套。
+配方与 fgvp_spw_prod_s2b.py 一致，本档只改时段 / 卡数 / 输出目录。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
-# ---------------------------------------------------------------------------
-# 路径（服务器上的固定位置，直接改这里）
-# ---------------------------------------------------------------------------
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
-# 源确定性图 + 插件（只读）。**这两个路径进成员指纹**：与 S2B 生产档逐字相同，
-# 才能认回已有的 51 个成员；挪文件 = 改 size/mtime = 整份重造。
+# 源确定性图 + 插件（只读），这两个路径进成员指纹：与 S2B 一致才能认回已有成员。
 MODEL_DIR = "/workspace/tmp/douzsh/models"
 SRC_GRAPH = f"{MODEL_DIR}/iwc_fgvp_gdn2.onnx"
 OPS_LIBRARY = f"{MODEL_DIR}/xmetai_onnx_plugins.so"
@@ -158,8 +104,7 @@ cfg = InferConfig(
     cudnn_algo_search="",
     # m1a 下批的是起报；GDN2 图的 batch 轴未核，保持生产档的逐条前向。
     model_batch=1,
-    # 成员外层 + claim_order=member：同一时刻每个 rank 只有一个成员是活的，
-    # 池子只需要一个余量槽（s2b 的实测结论，见那份 config）。
+    # 一时刻只活一个成员，池子只需要一个余量槽。
     resident_members=2,
     gpu_mem=0.9,
     # 新时段 / 新成员编排，另开目录，避免与 s2b 的 resume 计划串档。

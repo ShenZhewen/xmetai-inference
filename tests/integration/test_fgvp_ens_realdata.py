@@ -1,25 +1,10 @@
 # -*- coding: utf-8 -*-
 """fgvp_ens 真实数据档：真 51 成员集合 ONNX 在切片数据上跑一遍，和标准答案统计对拍。
 
-除链路端到端外还要证明**集合语义没坏**（扰动在触发、成员互异、spread>0）：FGVP 集合
-的扰动路径静默死了照样全绿，确定性档发现不了。逐成员对拍在原理上不成立（扰动是图内
-随机算子、无 seed）；golden 是 8 卡正式跑的 51 成员，接近独立采样。
-
-判 PASS 三层：
-  * 确定性层：51 成员 × 步 × 配方声明变量的覆盖面、NaN 掩码、网格与 golden 一致；
-  * 集合层：成员互异、逐变量 spread>0、集合均值对拍 —— 阈值从 golden 自身标定：
-    两次独立 51 成员采样的均值差 ~ N(0, σ·√(2/51))，超 4 倍预测噪声记违规点，违规
-    占比 ≤ 1e-3（与 ``EXCEED_FRACTION_CLOSE`` 同档）；σ≈0 的确定性格点回落 RTOL/ATOL。
-    **tp 例外**：零膨胀重尾让 4σ 线的实测越线率达 0.6~0.7%（其余变量最高 2.6e-4，
-    符合高斯预期），tp 的占比线放宽到 ``_FAIL_FRACTION`` 的 0.05 —— 真实回归会让
-    降水区整片越线（百分之几十），与噪声仍隔一个量级。
-  * 批量化层：配方显式给 ``model_batch=6``（一次 forward 堆 6 条成员轨迹）。随机算子
-    若按 (1,...) 出噪声再 broadcast 到 batch 维，k 行拿到同一份扰动、成员互异用例
-    立刻红。批量化是否真进图另有一条用例盯 rank 日志：图不是动态 batch 轴时 runner
-    会打一条 WARNING 退回 1（这一趟照跑完，其余用例照样全绿，却跟批量化毫无关系）。
-
-成员目录 0 基（``member_000..050``）。golden 必须挑 fgvp_ens_merged **新 .so 批次**
-（20250721 起）的完整日期 —— 批次混杂，旧批均值对拍可能真红。
+逐成员对拍不成立（图内随机无 seed），故对集合均值：阈值按两次独立 51 成员采样的噪声
+√(2/51)·σ 自标定，超 4σ 记违规点。**tp 例外**：零膨胀重尾让实测越线率达 0.6~0.7%，
+占比线放宽到 0.05（真实回归会让降水区整片越线，仍隔一个量级）。批量化层另有用例盯
+rank 日志，防止 model_batch>1 静默退回 1。
 
 跑法：pytest -m realdata tests/integration/test_fgvp_ens_realdata.py
 """
@@ -51,7 +36,7 @@ DATA_ROOT = Path("/workspace/data/shenzw/inference_test_data/fgvp_ens_test_data"
 #: 本档自己的切片 store（fgvp 档的切片只覆盖 20250102，golden 归档没有那天）。
 DATASET_ROOT = DATA_ROOT / "dataset"
 
-#: 被检 ONNX：iwc_gssp_im = fgvp_ens 现役图（20261008 导出，与仓库配方同源）。
+#: 被检 ONNX：iwc_gssp_im = fgvp_ens 现役图（与仓库配方同源）。
 ONNX_NAME = "iwc_gssp_im.onnx"
 
 #: ONNX 外部权重（ORT 从 .onnx 同目录读，缺了加载即崩，必须一起自检）。

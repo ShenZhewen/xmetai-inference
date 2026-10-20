@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
-"""模型侧处理管线：Dataset batch 透传、自回归回填与输出反变换。
+"""模型侧处理管线：自回归回填（recurrent）与输出反变换（output）两个阶段。
 
-只有两个阶段：
-  recurrent（回填）—— 自回归循环 state=result 回填前执行（如诊断通道清零）
-  output（输出）  —— 落盘前把模型工作空间还原成物理量（denormalize）
-
-热路径全程 torch tensor，不做 numpy 往返；numpy 只保留在归一化统计量加载和
-最终 xarray/netCDF 落盘等边界处。
+热路径全程 torch tensor，numpy 只用于统计量加载和最终落盘。
 """
 import logging
 import os
@@ -146,13 +141,10 @@ class Denormalize(_ArrayStatsProcessor):
 
 @register("denormalize_fengqing")
 class DenormalizeFengqing(Processor):
-    """FengQing 归一化空间 → 物理量（与数据层 ``normalize_fengqing`` 互逆）。
+    """FengQing 归一化空间 → 物理量（与数据层 normalize_fengqing 互逆）。
 
-    统计量与 ``Denormalize`` 的 mean.nc/std.nc 不同构：
-      * mean 逐像素（65,H,W）/（5,H,W），不是每通道标量；std 逐通道（65,1）/（5,1）；
-      * upper 与 surface 分两套文件（upper_mean/upper_std、mean_pre/std_pre）。
-
-    只做 ``x·std + mean``；tp 的非负钳位在模型 forward 里完成，这里不重复。
+    mean 逐像素、std 逐通道，upper/surface 分两套文件；只做 x·std + mean，
+    tp 的非负钳位在模型 forward 里完成。
     """
 
     stage = "output"
@@ -211,11 +203,8 @@ class DenormalizeFengqing(Processor):
 class ZeroChannels(Processor):
     """自回归回填前把指定诊断通道置成**归一化空间的 0**（不是物理量清零）。
 
-    对齐官方预归一化 input.nc（其中 ssr/ssrd/fdir/ttr/tp 在归一化空间精确为 0），
-    所以必须写字面 0.0 —— 改成「物理清零」会偏离官方行为。fuxi21 下 tp 的
-    mean=0/std=1 且输入侧 log1p 过，归零恰好同时是物理 0；辐射
-    ssr/ssrd/fdir/ttr 的 mean/std 量级 600~1400（6h Wh/m²），归一化 0 对应的
-    物理量是 mean（气候态均值）。
+    对齐官方预归一化 input.nc（ssr/ssrd/fdir/ttr/tp 在归一化空间精确为 0），
+    必须写字面 0.0，改成「物理清零」会偏离官方行为。
     """
 
     stage = "recurrent"
@@ -255,10 +244,8 @@ def build_pipeline(input_specs, model_cls, data_source, model_path=None,
                    recurrent_specs=None, output_specs=None):
     """config 的 Processor 列表 → ProcessingPipeline（recurrent + output 两阶段）。
 
-    ``input_specs``（``model_processing.input``，旧配置的 ``pre_processors``）
-    **必须为空**：输入侧前处理由 dataset.processors 在 DataLoader worker 里完成。
-    该参数只为误配时报错保留，不是可用的扩展点。recurrent/output 每项是处理器名
-    （字符串）或 ``{name: str, ...kwargs}``，缺省为空。
+    input_specs（model_processing.input / 旧 pre_processors）必须为空：输入侧前处理
+    由 dataset.processors 在 DataLoader worker 里完成，该参数只为误配时报错保留。
     """
     if input_specs:
         raise ValueError(

@@ -1,73 +1,12 @@
 # -*- coding: utf-8 -*-
-r"""fgvp_ens_spw：**集合模型 + SPW（权重扰动）** 的标准档 —— 完整自包含。
+r"""fgvp_ens_spw：集合模型 + SPW（权重扰动）的标准档。
 
-SPW 有两种用法，本文件是第二种：
-
-  1) **确定性模型 + SPW**（m1a，成员在外层）
-     扰动 N 份权重 = N 个成员；每份冻结权重要跑完全部起报，每个起报只出 1 条
-     轨迹，一个成员就是一份 onnx。见 ``configs/fgvp_spw_prod_s2b.py``（N=51）。
-
-  2) **集合模型 + SPW**（图在外层，本文件）
-     集合图自带图内随机算子，同一份权重每次前向给一个不同样本，所以：
-
-         成员 = n 份扰动图 x 每份图在同一 session 里跑 M 次前向 = n x M
-
-     本档 n = ``PERTURB_GRAPHS`` = 8、M = ``RUNS_PER_GRAPH`` = 6 -> **48 成员**。
-     成员 m 的权重身份是 g = m // M，图内序号 j = m % M。同一份图的 M 个成员
-     必须在同一进程的同一 session 里连跑（``cli._run_graph_outer``），不能按
-     成员拆到不同进程——否则图内随机算子按「worker 内第几次前向」对齐的序号
-     就断了。
-
----- 为什么取 8 x 6 ----
-
-  * 8 份图 / 4 卡 = 每卡 2 份图；每卡每起报跑 2 x 6 = 12 条轨迹，卡间完全均衡。
-  * M = 6 与 ``model_batch`` = 6 对齐：一份图的 6 条轨迹在每步只需要一次前向批。
-  * 48 与 FGVP 原生 51 成员只差 3，CRPS / spread 的成员数偏差可以忽略。
-    要严格 51 只能拆成 17 x 3（17 图 / 4 卡 = 5+4+4+4，卡间约 25% 尾巴），或者
-    放弃等 M（51/8 = 7x3 + 6x5）；本档不这么做。
-
-改 n / M 时保持 ``MEMBERS = PERTURB_GRAPHS * RUNS_PER_GRAPH``，否则
-``_graph_member_split`` 会按 51/8 那种「前几份多一个」摊分，M 不再相等。
-
----- 两条随机轴 ----
-
-权重扰动（本文件的 SPW）与图内随机算子是两条独立轴：换卡数只改「图分给哪个
-rank」，不改 (g, j) -> 成员号的映射；但图内随机序列按 session 内的前向顺序对齐，
-**换卡数 / 换 session 次序后不要拿新产物与在盘旧档逐位横比**（同批同卡数才可比）。
-``perturb_graphs`` 不进入权重指纹，加/减图不会重造已有的那几份成员权重。
-
----- groups / sigma 的来历 ----
-
-沿用确定性档 s2b 的 ``latent_mixer`` + ``noise_struct="channel"`` +
-``sigma_full=0.027``。README 2O 记录：集合图（Mamba 骨干）的注入组尚未单独做
-审计记录。这是本臂现行配方；若服务器上还没核过 groups，SPW 这条腿的解读要打
-折扣，不是「效果不好」而是「跑的可能不是想跑的臂」。
-
----- 时段、预算、跑法 ----
-
-时段：夏季 20250702-0730（29 起报）+ 冬季 20251101-1130（30 起报）= **59 起报**，
-评测侧必须同步。60 步 x 6 h = +360 h，5 变量 z500/u200/v200/msl/tp。
-
-输出预算：59 x 48 x 60 x 20.8 MB ≈ **3.5 TB**；成员权重集 8 份（不随成员数变，
-按 latent_mixer 与 gdn2 同量级估算约 12 GB）。
-
-    cd /workspace/szwCode/xmetai-inference2
-    nvidia-smi -L
-
-    # smoke：1 起报 / 8 图 x 2 成员 / 6 步，务必给 --out
-    xmetai-infer --model fgvp_ens_spw --times 2025070200 --steps 6 \
-        --members 16 --gpus 1 --cuda-devices 0 --out /tmp/smoke_ens_spw
-
-    # 正式
-    xmetai-infer --model fgvp_ens_spw
-
-smoke 的 ``--members`` 必须 >= 2 x PERTURB_GRAPHS = 16（每图至少 2 成员的校验）。
+成员 = n 份扰动图 × 每份图在同一 session 里跑 M 次前向（n=8, M=6 -> 48）。
+同一份图的 M 个成员必须在同一进程同一 session 里连跑，不能按成员拆进程。
+权重扰动与图内随机是两条独立轴；换卡数后不要与旧档逐位横比。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
-# ---------------------------------------------------------------------------
-# 路径（服务器上的固定位置，直接改这里）
-# ---------------------------------------------------------------------------
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 # 只读源集合图（fp16、动态 batch 轴）与插件。
 MODEL_DIR = "/workspace/tmp/douzsh/models"
@@ -82,9 +21,7 @@ FGVP_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
 ]
 
-# ---------------------------------------------------------------------------
 # 成员结构：n 份扰动图 x 每份 M 次图内前向
-# ---------------------------------------------------------------------------
 PERTURB_GRAPHS = 8      # n：扰动图份数（每卡 2 份）
 RUNS_PER_GRAPH = 6      # M：每份图在每个起报上跑几条轨迹（= 图内随机样本）
 MEMBERS = PERTURB_GRAPHS * RUNS_PER_GRAPH   # 48：总成员数，必须等 M
@@ -104,7 +41,7 @@ cfg = InferConfig(
     gpu_mem=0.9,
     model_class="iwc_fgvp_mamba_ens_onnx",
     weight_perturb={
-        # 注入点与幅度沿用 s2b；集合图上的组审计见文件头。
+        # 注入点与幅度沿用 s2b。
         "groups": ("latent_mixer",),
         "sigma_full": 0.027,
         "balance": "energy",

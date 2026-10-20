@@ -103,19 +103,10 @@ def aligned_coordinates(latitudes, longitudes, expected_shape):
     return lat, lon
 
 
-# ---------------------------------------------------------------------------
-# ERA5 单位约定参考（写 config 的 unit_convert.scales 时据此推导）
-# ---------------------------------------------------------------------------
-# era5_foundation_store2 的原生单位与采样约定（ERA5 数据固有性质，与模型无关）：
-#
-#   z/t/u/v/w           m²/s², K, m/s    无需换算
-#   q                   kg/kg            FuXi 系要 g/kg（×1000），FengQing 不换算
-#   ssr/ssrd/fdir/ttr   J/m² 1h 累积     → Wh/m² 需 ÷3600
-#   tp                  m 1h 累积        → mm 需 ×1000
-#
-# 累积场在 store 里是 1h 累积、而 time step 是 6h，模型要「每步(6h)累积」，故
-# config 里写的系数 = 物理单位换算 × 6：tp → 1000×6 = 6000.0，辐射 → 6/3600
-# （即 configs/fengqing.py 的 tp 与 configs/fuxi21.py 的 ssr）。
+# ERA5 store 原生单位：z/t/u/v/w 无需换算；q=kg/kg（FuXi 系要 g/kg ×1000）；
+# ssr/ssrd/fdir/ttr = J/m² 1h 累积（→ Wh/m² ÷3600）；tp = m 1h 累积（→ mm ×1000）。
+# 累积场在 store 里是 1h 而 step 是 6h，故 config 系数 = 单位换算 × 6：
+# tp → 1000×6 = 6000.0，辐射 → 6/3600。
 
 
 @register_tensor_processor("unit_convert")

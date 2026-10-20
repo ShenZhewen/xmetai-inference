@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """fgvp 真实数据档：真 ONNX 在切片数据上跑一遍，和标准答案对拍。
 
-配方是 ``configs/fgvp.py`` 的 deepcopy 派生，落成临时 ``.py`` 喂 CLI（链路契约是
-路径不是对象），只覆盖 fixture 特有项。判 PASS 口径：最坏一档 ∈ {IDENTICAL, CLOSE}，
-分档判据冻结在 ``realdata_common``，不要改；不要求逐位相同。
-
-已知弱点：golden 的出处（哪个 commit、几张卡）没能确证 —— 本档挡得住今后的回归，
-但不能用来论证「当前结果是对的」。
+配方是 configs/fgvp.py 的 deepcopy 派生，只覆盖 fixture 特有项；判 PASS 为最坏一档
+∈ {IDENTICAL, CLOSE}，分档判据冻结在 realdata_common，不要求逐位相同。golden 出处未
+确证，只能防回归，不能证明当前结果正确。
 
 跑法：pytest -m realdata tests/integration/test_fgvp_realdata.py
 """

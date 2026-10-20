@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """自回归 rollout 编排层：把模型的单步 forward 串成多轨迹自回归循环。
 
-一条 Trajectory = 一条独立轨迹。集合预报（members>1）是 N 条轨迹共享同一初始
-态、init_time 相同（扰动来自图内随机算子，框架不加扰动）；批量确定性是 N 个起
-报各一条轨迹，各有自己的初始态与 init_time。
+一条 Trajectory = 一条独立轨迹。集合预报是 N 条轨迹共享同一初始态；
+批量确定性是 N 个起报各一条轨迹，各有自己的初始态与 init_time。
 """
 import gc
 import logging
@@ -76,9 +75,8 @@ class Trajectory:
 class Rollout:
     """把模型的单步 forward 串成多轨迹自回归循环。
 
-    model      需实现 forward(x, step, valid_time)；gpu_state=True 时还需
-               to_gpu / forward_gpu / to_numpy
-    processing 提供 recurrent / output 两个阶段的变换；None = 都不做
+    model 需实现 forward(x, step, valid_time)；gpu_state=True 时还需 to_gpu /
+    forward_gpu / to_numpy。processing 提供 recurrent / output 变换；None = 不做。
     """
 
     def __init__(self, model, processing=None):
@@ -97,18 +95,13 @@ class Rollout:
         """跑 steps 步，每步对全部轨迹各前向一次。
 
         on_step(step_index, step_state) 每步回调一次，step_state 形状
-        (n_trajectories, C, H, W)，顺序与 trajectories 一致。传了 on_step 就走流式
-        （内存不随 steps 增长），否则把 (n_traj, steps, C, H, W) 攒在内存里返回；
-        流式时返回 None。
+        (n_trajectories, C, H, W)；传了就走流式（内存不随 steps 增长），否则返回
+        攒下的 (n_traj, steps, C, H, W)，流式时返回 None。
 
-        ``model_batch`` 是一次 forward 最多堆几条轨迹（缺省 1 = 逐条）。前提：图的
-        输入/输出 batch 轴都是符号维（模型层用 ``batch_axis_dynamic`` 声明，没声明
-        就退回 1）；不能与 gpu_state=True 同用（互斥，直接报错）；各轨迹时刻可以
-        不同 —— step/hour/doy 按 (k,) 向量喂。forward override 里写死 batch=1 的
-        模型类（fengqing / pangu）不支持，拿到 k>1 会炸形状。
-
-        显存按 k 倍涨：0.25° 78 通道两帧的轨迹状态约 648 MB，k 照着可用显存给。
-        生效/退回各留一行日志（``BATCH_ACTIVE_MARK`` / ``BATCH_FALLBACK_MARK``）。
+        ``model_batch`` 是一次 forward 最多堆几条轨迹（缺省 1）。要求图输入/输出的
+        batch 轴都是符号维（模型用 ``batch_axis_dynamic`` 声明，否则退回 1）；不能与
+        gpu_state=True 同用；forward 里写死 batch=1 的模型（fengqing / pangu）拿到
+        k>1 会炸形状。显存按 k 倍涨，k 按可用显存给。
         """
         if not trajectories:
             raise ValueError("trajectories 为空，没有可跑的轨迹")
@@ -236,9 +229,8 @@ class Rollout:
     def _next_state(prev, result, in_frames, windowed):
         """把 forward 的输出整理成下一拍的完整输入窗。
 
-        ``windowed_output=True``（缺省）：图自己做滑窗，输出帧数 == 输入帧数，整体
-        回填。``windowed_output=False``：图只出预报那一帧，由这里滑窗成
-        ``[输入末帧, 预报]``。
+        windowed_output=True：图自己做滑窗，输出帧数 == 输入帧数，整体回填；
+        False：图只出预报那一帧，这里滑窗成 ``[输入末帧, 预报]``。
         """
         if windowed:
             if result.shape[1] != in_frames:

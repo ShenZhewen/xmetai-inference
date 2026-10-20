@@ -1,33 +1,10 @@
 # -*- coding: utf-8 -*-
 """潜空间 AR(1) 强迫 —— pt2（torch.export）后端的注入实现。
 
-与 weights/spa.py（ONNX 图改写）**语义同构**：同一份 LatentForcingSpec / build_basis，
-以及 backends/spa.py 的 Ar1Driver / LatentStepStream；公式同一条
-`z' = z ⊙ (1 + σ·U diag(ξ) Vᵀ)`，σ 折进
-通道基、τ 留在驱动侧（换 τ 不改图，两个臂共图）。差别只在「把强迫接进图」的手段：
-
-1. **不落盘**：改写发生在加载后的内存图上（gm.graph 插节点 + gm.recompile()）。
-   没有缓存文件、没有外部数据落位问题；spec 的指纹只进日志，用于口径对账。
-2. **目标选择**：fx 图里计算节点名是泛型 aten 名（add_2 / mul_7 …），FGVP 那套
-   「节点名后缀」不可用。改用**从权重占位符回溯**：`p_model_decoder_layers_{k}_mlp_w2_weight`
-   → 它喂的 linear → 吸收其输出的残差 add → 该 add 的输出 = 第 k 层末残差流。
-   （权重占位符名保留原模块路径，是 torch.export 图里唯一带语义的名字。）
-3. **xi 走模块属性而不是图输入**：torch.export 的图签名固定（args_0..3），塞不进
-   新输入；属性 `spw_xi` 由驱动侧每步覆写，图用 get_attr 读取。属性名必须用
-   **下划线**——fx codegen 会把 get_attr 的名字直接写进生成代码，`/` 会生成非法
-   Python（ONNX 版的 spw/xi 命名在这里不能照抄）。
-
-FuXi-2.1 实测布局（2026-09-30 探针，fuxi-2.1.pt2 / torch 2.11）：
-tokens=28800（120×240）、channels=1536、30 个 decoder 层、全程 fp16、
-潜状态 [1, 28800, 1536]（3-D，与 FGVP 同构，build_basis 直接可用）。
-
-每目标插入 5 个节点：
-
-    xi_t = select(spw_xi [T,R], 0, t)      # 本目标的 ξ 列
-    n    = mm(spw_V [N,R] * xi_t, spw_U [R,C])   # n[tok,c] = Σ_r V[tok,r]·ξ[r]·U[r,c]
-    z'   = z * (n + 1)                      # 广播 [N,C] ⊙ [1,N,C]
-
-（ONNX 版是 6 节点：多一个 Reshape/Transpose；这边 aten.mm 直接吃 [N,R]@[R,C]。）
+与 ONNX 版语义同构：同一份 spec / 基，公式同为 ``z' = z ⊙ (1 + σ·U diag(ξ) Vᵀ)``。
+差别在接线方式：改写发生在加载后的内存图上（不落盘）；注入目标从 mlp_w2 权重占位符
+回溯到层末残差流；ξ 走 GraphModule 属性 ``spw_xi``（图签名固定，塞不进新输入），
+属性名必须用下划线，否则 fx codegen 会写出非法 Python。
 """
 from __future__ import annotations
 
@@ -46,14 +23,11 @@ ATTR_U = "spw_U"      # 通道基 [R, C]（σ 与归一化已折叠，同 ONNX �
 ATTR_XI = "spw_xi"    # 驱动侧每步覆写：[T, R]（T = 目标数）
 
 # 「第 k 层末残差流」的回溯锚点：FuXi-2.1 导出图里 MLP 输出投影的权重占位符。
-# 名字来自原模块路径 model/decoder/layers.{k}/mlp/w2/weight —— torch.export 把参数
-# 名变成 p_ 前缀占位符时保留了这个路径，是扁平 aten 图里唯一带语义的名字族。
+# torch.export 把参数名变成 p_ 前缀时保留了原模块路径，是扁平 aten 图里唯一带语义的名字族。
 LAYER_ANCHOR = re.compile(r"^p_model_decoder_layers_(\d+)_mlp_w2_weight$")
 
-# 从 MLP 输出投影走到残差 add 之间**允许穿过**的算子：它们只包一层（clone / dtype 拷贝）
-# 或乘一个广播因子（缩放），不改变「这是第 k 层末残差流」这个语义位置。
-# 2026-09-30 真图实测（fuxi-2.1.pt2）：链路是 linear → clone → mul(×[1,1,1536] 调制向量)
-# → add，**不是**最初假设的 linear → add。只看一步会在真图上直接报「0 个 add 消费者」。
+# 从 MLP 输出投影走到残差 add 之间允许穿过的算子：只包一层或乘广播因子，
+# 不改变「第 k 层末残差流」的语义。真图链路是 linear -> clone -> mul -> add。
 _TRANSPARENT_OPS = ("aten.clone", "aten._to_copy", "aten.view", "aten.reshape",
                     "aten.mul", "aten.div")
 #: 单链最多走多少步（防御性上限：真图是 3 步，走太远说明结构不是我们想的那样）。
@@ -89,9 +63,8 @@ def _layer_indices(gm) -> list[int]:
 def _walk_layer(gm, layer: int):
     """回溯第 layer 层的残差流：返回链路 [linear, …, 残差 add]（节点列表）。
 
-    必须沿**单链**走，且每一步都得是已知的透明算子（见 `_TRANSPARENT_OPS`）—— 宁可在这里
-    报错，也不能猜一个节点去注：注错层的所有结构检查都会是全绿的（形状一样、节点数一样），
-    只有数值参考能发现，而那时候已经在跑推理了。
+    必须沿单链走且每步都是已知透明算子；宁可报错也不猜节点——注错层时形状、节点数
+    全对，只有数值对照能发现。
     """
     anchor = "p_model_decoder_layers_%d_mlp_w2_weight" % layer
     weight = next(
@@ -160,9 +133,7 @@ def _parse_layer_alias(token: str):
 def resolve_fx_targets(gm, spec: LatentForcingSpec) -> list:
     """把 spec.targets 解析成 fx 节点列表（保持顺序、去重）。
 
-    支持两种写法（可混用）：
-      * 别名 "layer_stream"（全部层）或 "layer_stream:0,10,20"（指定层）；
-      * 显式节点名（先精确、再后缀匹配）——回溯规则覆盖不了的结构用它兜底。
+    支持 "layer_stream"（全部层）、"layer_stream:0,10,20"（指定层）与显式节点名/后缀。
     """
     nodes = {n.name: n for n in gm.graph.nodes}
     targets = []
@@ -184,9 +155,8 @@ def resolve_fx_targets(gm, spec: LatentForcingSpec) -> list:
                 targets.append(_layer_out_node(gm, layer))
         else:
             if token.isdigit():
-                # 裸数字几乎只可能来自「layer_stream:0,10,20 被逗号拆开」——它作为节点名后缀
-                # 极可能**碰巧**匹配到某个无关节点（实测踩过：静默注到了 channels 不同的节点上），
-                # 所以宁可直接报错，也不做这种后缀匹配。CLI 侧另有一层合并，这里是兜底。
+                # 裸数字多半是「layer_stream:0,10,20 被逗号拆开」，做后缀匹配会静默
+                # 命中无关节点，所以直接报错。
                 raise ValueError(
                     f"注入点 {token!r} 是裸数字，疑似 layer_stream 的层号被逗号拆开了"
                     "（配置里请写在一个 token 里：('layer_stream:0,10,20',)）。"
@@ -275,16 +245,9 @@ def inject_fx_forcing(gm, target_nodes, basis, spec: LatentForcingSpec, *,
     add_scalar = torch.ops.aten.add.Scalar
     added = 0
     for index, node in enumerate(target_nodes):
-        # ⚠ fx 的 inserting_after 是**一个插入点**，不是「从这里往后追加」：同一个 with 块里
-        # 连续 create_node 全都插在同一个位置 ⇒ 后建的反而排在前面。实测（torch 2.11）
-        #
-        #     with graph.inserting_after(anchor):
-        #         a = call(...); b = call(...); c = call(...)
-        #     # 图里顺序是 c, b, a —— 逆序
-        #
-        # 逆序的图**照样 recompile 成功**，但代码生成会「先用后定义」，而且 ep.module() 的
-        # unlift（deepcopy 整张图）会直接 KeyError: <先出现的那个节点名>。所以每建一个节点
-        # 就把锚点挪到它身上，接力着往下插 —— 这条是 2026-09-30 写自测时才踩出来的。
+        # ⚠ fx 的 inserting_after 是「一个插入点」而非「往后追加」：同一 with 块里连续
+        # create_node 会逆序（c, b, a）。逆序图照样 recompile 成功，但代码生成先用后定义，
+        # ep.module() 的 unlift 会 KeyError。所以每建一个节点就把锚点挪到它身上。
         anchor = node
 
         def _emit(target, args):
@@ -302,9 +265,8 @@ def inject_fx_forcing(gm, target_nodes, basis, spec: LatentForcingSpec, *,
             anchor = created
             return created
 
-        # 常量锚点**每目标各建一份**：跨目标复用会把它们集中在第一个目标旁边，而目标之间
-        # 未必按图层先后排（"layer_stream:5,3" 就是反的），那样后面那条链会引用到更靠后的
-        # 节点。3 个 get_attr 的代价可以忽略。
+        # 常量锚点每目标各建一份：目标未必按图序排列（如 "layer_stream:5,3"），
+        # 跨目标复用会让链引用到更靠后的节点。
         xi_attr, v_attr, u_attr = _attr(ATTR_XI), _attr(ATTR_V), _attr(ATTR_U)
         xi_t = _emit(select, (xi_attr, 0, index))
         scaled = _emit(mul, (v_attr, xi_t))
@@ -344,9 +306,7 @@ def audit_fx_forcing(gm) -> dict:
                     and first.target == ATTR_XI:
                 chains += 1
         report["targets"] = chains
-        # **拓扑序**单独查一遍（fx 的 lint）：逆序的图照样能 recompile 成功、节点数也对，
-        # 但代码生成是「先用后定义」，而且 ep.module() 的 unlift 会直接 KeyError —— 2026-09-30
-        # 写自测时踩的正是这个：所有结构性的检查全绿，一跑 module() 就炸。所以把它变成断言。
+        # 单独检查拓扑序：逆序图能 recompile、节点数也对，但 module() 会 KeyError。
         try:
             gm.graph.lint()
             report["topological"] = True
@@ -362,12 +322,9 @@ def audit_fx_forcing(gm) -> dict:
 
 def attach_forcing(ep, spec: LatentForcingSpec, *, device=None,
                    src_path=None, verbose: bool = True) -> dict:
-    """pt2 后端的总入口：在**已加载**的 ExportedProgram 上就地注入（改图不落盘）。
+    """pt2 后端总入口：在已加载的 ExportedProgram 上就地注入（改图不落盘）。
 
-    必须在 ep.module() 之前调用（module() 包装的是注入后的图）。返回报告 dict，
-    其中 n_targets 是驱动侧要喂的目标数（sigma=0 空转对照时为 0 —— 一个节点都不插）。
-    src_path 给了就按「规格 + 源文件身份」算指纹（与 ONNX 版同一套口径，日志对账用）；
-    没给就只对规格本身算（s- 前缀区分）。
+    必须在 ep.module() 之前调用。n_targets 是驱动侧要喂的目标数（sigma=0 时为 0）。
     """
     if spec.sigma <= 0:
         report = {"n_targets": 0, "sigma": float(spec.sigma), "skipped": True}
@@ -400,14 +357,11 @@ def attach_forcing(ep, spec: LatentForcingSpec, *, device=None,
         blob = json.dumps(spec.budgets(), sort_keys=True, ensure_ascii=False)
         fingerprint = "s-" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:10]
     report = audit_fx_forcing(gm)
-    # ‖Vt‖ 与基的隐含 sigma：与 ONNX 版（build_forcing_model 的打印）同一套口径，用于对账
-    # 「σ 真的折进基里了」。**先转 float32 再求范数** —— FuXi-2.1 全程 fp16，V 有 28800x16、
-    # U 有 16x1536 个元素，fp16 的平方和在范数里会直接溢出（Inf）或下溢成 0。
+    # 基的隐含 sigma（与 ONNX 版同一口径）。先转 float32 再求范数：
+    # fp16 的平方和在范数里会溢出或下溢。
     v_np32 = gm.spw_V.detach().float().cpu().numpy()
     u_np32 = gm.spw_U.detach().float().cpu().numpy()
-    # 验收用：把 layer_stream 别名点到的那几层的**回溯链路**记进报告。「注到了哪个节点」
-    # 是这个后端最需要人眼确认的一件事 —— 真图上它既不是 linear 直连 add，节点名（add_12）
-    # 也看不出是哪一层。
+    # 验收用：记下 layer_stream 别名实际点到的回溯链路，便于人眼确认注到了哪一层。
     chains = {}
     for token in spec.targets:
         is_alias, layers = _parse_layer_alias(token)

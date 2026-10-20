@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
 """iwc_fgvp_gdn2 ONNX 模型（FuXi-Ens 的 Gated DeltaNet 骨干变体）。
 
-输入契约与 FuXi-Ens 完全一致，可直接复用 fuxi_ens 的 78 通道布局
-（z/t/u/v/q × 13 层 + 13 地面）：物理量直接送入 ONNX，归一化、累积通道清零、掩码和
-反归一化均已烘焙进图；2 帧历史 + step/hour/doy 三个标量；0.25°×721×1440。
+输入契约同 FuXi-Ens（78 通道、2 帧历史 + step/hour/doy），物理量进/出，归一化已
+烘焙进图。骨干用自定义算子 GatedDeltaNet2Fn，需 config 的 ops_library 注册，
+onnxruntime 版本不符会在 ABI 报错。
 
-骨干用自定义算子 xmetai_plugins:GatedDeltaNet2Fn，建 session 前必须注册
-xmetai_onnx_plugins.so（路径由 config 的 ops_library 提供）；onnxruntime 版本不匹配
-时 register_custom_ops_library 会因 ABI 报错。
-
-本模型图**只输出预报那一帧**（fuxi_ens 是图内滑窗、输出完整 [t, t+1] 窗口），故声明
-windowed_output=False，滑窗归 runner.Rollout；gpu_state 必须为 False（GPU 常驻分支
-的 _spare buffer 复用假设「输入输出同形」，本模型 2 帧进 1 帧出不成立），否则静默算错，
-OnnxInferModel.load 的 _check_gpu_state_frames 会在加载期拦下。
+图只输出预报那一帧，故 windowed_output=False；gpu_state 必须 False（2 帧进 1 帧出，
+GPU 常驻的 buffer 复用假设不成立），load() 会断言拦下。
 """
 from xmetai_inference.backends.onnx import OnnxInferModel
 
