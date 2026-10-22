@@ -473,29 +473,6 @@ def _fmt_index_ranges(indices):
     return ",".join(parts)
 
 
-def _guard_segment_model(cls, plan):
-    """分段换权重的前提：模型在 session 内**没有跨步状态**。
-
-    段边界是「换 session 接着跑」实现的，Rollout 自己持有的 state 不受影响，所以对
-    「状态全在输入窗里」的图（FGVP 这类单步型、FuXi 这类窗口型）逐位等价。但跨步有状态的
-    模型（如 Pangu 方案B 的 24h 锚点，靠 reset_runtime_state 清空）会在换 session 时静默
-    丢掉那份状态 —— 输出照样有，只是物理上错了。静默算错比报错糟，所以这里直接拦。
-    """
-    from xmetai_inference.backends.base import BaseInferModel
-
-    # getattr 而不是 cls.reset_runtime_state：没有这个属性的类（测试桩 / 非 BaseInferModel
-    # 出来的类）也要走到同一条明确的报错，而不是 AttributeError。
-    if getattr(cls, "reset_runtime_state", None) is not BaseInferModel.reset_runtime_state:
-        raise SystemExit(
-            f"{cls.__name__} 覆盖了 reset_runtime_state（session 内有跨步状态），"
-            "分段 rollout 会在段边界换 session、从而静默丢掉那份状态，因此不支持。"
-            "要跑分段请换「状态全部在输入窗里」的模型。")
-    if getattr(cls, "gpu_state", False):
-        raise SystemExit(
-            f"{cls.__name__} 开了 gpu_state（state 常驻显存），分段 rollout 尚未在该路径上"
-            "验证过（换 session 会重置输出 buffer 复用池）。请先用 gpu_state=False 跑分段。")
-
-
 def _graph_member_split(members, graphs):
     """把 members 个成员摊到 graphs 份扰动图上：均分 + 余数给前面的图。
 
@@ -526,7 +503,7 @@ def _prepare_member_set(src, spec, count, member_indices, local_rank, world_size
     """
     # 惰性导入：backends.base 顶层 import torch，而 --help / 配置清单这条路不该被拖上 torch。
     from xmetai_inference.backends.base import _fmt_dur
-    from xmetai_inference.perturbation import build_member_set, member_exists
+    from xmetai_inference.weights.spw import build_member_set, member_exists
 
     shard = list(range(local_rank, count, world_size))
     # 只造本 rank 分片里**还不在盘上**的那些。build_member_set 是确定性的（同名即同内容），
@@ -580,7 +557,7 @@ def _pool_summary(model):
 
 def _run_member_outer(model, processors, dataset_source, writer, args, init_times,
                       member_indices, save_names, lat, lon, interval, local_rank,
-                      world_size, segments=None):
+                      world_size):
     """m1a 的集合编排：成员在外层、数据集在内层（每个成员把数据集走一遍）。
 
     为什么成员要在外层：m1a 的成员不是「同一 session 里的另一条轨迹」，而是另一份
@@ -600,7 +577,7 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
     total_t0 = perf_counter()
     _run_member_block(
         model, processors, dataset_source, writer, args, init_times, member_indices,
-        save_names, lat, lon, interval, local_rank, world_size, segments=segments)
+        save_names, lat, lon, interval, local_rank, world_size)
     errors = writer.close()
     if errors:
         log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))
@@ -613,7 +590,7 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
 
 def _run_member_block(model, processors, dataset_source, writer, args, init_times,
                       member_indices, save_names, lat, lon, interval, local_rank,
-                      world_size, segments=None, rollout_batch=1):
+                      world_size, rollout_batch=1):
     """成员外层的一段编舞 = 上面那个「成员循环」本身（不含收尾的 close 与总结）。
 
     逐成员跑完 ``member_indices``（每个成员一份冻结权重，进来前先 load），逐帧写盘并
@@ -623,24 +600,8 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
     from xmetai_inference.runner import Rollout, Trajectory
 
     release = getattr(model, "release", None)
-    # 分段 rollout（E3）：第一段必须用 segments 里的规格，而不是 config 里那份 base 规格 ——
-    # 两者的成员集目录（指纹）不同，用错规格会去找一个根本没生成的成员集。
-    switch_after = {}
-    first_spec = None
-    if segments is not None:
-        first_spec = segments.segments[0].spec
-        model.weight_perturb = first_spec
-        switch_after = segments.switch_after()
-        log.info("分段 rollout：%s（%d 段，段边界在跑完第 %s 步之后；末段之后不再换）",
-                 segments.describe(), len(segments.segments),
-                 "、".join(str(step) for step in sorted(switch_after)))
     for order, member_id in enumerate(member_indices, 1):
         model.member_index = member_id
-        if first_spec is not None:
-            # 每个成员都必须从**第 0 段**开始：上一个成员跑到段边界时把 model.weight_perturb
-            # 换成了后一段，不重置的话这个成员的头几步会带着上一段的权重跑 —— 安静地错，
-            # 只有 e2e 那条「边界之前逐位相同」能抓到它。
-            model.weight_perturb = first_spec
         t_member = perf_counter()
         model.load(args.model)
         log.info("[%d/%d] member_%03d 权重就绪，加载耗时 %s",
@@ -668,20 +629,6 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
                         member_ds,
                         raw=(step_state[batch_index], step, init),
                     )
-
-                # 段边界：本步跑完就换成下一段的冻结权重，下一步的前向用它。Rollout 的
-                # state 是它自己持有的数组（不在 session 里），所以换 session 对它是透明的：
-                # 轨迹连续、帧号连续，只有注入的权重变了。放在写盘之后 —— 这一步的预报
-                # 属于**上一段**的权重。成员号不变（同一成员号在每段各有自己那份权重）。
-                next_segment = switch_after.get(step_idx)
-                if next_segment is not None:
-                    segment = segments.segments[next_segment]
-                    model.weight_perturb = segment.spec
-                    t_switch = perf_counter()
-                    model.load(args.model)
-                    log.info("  member_%03d 第 %d 段权重就绪（%s，换段耗时 %s）",
-                             member_id, next_segment, segment.amplitude(),
-                             _fmt_dur(perf_counter() - t_switch))
 
             Rollout(model, processors).run(
                 [
@@ -887,8 +834,7 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
 
 
 def _worker_main(argv=None):
-    from xmetai_inference.backends.base import _fmt_dur
-    from xmetai_inference.backends.session_pool import normalize_budget
+    from xmetai_inference.backends.base import _fmt_dur, normalize_budget
     from xmetai_inference.data import create_dataset_source
     from xmetai_inference.models import create_model, get_model_class, grid_coords
     from xmetai_inference.processing.pipeline import build_pipeline
@@ -971,7 +917,7 @@ def _worker_main(argv=None):
     forecast_type = getattr(cls, "forecast_type", "deterministic")
     perturb_spec = None
     if worker_cfg.weight_perturb:
-        from xmetai_inference.perturbation import WeightPerturbSpec
+        from xmetai_inference.weights.spw import WeightPerturbSpec
 
         perturb_spec = WeightPerturbSpec.from_config(worker_cfg.weight_perturb)
     if perturb_spec is not None:
@@ -997,10 +943,6 @@ def _worker_main(argv=None):
                 f"但 {cls.__name__} 声明 forecast_type="
                 f"{getattr(cls, 'forecast_type', 'deterministic')!r}。"
                 "确定性模型的权重扰动走 m1a（去掉 perturb_graphs 即可）。")
-        if worker_cfg.spw_segments:
-            raise SystemExit(
-                "perturb_graphs 与 spw_segments 不支持组合：分段 rollout 的换权重"
-                "逻辑挂在成员外层编舞上（_run_member_outer 的 on_step）。")
         if n_graphs > members:
             raise SystemExit(
                 f"perturb_graphs({n_graphs}) > members({members})：会有图分不到成员。"
@@ -1069,21 +1011,6 @@ def _worker_main(argv=None):
     # 图外层（集合模型 + perturb_graphs）不在此列：它的外层是扰动图不是成员，走
     # _run_graph_outer，复用 _run_plain_block 的「一 session x 多轨迹」。
     member_outer = perturb_spec is not None and not graph_outer
-
-    # 分段 rollout（E3，config 的 spw_segments）：在同一条轨迹里按段更换冻结权重。
-    # 它不动「成员在外层」的结构，只在段边界多挂一次 session（见 _run_member_outer 的
-    # on_step），所以帧号、输出布局、下游体检都与非分段路径完全一致。
-    segments = None
-    if worker_cfg.spw_segments:
-        from xmetai_inference.perturbation.segments import parse_segment_plan
-
-        try:
-            segments = parse_segment_plan(worker_cfg.spw_segments, perturb_spec, args.steps)
-        except ValueError as error:
-            raise SystemExit(f"config 的 spw_segments 无法使用：{error}") from error
-        _guard_segment_model(cls, segments)
-        log.info("分段 rollout 已启用：%d 段 / 共 %d 步：%s",
-                 len(segments.segments), segments.total_steps, segments.describe())
 
     if not init_times:
         log.info("没有分配到起报时间，退出")
@@ -1154,14 +1081,9 @@ def _worker_main(argv=None):
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    member_specs = (list(segments.specs()) if segments is not None
-                    else ([perturb_spec] if perturb_spec is not None else []))
     if member_outer:
-        # 分段时每一段都有自己的成员集（sigma / 种子不同 -> 指纹不同 -> 各自一个目录），
-        # 必须在开跑前全部造好：段边界是在推理中途到的，那里既不能等生成、也不该写盘。
-        for spec_k in member_specs:
-            _prepare_member_set(args.model, spec_k, members, member_indices,
-                                local_rank, world_size)
+        _prepare_member_set(args.model, perturb_spec, members, member_indices,
+                            local_rank, world_size)
     elif graph_outer:
         # 图外层：成员集只有 n_graphs 份（每图一份冻结权重），「成员号」= 图号。
         # 造完本 rank 分到的那几份，缺的等其它 rank（与 m1a 同一套分片协议）。
@@ -1211,9 +1133,7 @@ def _worker_main(argv=None):
     if member_outer:
         return _run_member_outer(
             model, processors, dataset_source, writer, args, init_times,
-            member_indices, save_names, lat, lon, interval, local_rank, world_size,
-            segments=segments,
-            rollout_batch=worker_cfg.rollout_batch)
+            member_indices, save_names, lat, lon, interval, local_rank, world_size)
 
     if dataset_source is not None:
         total_t0 = perf_counter()

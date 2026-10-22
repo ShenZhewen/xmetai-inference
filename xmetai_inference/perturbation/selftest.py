@@ -23,10 +23,12 @@
      同一个文件」；以及**被外置的 Constant 节点张量也必须被改名**
      （2026-09-23 服务器事故的回归：只扫 graph.initializer 会漏掉它们，
      成员图会继续指向源 .data）；
-  7. 分段编排与判据（segments.py / verdict.py）；
-  8. 潜空间 AR(1)（latent.py）：sigma=0 时与源图逐位相同、非零时与 numpy 参考一致、
+  7. 判据（analysis/verdict.py）与潜空间 AR(1)（weights/spa.py）：sigma=0 时与源图逐位相同、非零时与 numpy 参考一致、
      同 xi 两次逐位相同而换 xi 才变（图自身无随机性）、目标的消费者全部改接且只改
      一次、基正交且无 DC、rho/平稳方差/成员独立性、尺度旋钮真的接上了。
+
+上面 7 条是主题分组；`CASES` 实际按 11 组执行，还包含 CLI / 产物等辅助用例，
+以 `CASES` 为准。
 
 用法：python -m xmetai_inference.perturbation self-test [--keep]
 """
@@ -40,29 +42,30 @@ import tempfile
 
 import numpy as np
 
-from .graph import (
+from ..backends.spa import (Ar1Driver, LatentStepStream,
+                            lag1_autocorr)
+from ..weights.spa import (_grid_from_patch_embed, LatentForcingSpec,
+                           build_basis, build_forcing_model,
+                           detect_layout, resolve_targets)
+from ..weights.spw import (
+    NOISE_STRUCTS,
+    WeightPerturbSpec,
     _onnx,
     _verify_external_refs,
-    external_tensors,
-    iter_graphs,
-    group_alternatives,
-    resolve_sigmas,
-    load_model,
-    resolve_effective_path,
-    select_initializers,
-    tensor_array,
-)
-from .latent import (Ar1Driver, LatentForcingSpec, LatentStepStream,
-                     _grid_from_patch_embed, build_basis, build_forcing_model,
-                     detect_layout, lag1_autocorr, resolve_targets)
-from .spec import NOISE_STRUCTS, WeightPerturbSpec
-from .weights import (
     build_member_set,
+    external_tensors,
+    group_alternatives,
+    iter_graphs,
+    load_model,
     member_base_path,
     member_model_path,
     member_perturbed_path,
+    resolve_effective_path,
     resolve_member_path,
+    resolve_sigmas,
+    select_initializers,
     set_dir_for,
+    tensor_array,
     verify_member_set,
 )
 
@@ -248,7 +251,7 @@ def _write_probe(path, *, count=1, size=256, seed=1):
 
 def _session(path):
     """建一个可反复 run 的 session（模拟「一个 rank = 一个进程 = 一个 session」）。"""
-    from .probe import make_session
+    from ..analysis.probe import make_session
 
     return make_session(path)
 
@@ -303,7 +306,7 @@ def _feeds(seed=0):
 
 
 def _run(path, feeds):
-    from .probe import make_session
+    from ..analysis.probe import make_session
 
     # 合成图故意留了「无消费者」的 initializer 来测跳过规则，ORT 会逐条告警；
     # 自检的输出只需要我们自己的断言结果，make_session 已把日志压到只报 error。
@@ -411,7 +414,7 @@ def _case_noise_struct(work, check):
     也改了，那就变成了又一次 σ 扫描，前面 A/B 的结论一个都用不上。所以「独立样本数」、
     「每元素方差」、「行内常数性」、「方差定律」四条都要钉死。纯数值，不需要 onnx。
     """
-    from .weights import _draw, _noise_shape
+    from ..weights.spw import _draw, _noise_shape
 
     shape = (12, 5, 3, 3)               # (out, in, kh, kw)，模仿一个卷积权重
     want = {
@@ -870,8 +873,8 @@ def _case_m1a(work, check):
     try:
         resolve_member_path(src, spec, 99)
     except FileNotFoundError as error:
-        check("perturbation members" in str(error),
-              "成员缺失时的报错里带着可直接执行的构建命令")
+        check("xmetai_inference.weights.spw" in str(error),
+              "成员缺失时的报错里指向造产物入口")
 
     # 后端加载期的成员号自检（防「51 个成员其实加载了同一个文件」）
     from xmetai_inference.backends.onnx import OnnxInferModel
@@ -931,93 +934,6 @@ def _case_m1a(work, check):
           "重新生成后成员集恢复干净（生成是确定性的）")
 
 
-def _case_segment_plan(work, check):
-    """分段 rollout 的**计划层**：预算、继承、指纹、段边界四类。
-
-    为什么要单测这一层：分段写错不会报错，只会「跑完 60 步但权重只换了一次」或者「每段都用
-    base 的 σ」，两种都只让结论不可信 —— 正是这一版最贵的一类 bug。真正换 session 的动作在
-    cli 里，这里钉的是「规格算得对不对、边界在第几步、错例会不会被拦下」。纯逻辑，不碰 onnx。
-    """
-    from .segments import parse_segment_plan
-
-    base = WeightPerturbSpec(groups=("latent_mixer",), sigma_full=0.04,
-                             balance="energy", seed=0,
-                             noise_struct="channel", member_dir=osp.join(work, "seg_dir"))
-    sigma_seg = base.sigma_full / 3 ** 0.5
-    plan = parse_segment_plan(
-        [{"sigma_full": sigma_seg, "steps": 20},
-         {"sigma_full": sigma_seg, "steps": 20, "seed": 1},
-         {"sigma_full": sigma_seg, "steps": 20, "seed": 2}], base, 60)
-    check(plan is not None and plan.total_steps == 60 and len(plan.segments) == 3,
-          "3 段 x 20 步：总步数与段数正确",
-          f"total={plan.total_steps} 段数={len(plan.segments)}")
-
-    specs = plan.specs()
-    check(all(spec.groups == base.groups and spec.balance == base.balance
-              and spec.exclude == base.exclude and spec.include == base.include
-              and spec.noise_struct == base.noise_struct
-              and spec.member_dir == base.member_dir
-              and spec.min_elements == base.min_elements for spec in specs),
-          "各段规格：组 / 预算口径 / 排除 / include / 噪声结构 / 落盘目录 全部继承 base",
-          specs[0].describe())
-    check([spec.sigma_full for spec in specs] == [sigma_seg] * 3
-          and [spec.seed for spec in specs] == [0, 1, 2],
-          "各段的幅度与种子按分段表逐段落地（不是都被 base 的 sigma 抹平）",
-          f"sigma_full={[spec.sigma_full for spec in specs]} seed={[spec.seed for spec in specs]}")
-
-    # 预算：每段 sigma_full/sqrt(K) -> 一段摊 1/K 份，K 段和起来正好是冻结臂那一份
-    total = sum(spec.sigma_full ** 2 for spec in specs)
-    check(abs(total / base.sigma_full ** 2 - 1.0) < 1e-12,
-          "同预算分段：各段 (sigma_full/sqrt(K))^2 之和 = 冻结臂的 sigma_full^2",
-          f"比值={total / base.sigma_full ** 2:.9f}")
-
-    switch = plan.switch_after()
-    check(switch == {20: 1, 40: 2},
-          "段边界：跑完第 20 / 40 步之后换成第 1 / 2 段",
-          f"switch_after={switch}")
-    check(plan.total_steps not in switch and max(switch) < plan.total_steps,
-          "末段之后不产生换段点（最后一步跑完不必再挂一次 session）",
-          f"switch_after={switch} total={plan.total_steps}")
-
-    # 指纹：段规格不同 -> 各自一个成员集目录。探针图放在子目录里，避免给同批用例添乱
-    # （它们会断言工作目录里没有多余的 .data）。
-    box = osp.join(work, "seg_case")
-    os.makedirs(box, exist_ok=True)
-    src = osp.join(box, "seg_probe.onnx")
-    with open(src, "wb") as handle:
-        handle.write(b"seg")
-    dirs = [set_dir_for(src, spec) for spec in specs]
-    check(len(set(dirs)) == 3,
-          "分段指纹：三段各自一个成员集目录（seed / 幅度不同就不共用）",
-          " / ".join(osp.basename(path) for path in dirs))
-    twin = parse_segment_plan([{"sigma_full": sigma_seg, "steps": 30},
-                               {"sigma_full": sigma_seg, "steps": 30}], base, 60)
-    check(set_dir_for(src, twin.specs()[0]) == set_dir_for(src, twin.specs()[1]),
-          "同幅度 + 同种子的两段 = 同一份权重（要真刷新必须在分段表里给不同的 seed）",
-          "两段目录相同，这是预期语义而不是 bug")
-
-    for bad, label in (
-        ([{"sigma_full": 0.02, "steps": 30}], "各段步数之和 != steps"),
-        ([{"steps": 60}], "缺 sigma / sigma_full"),
-        ([{"sigma_full": 0.02, "sigma": 0.02, "steps": 60}], "同时给了 sigma 与 sigma_full"),
-        ([{"sigma_full": 0.02, "steps": 60, "segma_full": 0.1}], "键名写错（segma_full）"),
-        ([{"sigma_full": 0.02, "steps": 0}], "某段步数为 0"),
-        ([], "空表"),
-        ("sigma_full=0.02", "不是列表"),
-    ):
-        try:
-            parse_segment_plan(bad, base, 60)
-        except ValueError:
-            check(True, f"错例被拦下：{label}")
-        else:
-            check(False, f"错例被拦下：{label}", "竟然没报错")
-    check(parse_segment_plan(None, base, 60) is None,
-          "None = 不分段（默认路径逐位不变）")
-    check("0:20步" in plan.describe() and "seed=2" in plan.describe(),
-          "describe() 里读得到每段步数 / 幅度 / 种子（服务器上核对日志用）",
-          plan.describe())
-
-
 def _case_verdict(work, check):
     """判决页（verdict）的**判据层**：p 插值 / k 折算 / 平坦度 / 判据分类 / 门槛。
 
@@ -1029,7 +945,7 @@ def _case_verdict(work, check):
 
     import pandas as pd
 
-    from .verdict import (BANDS, P_TABLE, _band_symbol, bin_mean, criteria, flatness,
+    from ..analysis.verdict import (BANDS, P_TABLE, _band_symbol, bin_mean, criteria, flatness,
                           k_needed, k_profile, p_at)
 
     # 1) p 在对数时效上插值：端点原样、越界夹住、单调不增
@@ -1128,7 +1044,7 @@ def _case_verdict(work, check):
 
 
 # ---------------------------------------------------------------------------
-# 潜空间 AR(1) 强迫（latent.py）
+# 潜空间 AR(1) 强迫（weights/spa.py）
 # ---------------------------------------------------------------------------
 _FORCE_TOKENS = 64
 _FORCE_CHANNELS = 8
@@ -1152,7 +1068,7 @@ def _write_forcing_fixture(path, *, patch_embed=False, fp16=False):
     fp16=True：全图 float16。**这一档必须单列**：生产用的集合图就是 fp16
     （iwc_gssp_im_fp16.onnx），而注入链的常量是 fp32，两边直接相乘会被 ORT 判为
     「Type parameter (T) of Optype (Mul) bound to different types」而**建不出会话**。
-    修复是链尾往目标类型 Cast 一次（latent.py 的 CastGain）。这个 bug 从 fp32 夹具上
+    修复是链尾往目标类型 Cast 一次（weights/spa.py 的 CastGain）。这个 bug 从 fp32 夹具上
     完全看不见，所以夹具本身要能出 fp16。
     """
     onnx = _onnx()
@@ -1502,7 +1418,7 @@ def _case_latent(work, check):
 
 
 # ---------------------------------------------------------------------------
-# 潜空间 AR(1) 强迫 —— pt2 后端（latent_pt2.py）
+# 潜空间 AR(1) 强迫 —— pt2 后端（weights/spa_pt2.py）
 # ---------------------------------------------------------------------------
 # 夹具尺寸取到「网格大于 1x1、rank < channels」的最小可用档：空间基的低通在 4x4 上
 # 不会退化（length_scale=1 时非 DC 模的能量远在兜底阈值之上），也不至于让用例变慢。
@@ -1652,8 +1568,8 @@ def _case_latent_pt2(work, check):
         check(True, f"没有 torch，跳过 pt2 后端用例：{error}")
         return
 
-    from .latent_pt2 import (attach_forcing, audit_fx_forcing, detect_fx_layout,
-                             resolve_fx_targets, _walk_layer)
+    from ..weights.spa_pt2 import (attach_forcing, audit_fx_forcing, detect_fx_layout,
+                                   resolve_fx_targets, _walk_layer)
 
     box = osp.join(work, "latent_pt2")
     os.makedirs(box, exist_ok=True)
@@ -1858,7 +1774,7 @@ def _case_latent_pt2(work, check):
           "audit_fx_forcing：每目标一条 select(spw_xi) 链且形状自洽", str(audit_fx_forcing(gm)))
 
     # ---- 7) 驱动侧：后端共享的 LatentStepStream（A32 首跑踩的是这条接线）----
-    from .latent import LatentStepStream
+    from ..backends.spa import LatentStepStream
 
     stream = LatentStepStream()
     rows = [stream(spec, 0, n_targets=len(two), member_index=0, hour_interval=6.0)
@@ -1951,7 +1867,6 @@ CASES = (
     ("选择集与跳过原因", _case_selection),
     ("M1a 逐成员冻结权重落盘", _case_m1a),
     ("结构化噪声落到成员权重（m1a + channel + scalar）", _case_m1a_noise_struct),
-    ("分段 rollout 计划（spw_segments / E3）", _case_segment_plan),
     ("判决页的判据层（p 插值 / k 折算 / 平坦度 / 判据分类 / 门槛）", _case_verdict),
     ("潜空间 AR(1) 强迫（等价性 / 数值 / 结构 / 驱动侧）", _case_latent),
     ("潜空间 AR(1) 强迫的 pt2 后端（fx 回溯 / 属性喂 xi / 列序）", _case_latent_pt2),

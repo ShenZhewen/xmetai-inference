@@ -147,7 +147,7 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
     哪一份成员模型。跑集合时同一个实例会被反复 load（每次换一个成员号）；resident_members
     决定这些 session 在显存里驻留几份——1（缺省）是一换一放，51 个成员 x 3 GB 全挂上去
     会把显存吃干净；显存够大就调大它（-1 = 全常驻），换回来时不重建 session、不重新预热
-    cuDNN。见 backends/session_pool.py 与 cli 的 _run_member_block。
+    cuDNN。见 backends/base.py 的 SessionPool 与 cli 的 _run_member_block。
     """
     cls = get_model_class(model_name)
     model = cls(device_id=device_id, gpu_mem_fraction=gpu_mem_fraction)
@@ -163,7 +163,7 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
         model.resident_members = int(resident_members)
     model.member_index = int(member_index or 0)
     if weight_perturb is not None:
-        from xmetai_inference.perturbation import WeightPerturbSpec
+        from xmetai_inference.weights.spw import WeightPerturbSpec
 
         spec = WeightPerturbSpec.from_config(weight_perturb)
         if spec is not None:
@@ -174,16 +174,16 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
                     "权重），见 xmetai_inference/perturbation/README.md")
             model.weight_perturb = spec
     if latent_forcing is not None:
-        from xmetai_inference.perturbation import LatentForcingSpec
+        from xmetai_inference.weights.spa import LatentForcingSpec
 
         forcing = LatentForcingSpec.from_config(latent_forcing)
         if forcing is not None:
-            # 能力位与 weight_perturb 分开：onnx（latent.py 图改写）与 pt2
-            # （latent_pt2.py 的 fx 图改写）各自声明 supports_latent_forcing。
+            # 能力位与 weight_perturb 分开：onnx（weights/spa.py 图改写）与 pt2
+            # （weights/spa_pt2.py 的 fx 图改写）各自声明 supports_latent_forcing。
             if not getattr(model, "supports_latent_forcing", False):
                 raise ValueError(
                     f"{cls.__name__}（backend={model.backend}）不支持潜空间 AR(1) 强迫："
-                    "已实现的是 ONNX 后端（latent.py）与 pt2 后端（latent_pt2.py）的图改写"
+                    "已实现的是 ONNX 后端（weights/spa.py）与 pt2 后端（weights/spa_pt2.py）的图改写"
                     "注入，见 xmetai_inference/perturbation/README.md 2N 节")
             model.latent_forcing = forcing
     return model

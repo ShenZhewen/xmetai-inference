@@ -102,23 +102,15 @@ class InferConfig:
     ops_library: str = ""                    # 自定义算子库 .so（空 = 不注册，标准模型）
     gpu_state: Any = None                   # None = 使用模型类默认；True/False 可覆盖
     # 确定性 ONNX -> 集合：权重扰动（SPW）规格。None = 不加扰动；dict 见
-    # perturbation.WeightPerturbSpec（groups / sigma_full / sigma / balance / ...）。
+    # weights.spw.WeightPerturbSpec（groups / sigma_full / sigma / balance / ...）。
     # 需要 onnx extra（图改写）。详见 xmetai_inference/perturbation/README.md。
     weight_perturb: Any = None
     # 确定性 ONNX -> 集合：潜空间 AR(1) 强迫规格（噪声的**时间相关**那条腿）。None = 不加；
-    # dict 见 perturbation.LatentForcingSpec（targets / sigma / tau_days / rank /
+    # dict 见 weights.spa.LatentForcingSpec（targets / sigma / tau_days / rank /
     # length_scale / seed）。它不改权重，只给图加一个 `spw/xi` 输入，所以与 weight_perturb
     # 正交、可叠加；成员之间的差别只来自 xi 的种子 -> 同一份图服务全部成员。
     # 需要 onnx extra（图改写）。详见 xmetai_inference/perturbation/README.md 的 2M 节。
     latent_forcing: Any = None
-    # 分段 rollout（E3）：把一条轨迹切成若干段，在段边界换一份**冻结**权重（= 换 sigma
-    # 或换一次抽样）。形如
-    #   [{"sigma_full": 0.0231, "steps": 20},
-    #    {"sigma_full": 0.0231, "steps": 20, "seed": 1}, ...]
-    # 各段 steps 之和必须等于 steps；配了 spw_segments 就必须同时配 weight_perturb。
-    # 解析、校验与段边界的定义见 perturbation.segments.parse_segment_plan。
-    # None = 不分段（默认，行为与以前逐位相同）。
-    spw_segments: Any = None
     # perturb_graphs：**集合模型（图内随机算子出成员）+ weight_perturb** 时生效 ——
     # 把 members 个成员摊到 G 份扰动图上（均分 + 余数给前面的图，如 51/5 = 11+10x4）：
     # 成员 m = 第 g 份冻结权重 x 该图 session 内的第 j 次前向。编舞是「图在外层
@@ -152,7 +144,7 @@ class InferConfig:
     #   N  = 最多驻留 N 份，第 N+1 份进来时按 LRU 换出最久没用过的那份；
     #   -1 = 不限（全常驻）。
     # 只在配了 weight_perturb 时有意义（latent_forcing 是一份 session 服务全部成员，
-    # 没有第二份可驻留）。实现见 backends/session_pool.py。
+    # 没有第二份可驻留）。实现见 backends/base.py 的 SessionPool。
     resident_members: int = 1
     # 数据源统一走 xmetai-core Dataset + torch DataLoader 批量读取。
     dataset: Any = None

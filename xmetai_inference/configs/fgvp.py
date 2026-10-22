@@ -22,9 +22,9 @@ FGVP_DYNAMIC_STORES = [
 cfg = InferConfig(
     name="fgvp",
     model_path=os.environ.get(
-        "FGVP_ONNX", "/workspace/tmp/douzsh/models/iwc_fgvp_gdn2_260901.onnx"),
+        "FGVP_ONNX", "/workspace/tmp/douzsh/models/20261013/iwc_fgvp_gdn2_260901.onnx"),
     ops_library=os.environ.get(
-        "FGVP_OPS_LIBRARY", "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.so"),
+        "FGVP_OPS_LIBRARY", "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so"),
     # 统一开关：XMETAI_GPU_STATE="1"/"0" 显式覆盖，未设时用本 config 的默认。
     # 本模型默认必须关（图只出 1 帧，见 models/iwc_fgvp_gdn2.py 的说明）；
     # 即使显式设 1，OnnxInferModel.load 的启动期断言也会拦下。
@@ -59,8 +59,8 @@ cfg = InferConfig(
         ],
     },
     dataloader={
-        "batch_size": 4,
-        "num_workers": 4,
+        "batch_size": 1,
+        "num_workers": 1,
         "pin_memory": True,
         "shuffle": False,
         "drop_last": False,
@@ -70,12 +70,15 @@ cfg = InferConfig(
         recurrent=[],
         output=[],
     ),
-    times="2025010200..2025010500:24",
+    # 默认冬季 16 起报（1216-1231），与 fgvp_spa.py 同窗口；这是扫描/对照窗口。
+    times="2025121600..2025123100:24",
     steps=60,
     hour_interval=6,
     members=1,
     vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl,tp",
     gpus=2,
     cuda_devices="0,1",
-    output_dir="/workspace/data/shenzw/fgvp_output_new",
+    # 注意：目录名是 tongyun_single，但本档模型是 FGVP gdn2。
+    # 若这是给通云对照造的确定性基线，保留；否则应改成 fgvp_single。
+    output_dir="/workspace/data/shenzw/tongyun_single",
 )

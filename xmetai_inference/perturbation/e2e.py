@@ -2,7 +2,7 @@
 """SPW 端到端预检（e2e）：在**真实框架路径**上把「确定性 ONNX -> N 成员集合」跑一遍。
 
 self-test 验的是「选张量/配平/落盘」本身（纯 onnx / onnxruntime 层）；正式跑之前真正会
-翻车的是**框架接线**。本模块把下面五条逐条钉死，任何一条不过就说明先别上服务器：
+翻车的是**框架接线**。本模块把下面四条逐条钉死，任何一条不过就说明先别上服务器：
 
   1. 规格解析：config 里的 weight_perturb dict -> WeightPerturbSpec -> create_model；
      非 ONNX 后端必须被明确拒绝（ValueError），而不是悄悄忽略扰动。
@@ -14,7 +14,6 @@ self-test 验的是「选张量/配平/落盘」本身（纯 onnx / onnxruntime 
   4. 成员集的 cli 编排：直接驱动 `cli._run_member_outer`（服务器上真正跑的就是它）——
      逐成员 load/release、每个成员各跑遍全部起报、输出落到 member_NNN/ 子目录、跑完
      session 已释放。第 3 节验的是语义，这一节验的是**落地那段代码**。
-  5. 分段 rollout（E3）：在段边界换一份冻结权重，边界前逐位相同、边界后全部不同。
 
 为什么用合成图：正式模型（iwc_fgvp_gdn2）依赖 Linux 侧自定义算子库 + CUDA，本地/CI
 建不了 session。所以这里用一张结构同构的小图 + 一个最小的 OnnxInferModel 子类。
@@ -34,17 +33,20 @@ import pandas as pd
 from ..backends.onnx import OnnxInferModel
 from ..models import create_model
 from ..runner import Rollout, Trajectory
-from .graph import (
+from ..weights.spw import (
+    DEFAULT_EXCLUDE,
+    WeightPerturbSpec,
     _onnx,
+    build_member_set,
     external_tensors,
     load_model,
+    member_model_path,
     resolve_effective_path,
     resolve_sigmas,
     select_initializers,
+    set_dir_for,
 )
 from .selftest import _Checker
-from .spec import DEFAULT_EXCLUDE, WeightPerturbSpec
-from .weights import build_member_set, member_model_path, set_dir_for
 
 # 合成「小天气模型」的几何：2 帧 x 6 通道，20x20 网格，64 隐层通道。
 # 组名照抄 FGVP 的三个架构组，让「按架构组选张量」这条路径也被走到。
@@ -69,7 +71,7 @@ _EXPECT_SKIPPED = (
     ("slice.starts", "非浮点"),
 )
 
-_TOTAL_SECTIONS = 5
+_TOTAL_SECTIONS = 4
 
 
 def _sha256(path: str) -> str:
@@ -239,7 +241,7 @@ def _load_mini(work: str):
 
 
 # ---------------------------------------------------------------------------
-# 1/6 规格与选组
+# 1/4 规格与选组
 # ---------------------------------------------------------------------------
 def _section_spec(work, check, metrics):
     check.section(1, _TOTAL_SECTIONS, "规格解析与选组（config dict -> spec -> 选中/排除）")
@@ -299,7 +301,7 @@ def _section_spec(work, check, metrics):
 
 
 # ---------------------------------------------------------------------------
-# 2/5 加载路径
+# 2/4 加载路径
 # ---------------------------------------------------------------------------
 def _section_load(work, check, metrics):
     check.section(2, _TOTAL_SECTIONS, "加载路径（走的是成员图 / 源图不变 / 外部数据在集内）")
@@ -351,7 +353,7 @@ def _section_load(work, check, metrics):
 
 
 # ---------------------------------------------------------------------------
-# 3/5 成员可用性
+# 3/4 成员可用性
 # ---------------------------------------------------------------------------
 def _section_members(work, check, metrics, members, steps):
     check.section(3, _TOTAL_SECTIONS,
@@ -464,94 +466,6 @@ def _stub_batch_model_class():
     return _BatchModel
 
 
-def _run_cli_m1a(path, spec, count, steps, inits, frame, *, segments=None):
-    """用 cli 的 m1a 编排跑一遍，返回 (返回码, 模型桩, {输出名: 该帧的预报数组})。
-
-    两条路径（segments=None / 分段）用的是同一份成员集与同一个初始态，所以逐帧可比：
-    只要第 0 段与基线同规格，`边界之前逐位相同` 就是一条可断言的强命题。
-    """
-    import argparse
-
-    from ..cli import _run_member_outer
-
-    model = _stub_batch_model_class()()
-    model.weight_perturb = spec
-    writer = _StubWriter()
-    args = argparse.Namespace(steps=steps, out="", model=path)
-    batches = [[{"state": frame, "init": init} for init in inits]]
-    code = _run_member_outer(model, None, batches, writer, args, inits,
-                             list(range(count)), ["c0"], np.zeros(1), np.zeros(1),
-                             6, 0, 1, segments=segments)
-    return code, model, {name: array for name, array in writer.raw if array is not None}
-
-
-def _section_segments(work, check, metrics, members, steps):
-    check.section(5, _TOTAL_SECTIONS,
-                  "分段 rollout（E3：段边界换权重 / 帧号连续 / 边界前后逐帧可对照）")
-    from .segments import parse_segment_plan
-
-    if steps < 2:
-        raise ValueError("分段预检至少要 2 步")
-
-    path = osp.join(work, "mini.onnx")
-    cfg = _cfg(groups=("all",), sigma_full=0.01)
-    spec = WeightPerturbSpec.from_config(cfg)
-    count = min(members, 4)
-    build_member_set(path, spec, count, verbose=False)
-
-    head = steps // 2
-    # 第 0 段故意与基线**同规格同种子**：于是「边界之前逐位相同」变成可断言的强命题
-    # （换段不会回头污染已经算完的帧）。第 1 段换 σ 与种子，保证边界之后必然不同。
-    plan = parse_segment_plan(
-        [{"sigma_full": spec.sigma_full, "steps": head},
-         {"sigma_full": spec.sigma_full * 2.0, "steps": steps - head, "seed": 1}],
-        spec, steps)
-    check([round(item.sigma_full, 6) for item in plan.specs()] == [0.01, 0.02],
-          "各段 σ 按分段表落地（0.01 -> 0.02）",
-          str([item.sigma_full for item in plan.specs()]))
-    build_member_set(path, plan.specs()[1], count, verbose=False)
-
-    inits = [pd.Timestamp("2025-01-02 00:00")]
-    frame = np.random.default_rng(11).standard_normal(_IN_SHAPE[1:]).astype(np.float32)
-
-    base_code, base_model, base_raw = _run_cli_m1a(path, spec, count, steps, inits, frame)
-    seg_code, seg_model, seg_raw = _run_cli_m1a(path, spec, count, steps, inits, frame,
-                                                segments=plan)
-    check(base_code == 0 and seg_code == 0, "不分段 / 分段两条路径都正常返回 0",
-          f"base={base_code} segments={seg_code}")
-    check(set(seg_raw) == set(base_raw) and base_raw,
-          f"分段不改输出布局：帧号仍然连续到 {steps}（{len(seg_raw)} 个文件）",
-          str(sorted(set(base_raw) ^ set(seg_raw))[:4]))
-
-    same, before = 0, 0
-    diff, after = 0, 0
-    for name, array in base_raw.items():
-        step = int(osp.basename(name)[:-3])
-        equal = np.array_equal(array, seg_raw[name])
-        if step <= head:
-            before += 1
-            same += int(equal)
-        else:
-            after += 1
-            diff += int(not equal)
-    check(before > 0 and same == before,
-          f"边界之前（前 {head} 步）逐位相同：换段没有回头改写已经算完的帧",
-          f"{same}/{before}")
-    check(after > 0 and diff == after,
-          f"边界之后（后 {steps - head} 步）全部不同：段边界确实换了权重",
-          f"{diff}/{after}")
-
-    check(base_model.seen == list(range(count)),
-          "不分段时每个成员只 load 一次", str(base_model.seen))
-    expect = [index for index in range(count) for _ in plan.segments]
-    check(seg_model.seen == expect,
-          f"分段时每个成员 load {len(plan.segments)} 次（段边界各换一次；这是分段唯一的额外开销）",
-          str(seg_model.seen))
-    metrics["segments_loads"] = len(seg_model.seen)
-    metrics["segments_same_before"] = same
-    metrics["segments_diff_after"] = diff
-
-
 def _section_cli_m1a(work, check, metrics, members, steps):
     check.section(4, _TOTAL_SECTIONS,
                   "成员集的 cli 编排（成员外层 / 逐成员 release / 输出落 member_NNN/）")
@@ -633,7 +547,6 @@ def run_e2e(members=51, steps=6, *, verbose=True, keep=False):
         _section_load(work, check, metrics)
         _section_members(work, check, metrics, members, steps)
         _section_cli_m1a(work, check, metrics, members, steps)
-        _section_segments(work, check, metrics, members, steps)
 
         print("\n" + "=" * 72)
         print("关键数字")
@@ -646,10 +559,6 @@ def run_e2e(members=51, steps=6, *, verbose=True, keep=False):
         if metrics.get("cli_files"):
             print(f"  cli 编排产出 {metrics['cli_files']} 个输出文件"
                   "（按 起报/member_NNN/步号 命名）")
-        if metrics.get("segments_loads"):
-            print(f"  分段 rollout（E3）：{metrics['segments_loads']} 次 load；"
-                  f"边界前逐位相同 {metrics['segments_same_before']} 帧、"
-                  f"边界后全部不同 {metrics['segments_diff_after']} 帧")
         print(f"合计：{check.passed} 条通过，{len(check.failures)} 条不通过")
         if check.failures:
             print("不通过项：")

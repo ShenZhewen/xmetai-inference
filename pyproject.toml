@@ -36,7 +36,6 @@ xmetai-infer = "xmetai_inference.cli:main"
 include = ["xmetai_inference*"]
 
 [tool.setuptools.package-data]
-"xmetai_inference" = [
-    "weights/README.md",
-    "perturbation/README.md",
+"xmetai_inference.weights" = [
+    "README.md",
 ]

@@ -1,52 +1,28 @@
 # -*- coding: utf-8 -*-
-"""SPW 命令行：members（造成员集）/ groups（选组）/ probe（量级）/ e2e（端到端预检）/ check（真实输出目录的集合体检）。
+"""扰动 / 分析命令：probe / self-test / e2e / check / spread / verdict。
 
-用法（在仓库根目录，或设 PYTHONPATH 指向仓库根）：
+造产物的动作已经移出命令行：直接改 `xmetai_inference/weights/spw.py` 或
+`weights/spa.py` 末尾 `if __name__ == "__main__"` 里的字面量再运行：
 
-    python -m xmetai_inference.perturbation groups  model.onnx
-    python -m xmetai_inference.perturbation members model.onnx --members 51
+    python -m xmetai_inference.weights.spw     # groups / members
+    python -m xmetai_inference.weights.spa     # latent build / audit
+
+本模块只保留需要按次传参的分析与测试入口：
+
     python -m xmetai_inference.perturbation probe   model.onnx --m1a-members 8
     python -m xmetai_inference.perturbation self-test
     python -m xmetai_inference.perturbation e2e --members 51
     python -m xmetai_inference.perturbation check /path/to/output_dir
-    python -m xmetai_inference.perturbation verdict F S T V E3      # 判决页（零推理）
-    python -m xmetai_inference.perturbation latent build model.onnx --tau-days 3   # 潜空间 AR(1)
-    python -m xmetai_inference.perturbation latent audit model.ar1-xxxxxxxxxx.onnx
-    python -m xmetai_inference.perturbation noise-scale model.onnx --k 2.0   # 图内噪声幅度 σ×k
-
-`groups` 用来挑注入点：打印每个名字前缀的张量数、元素数、权重能量占比，
-按能量降序，方便对着论文的「张量组 / 尺度」两阶段消融选候选。
-`members` 造完之后直接 `xmetai-infer --model <config>` 即可（配置里写 weight_perturb，
-框架会按成员号自己换路径）。
-
-`audit` 子命令与它依赖的审计 / 结构核对工具（`audit_model` / `structural_diff` /
-`find_source_for` / `reference_budget`）已于 2026-09-28 删除：它们只服务于 2026-09-23 淘汰的
-M3「图内随机算子」旧图，而磁盘上那张 m3 旧图也已一并删掉；成员图本来就没有图内噪声节点。
+    python -m xmetai_inference.perturbation spread out/A out/B --csv out/curves
+    python -m xmetai_inference.perturbation verdict F S T V E3
 """
 from __future__ import annotations
 
 import argparse
-import os.path as osp
 import sys
 
-import numpy as np
-
-from .graph import (
-    _FLOAT_DTYPES,
-    _onnx,
-    consumer_map,
-    key_parts,
-    load_model,
-    tensor_energy,
-    weight_like,
-    _match_pattern,
-)
-from .latent import (DEFAULT_LENGTH_SCALE, LatentForcingSpec, audit_forcing,
-                     build_forcing_model, format_forcing_audit)
-from .noise_scale import (DEFAULT_FACTOR, DEFAULT_TENSOR, format_noise_scale_report,
-                          scale_builtin_noise)
-from .spec import DEFAULT_EXCLUDE, WeightPerturbSpec
-from .verdict import DEFAULT_BASE, DEFAULT_PREFIX, DEFAULT_VAR
+from ..analysis.verdict import DEFAULT_BASE, DEFAULT_PREFIX, DEFAULT_VAR
+from ..weights.spw import DEFAULT_EXCLUDE, WeightPerturbSpec
 
 
 def _spec_from_args(args) -> WeightPerturbSpec:
@@ -67,140 +43,10 @@ def _spec_from_args(args) -> WeightPerturbSpec:
     )
 
 
-def _cmd_groups(args) -> int:
-    """列出候选注入组。与 select_initializers 用同一套「权重」口径，避免误导。
-
-    `--depth` 控制分桶深度（默认 2：只到 `latent_mixer/layers` 这一级）；`--under` 把统计
-    限制到某个子树里，并把桶从子树的下一级开始列 —— 两者配合就是「注入点消融」的细粒度扫描
-    （论文 Phase 2 的做法）：先 `--under latent_mixer.layers.0.blocks --depth 5` 看每个 block
-    的能量，再挑 key 填进 config 的 `groups`。key 里 `/` 与 `.` 等价（`key_parts` 两种都切）。
-    """
-    onnx = _onnx()
-    model = load_model(args.model)
-    src_dir = osp.dirname(osp.abspath(args.model))
-    consumers = consumer_map(model.graph)
-    memo: dict = {}
-    exclude = (tuple(token.strip() for token in args.exclude.split(","))
-               if args.exclude else DEFAULT_EXCLUDE)
-    include = (tuple(token.strip() for token in args.include.split(","))
-               if args.include else ())
-    under = key_parts(args.under) if args.under else ()
-    depth_max = max(1, min(int(args.depth), 8))
-    if under and depth_max <= len(under):
-        depth_max = len(under) + 1          # 否则一个桶都列不出来，静默空表最坑
-    first_depth = len(under) + 1 if under else 1
-
-    buckets: dict[str, dict] = {}
-    chosen: list[tuple[float, str, int]] = []
-    weight_total = 0.0
-    total_tensors = 0
-    total_elements = 0
-    excluded_energy = other_energy = 0.0
-    excluded_count = other_count = 0
-    for tensor in model.graph.initializer:
-        name = tensor.name
-        dtype = onnx.TensorProto.DataType.Name(tensor.data_type)
-        elements = int(np.prod(tensor.dims)) if tensor.dims else 1
-        if dtype not in _FLOAT_DTYPES:
-            continue
-        parts = key_parts(name)
-        forced = _match_pattern(parts, include) is not None
-        if not forced and elements < args.min_elements:
-            continue
-        energy = tensor_energy(tensor, src_dir) if args.energy else float(elements)
-        if _match_pattern(parts, exclude) is not None:
-            excluded_energy += energy
-            excluded_count += 1
-            continue
-        if not forced and not weight_like(name, consumers, memo):
-            other_energy += energy
-            other_count += 1
-            continue
-        weight_total += energy
-        total_tensors += 1
-        total_elements += elements
-        if under and parts[: len(under)] != under:
-            continue                        # --under：只统计子树
-        chosen.append((energy, name, elements))
-        for depth in range(first_depth, depth_max + 1):
-            key = "/".join(parts[:depth])
-            bucket = buckets.setdefault(
-                key, {"tensors": 0, "elements": 0, "energy": 0.0})
-            bucket["tensors"] += 1
-            bucket["elements"] += elements
-            bucket["energy"] += energy
-
-    unit = "能量 ΣW^2" if args.energy else "元素数"
-    print(f"候选权重合计（{unit}）{weight_total:.6g}，"
-          f"{total_tensors} 个张量 / {total_elements/1e6:.2f}M 元素")
-    if under:
-        share = (sum(item[0] for item in chosen) / weight_total * 100.0
-                 if weight_total else 0.0)
-        print(f"--under {'/'.join(under)}：命中 {len(chosen)} 个张量 / "
-              f"{sum(item[2] for item in chosen)/1e6:.2f}M 元素，占候选能量 {share:.1f}%"
-              f"（桶列到第 {depth_max} 级）")
-    print(f"{'group':40s} {'tensors':>8s} {'elements':>12s} {'share':>7s}")
-    for key, bucket in sorted(buckets.items(), key=lambda kv: -kv[1]["energy"])[: args.top]:
-        share = bucket["energy"] / weight_total * 100.0 if weight_total else 0.0
-        print(f"{key:40s} {bucket['tensors']:8d} {bucket['elements']/1e6:11.2f}M {share:6.1f}%")
-    print("\n能量最大的 10 个候选张量（肉眼确认没有混进常量）：")
-    for energy, name, elements in sorted(chosen, reverse=True)[:10]:
-        print(f"  {energy:12.4g}  {name:56s} n={elements}")
-    if excluded_count:
-        share = excluded_energy / (weight_total + excluded_energy) * 100.0
-        print(f"\n另命中 exclude 的 {excluded_count} 个张量，能量占比 {share:.1f}%"
-              f"（默认排除统计量/烘焙常量，可用 --exclude 覆盖）")
-    if other_count:
-        print(f"另 {other_count} 个非权重张量（{other_energy:.4g}）未计入；"
-              f"确属可学习参数可用 --include 纳入")
-    print("\ngroups 支持任意深度前缀（`/` 与 `.` 等价），上面列出的 key 可以直接填进 config 的"
-          " `groups`。\n扫子组用：--under <前缀> --depth <级数>；权重名被导出器拍平的图会走"
-          "消费者节点名前缀匹配。")
-    return 0
-
-
 def _cmd_self_test(args) -> int:
     from .selftest import run_self_test
 
     return run_self_test(verbose=not args.quiet, keep=args.keep)
-
-
-def _cmd_members(args) -> int:
-    """把逐成员冻结的扰动权重物理落盘。"""
-    from .weights import build_member_set, format_member_report, verify_member_set
-
-    spec = _spec_from_args(args)
-    report = build_member_set(args.model, spec, args.members, out_dir=args.out,
-                              link=not args.no_link, verbose=True)
-    if args.verify:
-        info = verify_member_set(args.model, spec, args.members, out_dir=args.out)
-        print()
-        print(format_member_report(info))
-        return 1 if info["problems"] else 0
-    print(f"清单：{report['manifest']}")
-    print("成员模型可直接当确定性模型跑：它们是成员集目录里的普通确定性 onnx"
-          "（<模型名>.mNNN.onnx）。正常不用手动指——config 里给了 weight_perturb，"
-          "框架会按成员号自己换路径。")
-    return 0
-
-
-def _cmd_probe(args) -> int:
-    """探针：量噪声在输出上的量级与线性度。"""
-    from .probe import format_member_scan, format_probe, member_scan, probe
-
-    spec = _spec_from_args(args)
-    common = dict(provider=args.provider, device=args.device,
-                  ops_library=args.ops_library, seed=args.seed,
-                  feeds_mode=args.feeds, per_channel=args.per_channel)
-    if args.m1a_members:
-        print(format_member_scan(member_scan(args.model, spec, args.m1a_members,
-                                             runs=1, **common)))
-        return 0
-    report = probe(args.model, runs=args.runs, reference=args.reference, **common)
-    print(format_probe(report, per_channel=args.per_channel))
-    if not report.get("ok"):
-        return 1
-    return 0
 
 
 def _cmd_e2e(args) -> int:
@@ -214,8 +60,25 @@ def _cmd_e2e(args) -> int:
     )
 
 
+def _cmd_probe(args) -> int:
+    """探针：量噪声在输出上的量级与线性度。"""
+    from ..analysis.probe import format_member_scan, format_probe, member_scan, probe
+
+    spec = _spec_from_args(args)
+    common = dict(provider=args.provider, device=args.device,
+                  ops_library=args.ops_library, seed=args.seed,
+                  feeds_mode=args.feeds, per_channel=args.per_channel)
+    if args.m1a_members:
+        print(format_member_scan(member_scan(args.model, spec, args.m1a_members,
+                                             runs=1, **common)))
+        return 0
+    report = probe(args.model, runs=args.runs, reference=args.reference, **common)
+    print(format_probe(report, per_channel=args.per_channel))
+    return 0 if report.get("ok") else 1
+
+
 def _cmd_check(args) -> int:
-    from .enscheck import run_check
+    from ..analysis.enscheck import run_check
 
     return run_check(
         args.path,
@@ -229,7 +92,7 @@ def _cmd_check(args) -> int:
 
 
 def _cmd_spread(args) -> int:
-    from .spread import run_spread
+    from ..analysis.spread import run_spread
 
     return run_spread(
         args.paths,
@@ -245,7 +108,7 @@ def _cmd_spread(args) -> int:
 
 
 def _cmd_verdict(args) -> int:
-    from .verdict import run_verdict
+    from ..analysis.verdict import run_verdict
 
     dirs = {}
     for token in str(args.dir or "").split(","):
@@ -277,132 +140,8 @@ def _cmd_verdict(args) -> int:
     )
 
 
-def _split_targets(text):
-    """`--targets` 的逗号分隔，但 `layer_stream:0,10,20` 别名**内部**的逗号不算分隔符。
-
-    `--targets` 用逗号分隔多个注入点，而 pt2 的层号别名天生也带逗号，两者会撞：不处理的话
-    `layer_stream:0,2` 被拆成 `layer_stream:0` + `2`，而裸 `2` 作为节点名后缀会**静默**匹配到
-    某个无关节点（实测踩过）。合并规则很窄：上一个 token 是 `layer_stream:` 开头、当前 token
-    是纯数字，才并回去 —— 想同时注入 `layer_stream:0` 和名字以数字结尾的节点，请写显式节点名。
-    """
-    merged = []
-    for token in (part.strip() for part in str(text).split(",")):
-        if not token:
-            continue
-        if merged and merged[-1].startswith("layer_stream:") and token.isdigit():
-            merged[-1] = f"{merged[-1]},{token}"
-        else:
-            merged.append(token)
-    return tuple(merged)
-
-
-def _latent_build_pt2(args, spec) -> int:
-    """pt2 的注入验收：加载 → 改内存图 → 就地审计（没有落盘产物，所以只有这一步）。
-
-    验收看三件事：目标回溯到几个层（FuXi-2.1 应为 30）、布局是否与配置相符
-    （tokens/channels/grid）、以及 audit 的 `ok`（含**拓扑序** —— 逆序的图照样能
-    recompile，只在跑 module() 时才炸，所以它是断言不是提醒）。
-    """
-    import torch.export
-
-    from .latent_pt2 import attach_forcing
-
-    ep = torch.export.load(args.model)
-    report = attach_forcing(ep, spec, src_path=args.model, verbose=not args.quiet)
-    if args.json:
-        print(json.dumps({k: v for k, v in report.items()}, ensure_ascii=False, indent=2,
-                         default=str))
-        return 0 if report.get("ok") else 1
-
-    print(f"pt2 注入报告：{args.model}")
-    if report.get("skipped"):
-        print(f"  sigma={report['sigma']} ⇒ 空转对照：不改图、驱动侧不喂 xi（n_targets=0）")
-        return 0
-    layout = report["layout"]
-    print(f"  目标        {report['n_targets']} 个（{', '.join(report['targets'])}…）")
-    # 链路是验收的关键证据：节点名（add_12）看不出是哪一层，也看不出中间隔了什么。
-    for key, chain in sorted(report.get("chains", {}).items(),
-                             key=lambda item: int(item[0].split("_")[1])):
-        print(f"    {key:<10} {' → '.join(chain)}")
-    print(f"  新增节点    {report['nodes']}")
-    print(f"  布局        tokens={layout['tokens']} channels={layout['channels']} "
-          f"grid={layout['grid']}")
-    print(f"  dtype       {report['dtype']}")
-    print(f"  指纹        {report['fingerprint']}")
-    basis = report["basis"]
-    print(f"  基          ‖Vt‖={report['norm_v']:.4f}（应 ≈ sqrt(rank)="
-          f"{np.sqrt(basis['rank']):.4f}）基隐含 sigma={report['sigma_implied']:.6f}"
-          f"（设定 {spec.sigma:.6f}）退化={basis['fallbacks']}")
-    print(f"  ρ(Δt={spec.hour_interval:g}h) = {spec.rho():.4f}（τ={spec.tau_days:g} 天，驱动侧）")
-    print(f"  审计        {'结构自洽' if report['ok'] else '**不过**'} "
-          f"(拓扑序={report.get('topological')} {report.get('lint_error', '')})")
-    return 0 if report.get("ok") else 1
-
-
-def _cmd_noise_scale(args) -> int:
-    """图内自带噪声的幅度：σ ×k（改 logvar bias 一个 initializer，权重结构一字不动）。
-
-    只对**集合图**有意义 —— 成员的多样性来自图内随机算子的那些图。谱系上它与
-    weight_perturb（改权重）和 latent_forcing（改时间相关）正交，三条可叠。
-    """
-    report = scale_builtin_noise(
-        args.model, k=args.k, tensor=args.tensor, factor=args.factor, out=args.out)
-    for line in format_noise_scale_report(report):
-        print(line)
-    return 0
-
-
-def _cmd_latent(args) -> int:
-    """潜空间 AR(1) 强迫：build（给图加 spw/xi）/ audit（看改得对不对）。
-
-    与 SPW 的关系：SPW 改**权重**（幅度轴），这条改**图**、拧的是噪声的时间相关（tau）与
-    空间尺度（length_scale）。两条正交，config 里同时写就是「冻结的扰动权重 + 时间相关的
-    潜空间强迫」。build 出来的图要由**框架**喂 spw/xi（每步 T x R 个数），单独拿它跑推理
-    只会得到「sigma=0 的空转」——那正是等价性回归用的对照。
-    """
-    if args.latent_command == "audit":
-        if str(args.model).endswith(".pt2"):
-            print("pt2 后端的强迫图**不落盘**（改的是加载后的内存图），没有可以单独审计的"
-                  "产物；改跑 build —— 它注入完就地审计并打印同一份报告。", file=sys.stderr)
-            return 2
-        report = audit_forcing(args.model)
-        if args.json:
-            print(json.dumps(dict(report), ensure_ascii=False, indent=2))
-        else:
-            for line in format_forcing_audit(report):
-                print(line)
-        return 0 if report.get("ok") else 1
-
-    spec = LatentForcingSpec(
-        targets=_split_targets(args.targets),
-        sigma=args.sigma,
-        tau_days=args.tau_days,
-        rank=args.rank,
-        length_scale=args.length_scale,
-        seed=args.seed,
-        hour_interval=args.hour_interval,
-        grid=(tuple(int(v) for v in str(args.grid).split(",")) if args.grid else None),
-        cache_dir=args.cache_dir,
-    )
-    if str(args.model).endswith(".pt2"):
-        # pt2：改内存图、不落盘 ⇒ build 与 audit 是同一步（见上面的 audit 分支）。
-        return _latent_build_pt2(args, spec)
-
-    path = build_forcing_model(args.model, spec, args.out, verbose=not args.quiet)
-    report = audit_forcing(path)
-    if args.json:
-        print(json.dumps(dict(report), ensure_ascii=False, indent=2))
-    else:
-        print()
-        for line in format_forcing_audit(report):
-            print(line)
-    return 0 if report.get("ok") else 1
-
-
-def _add_spec_args(parser, *, with_out: bool = True) -> None:
-    """members / probe 共用的注入规格参数。"""
-    if with_out:
-        parser.add_argument("--out", default=None, help="输出路径；默认源模型同目录")
+def _add_spec_args(parser) -> None:
+    """probe 的注入规格参数。"""
     parser.add_argument("--groups", default="all", help="逗号分隔的组前缀，默认 all")
     parser.add_argument("--sigma", type=float, default=None, help="直接指定 σ（跳过自动配平）")
     parser.add_argument("--sigma-full", type=float, default=0.01, help="全权重口径的 σ")
@@ -427,28 +166,8 @@ def main(argv=None) -> int:
         except Exception:
             pass
     parser = argparse.ArgumentParser(
-        description="确定性 ONNX -> 集合模型：权重扰动（SPW）工具")
+        description="扰动分析 / 测试命令（造产物请直接运行 weights 模块）")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    groups = sub.add_parser("groups", help="列出可选的注入组（按权重能量排序）")
-    groups.add_argument("model")
-    groups.add_argument("--min-elements", type=int, default=64)
-    groups.add_argument("--exclude", default=None,
-                        help=f"排除模式，逗号分隔；默认 {','.join(DEFAULT_EXCLUDE)}")
-    groups.add_argument("--include", default=None,
-                        help="强制纳入模式（名字不像 weight/bias 的可学习参数）")
-    groups.add_argument("--energy", action="store_true", default=True,
-                        help="按 Frobenius 能量统计（默认）；--no-energy 时退化为元素数")
-    groups.add_argument("--no-energy", dest="energy", action="store_false")
-    groups.add_argument("--top", type=int, default=25)
-    groups.add_argument("--depth", type=int, default=2,
-                        help="分桶深度（默认 2）。扫子组时配合 --under 用，例如 "
-                             "--under latent_mixer.layers.0.blocks --depth 5")
-    groups.add_argument("--under", default=None,
-                        help="只统计该名字前缀（`/` 与 `.` 等价）下面的张量，"
-                             "并把桶从它的下一级开始列 —— 注入点的细粒度扫描")
-    groups.set_defaults(func=_cmd_groups)
-
 
     self_test = sub.add_parser(
         "self-test", help="在合成小图上自检：σ→0 无损 / 注入方差定律 / 外部数据不被复制")
@@ -464,19 +183,6 @@ def main(argv=None) -> int:
     e2e.add_argument("--keep", action="store_true", help="保留临时工作目录")
     e2e.add_argument("--quiet", action="store_true", help="只打印失败项与总结")
     e2e.set_defaults(func=_cmd_e2e)
-
-    members = sub.add_parser(
-        "members",
-        help="把逐成员冻结的扰动权重物理落盘（论文的主配置；推理零噪声开销）")
-    members.add_argument("model", help="源确定性 onnx（权重可以走外部 .data）")
-    members.add_argument("--members", type=int, required=True, help="要生成多少个成员")
-    members.add_argument("--out", default=None,
-                         help="成员集目录；默认落在源模型同目录（文件名带指纹）")
-    members.add_argument("--no-link", dest="no_link", action="store_true",
-                         help="不用硬链接共享源 .data，整份复制（会占大量磁盘）")
-    members.add_argument("--verify", action="store_true", help="生成后立刻复核")
-    _add_spec_args(members, with_out=False)
-    members.set_defaults(func=_cmd_members)
 
     probe_cmd = sub.add_parser(
         "probe", help="量噪声在输出上的量级与线性度（不需要实况、不需要 rollout）")
@@ -494,7 +200,7 @@ def main(argv=None) -> int:
                            help="按倒数第 3 维（[B,F,C,H,W] 的通道）细分")
     probe_cmd.add_argument("--feeds", default="normal", choices=["normal", "ones", "zeros"],
                            help="自动造输入的口径（默认 normal）")
-    _add_spec_args(probe_cmd, with_out=False)
+    _add_spec_args(probe_cmd)
     probe_cmd.set_defaults(func=_cmd_probe)
 
     check = sub.add_parser(
@@ -560,61 +266,6 @@ def main(argv=None) -> int:
                          help="跳过可比性核对")
     verdict.add_argument("--csv", default=None, help="把 r/k 曲线落盘成 CSV")
     verdict.set_defaults(func=_cmd_verdict)
-
-    latent = sub.add_parser(
-        "latent",
-        help="潜空间 AR(1) 强迫：给图加一个 spw/xi 输入（噪声的**时间相关**那条腿）")
-    latent_sub = latent.add_subparsers(dest="latent_command", required=True,
-                                       help="build = 改图 / audit = 审计改完的图")
-
-    latent_build = latent_sub.add_parser(
-        "build", help="把 AR(1) 潜空间强迫注入图上（权重一个字节都不动），写出新图")
-    latent_build.add_argument("model", help="源确定性 onnx（也可以直接给 m1a 的成员图）")
-    latent_build.add_argument("--targets", default="latent_state",
-                              help="注入目标：onnx 用 latent_state（默认）/ blocks / 节点名后缀；"
-                                   "pt2 用 layer_stream 或 layer_stream:0,10,20。多个目标逗号分隔"
-                                   "（别名内部的逗号会被识别，不用转义）")
-    latent_build.add_argument("--sigma", type=float, default=0.04,
-                              help="相对强迫强度（z (x) (1 + sigma*n)），默认 0.04；0 = 空转对照")
-    latent_build.add_argument("--tau-days", dest="tau_days", type=float, default=3.0,
-                              help="AR(1) 相关时间（天），默认 3（rho = exp(-dt/tau) = 0.92）")
-    latent_build.add_argument("--rank", type=int, default=16, help="低秩基的秩 R，默认 16")
-    latent_build.add_argument("--length-scale", dest="length_scale", type=float,
-                              default=DEFAULT_LENGTH_SCALE,
-                              help="空间基的高斯低通相关长度（token 数）：32 = 只扰行星尺度，"
-                                   "1 = 所有尺度一起扰（默认 %(default)s）")
-    latent_build.add_argument("--hour-interval", dest="hour_interval", type=float, default=6.0,
-                              help="一步多少小时（算 rho 用），默认 6")
-    latent_build.add_argument("--seed", type=int, default=None, help="驱动侧随机流的种子")
-    latent_build.add_argument("--grid", default=None,
-                              help="pt2 专用：空间网格「rows,cols」（FuXi-2.1 = 120,240）。"
-                                   "fx 图里没有可靠的网格来源，必须显式给；onnx 自动推")
-    latent_build.add_argument("--cache-dir", dest="cache_dir", default=None,
-                              help="输出目录；默认源模型同目录（外部数据要求同目录，别乱指）")
-    latent_build.add_argument("--out", default=None, help="输出文件路径；默认按指纹命名")
-    latent_build.add_argument("--quiet", action="store_true", help="只打印审计结果")
-    latent_build.add_argument("--json", action="store_true", help="审计结果打成 JSON")
-    latent_build.set_defaults(func=_cmd_latent)
-
-    latent_audit = latent_sub.add_parser(
-        "audit", help="审计强迫图：spw/xi 是否真在输入里、metadata 是否自洽")
-    latent_audit.add_argument("model")
-    latent_audit.add_argument("--json", action="store_true", help="打成 JSON")
-    latent_audit.set_defaults(func=_cmd_latent)
-
-    noise = sub.add_parser(
-        "noise-scale",
-        help="图内自带噪声的幅度 σ×k（只动 logvar bias 一个 initializer，权重结构不动）")
-    noise.add_argument("model", help="集合图 onnx（成员由图内随机算子给出的那张）")
-    noise.add_argument("--k", type=float, default=2.0,
-                       help="σ 的倍数，默认 2；<1 = 收缩。等价位移 = factor·ln(k)")
-    noise.add_argument("--tensor", default=DEFAULT_TENSOR,
-                       help="σ 的 logvar bias 张量名（默认 %(default)s）")
-    noise.add_argument("--factor", type=float, default=DEFAULT_FACTOR,
-                       help="σ 与 logvar 的换算 σ = exp(logvar/factor)，默认 %(default)s")
-    noise.add_argument("--out", default=None,
-                       help="输出路径；默认源图同目录 <stem>.k<k>.onnx（外部数据要求同目录）")
-    noise.set_defaults(func=_cmd_noise_scale)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -66,7 +66,7 @@ rho_eff = 0.92^51 ≈ 0.014（近似白噪声）。**那不影响本档的判决
     xmetai-infer --model fgvp_ens_ar1hi    --gpus 2 --cuda-devices 0,1 --out /tmp/probe_hi
     xmetai-infer --model fgvp_ens_ar1hi_hd --gpus 2 --cuda-devices 2,3 --out /tmp/probe_hd
 """
-from xmetai_inference.configs.fgvp_ens_pert import build
+from xmetai_inference.tmp_config.fgvp_ens_pert import build
 
 cfg = build("fgvp_ens_ar1hi", ar1=True, sigma=20.0, rollout_batch=6)
 # 只跑 1 个起报：这是判「有没有」的探针，不是出数的档（3 起报留给结论明确之后）。

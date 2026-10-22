@@ -9,9 +9,10 @@ Processor 管线处理。
 不再每步做 numpy↔torch 转换。
 
 潜空间 AR(1) 强迫（config 的 latent_forcing）：加载后对 fx 图做**内存改写**
-（perturbation/latent_pt2.py，与 ONNX 版语义同构：σ 折进基、τ 在驱动侧、不落盘）。
+（weights/spa_pt2.py，与 ONNX 版语义同构：σ 折进基、τ 在驱动侧、不落盘）。
 xi 走 GraphModule 属性（spw_xi）而不是图输入——torch.export 的图签名固定，
-塞不进新输入。驱动状态机与 onnx 后端共享 LatentStepStream。
+塞不进新输入。驱动状态机与 onnx 后端共享 `backends/spa.py` 的
+LatentStepStream。
 """
 import logging
 import os
@@ -58,7 +59,7 @@ class Pt2InferModel(BaseInferModel):
 
         forcing = getattr(self, "latent_forcing", None)
         if forcing is not None:
-            from xmetai_inference.perturbation.latent import LatentStepStream
+            from xmetai_inference.backends.spa import LatentStepStream
 
             # load() 里重建（同 onnx 后端的纪律）：每个成员一份、从不共享。
             self._latent_stream = LatentStepStream()
@@ -70,7 +71,7 @@ class Pt2InferModel(BaseInferModel):
             # 潜空间 AR(1)：必须在 module() 之前改图（unlift 拿到的是注入后的图）。
             # tau 只在驱动侧，不进图 ⇒ 换 τ 复用同一份改写逻辑（同 ONNX 版的共图设计）。
             if forcing is not None:
-                from xmetai_inference.perturbation.latent_pt2 import attach_forcing
+                from xmetai_inference.weights.spa_pt2 import attach_forcing
 
                 report = attach_forcing(ep, forcing, src_path=path)
                 self._latent_n_targets = int(report.get("n_targets", 0))

@@ -21,9 +21,10 @@ FUXI_ENS_DYNAMIC_STORES = [
 
 cfg = InferConfig(
     name="fuxi_ens",
+    # 2026-10-20 更正：权重在 xmetai-inference2 下（旧仓库 xmetai-inference 已不存在）。
     model_path=os.environ.get(
         "FUXI_ENS_ONNX",
-        "/workspace/szwCode/xmetai-inference/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
+        "/workspace/szwCode/xmetai-inference2/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
     ),
     # 统一开关：XMETAI_GPU_STATE="1"/"0" 显式覆盖，未设时用本 config 的默认（开）。
     # 原来这里是 XMETAI_DISABLE_GPU_STATE（反向语义），与 fgvp 的 ENABLE 方向相反、
@@ -60,6 +61,8 @@ cfg = InferConfig(
         recurrent=[],
         output=[],
     ),
+    # 默认 6 天（0102-0107）是链路冒烟窗口，不是生产窗口；正式全年请覆盖：
+    #   --times 2025010200..2025121500:24   # 348 起报，对齐 weather_rmse_ens_fuxi
     times=(
         "20250102..20250107:24,"
     ),

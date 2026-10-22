@@ -30,8 +30,8 @@
 """
 from copy import deepcopy
 
-from xmetai_inference.configs.fgvp_ens_pert import OUT_ROOT
-from xmetai_inference.configs.fgvp_ens_ar1state_s04 import cfg as _main
+from xmetai_inference.tmp_config.fgvp_ens_pert import OUT_ROOT
+from xmetai_inference.tmp_config.fgvp_ens_ar1state_s04 import cfg as _main
 
 cfg = deepcopy(_main)
 cfg.name = "fgvp_ens_ar1state_s04c4"

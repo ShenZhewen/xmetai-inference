@@ -66,12 +66,10 @@ cfg = InferConfig(
         output=[{"name": "denormalize_fengqing"}],
     ),
 
-    # 框架整体连通性测试：2 卡 × batch 2 × 预报 15 天，起报按天（每天 00Z）。
+    # 正式跑：2 卡 × batch 2 × 预报 15 天，起报按天（每天 00Z），覆盖 2025 全年。
     #
-    # 起报数必须 = gpus × batch_size = 4，理由是 cli.py 的多卡切分逻辑：
-    # members=1 时 cost_by_init 恒 ≤ cost_by_member，所以永远「按起报时间切」。
-    # 起报数 < gpus 会让部分 rank 分不到任务直接退出（2 卡只有 1 卡干活）；
-    # 起报数 = 4 时每卡拿 2 个，恰好凑成 1 个 batch，batch 维才真的被走到。
+    # members=1 时 cli.py 按起报时间切分；起报数 < gpus 会让部分 rank 空转。
+    # 本档全年逐日起报，每卡分到足够任务。
     #
     # `:24` 是起报**间隔**（每天一个起报），与 steps/hour_interval 的预报步长
     # 无关。显式写出来：cli.py:207 调 parse_times 时没传 hour_interval，缺省

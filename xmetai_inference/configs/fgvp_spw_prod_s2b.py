@@ -2,7 +2,7 @@
 r"""fgvp_spw_prod_s2b：SPW 的**大规模生产跑** —— S2B 配方，51 成员 / 29 起报 / 60 步 /
 5 变量（z500, u200, v200, msl, tp）。
 
-跑什么：`configs/fgvp_spw_ab.py` 的 **S2B** 臂（`latent_mixer` + `noise_struct="channel"`
+跑什么：`xmetai_inference/tmp_config/fgvp_spw_ab.py` 的 **S2B** 臂（`latent_mixer` + `noise_struct="channel"`
 + `sigma_full=0.027`），从 A/B 协议的 6 成员放大到 51 成员、29 起报。
 
 为什么是 S2B（依据 = 判决页 `$P verdict F S2B`，细节见 perturbation/README 与 PAPER.md）：
@@ -32,10 +32,10 @@ A/B 协议只有 6 成员，σ̂ 由单个成员主导（拿掉第 3 号掉 22-3
 成员集：**本次整份重造 51 个**（不复用第五轮那份）。
 
   指纹 = (groups, sigma_full, balance, exclude, include, min_elements, seed,
-  **noise_struct**, noise_block（冻结键，见 spec.NOISE_BLOCK_FROZEN）, member_format,
+  **noise_struct**, noise_block（冻结键，见 weights.spw.NOISE_BLOCK_FROZEN）, member_format,
   源 .onnx 的 size/mtime)。
   S2B 与 F 只差 `sigma_full`（0.027 vs 0.04）与 `noise_struct`（channel vs iid）；
-  `noise_struct` 的**非默认值进指纹**（`perturbation/spec.py` 的 `budgets()`，且有 selftest
+  `noise_struct` 的**非默认值进指纹**（`weights/spw.py` 的 `budgets()`，且有 selftest
   专门钉住「channel 不许耦合命中 iid 的成员集目录、静默复用错权重」）—— 所以 S2B 走自己的
   成员集目录，与 F **互不串味**。
 
@@ -211,7 +211,7 @@ cfg = InferConfig(
         "balance": "energy",
         "exclude": BASE_EXCLUDE,
         # **S2B 的定义性字段**：逐输出通道共享一个 xi（delta_W = diag(xi).W），而不是
-        # 逐元素 iid。非默认值**进指纹**（perturbation/spec.py 的 budgets()），
+        # 逐元素 iid。非默认值**进指纹**（weights/spw.py 的 budgets()），
         # 所以它会落到自己的成员集目录，不会命中 F 的 iid 成员集。
         "noise_struct": "channel",
         "min_elements": 64,

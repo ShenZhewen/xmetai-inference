@@ -51,8 +51,8 @@ def _c4(m: int) -> float:
 # balance：配平口径算术
 # --------------------------------------------------------------------------- #
 def cmd_balance(args) -> int:
-    from xmetai_inference.perturbation.graph import load_model, select_initializers
-    from xmetai_inference.perturbation.spec import WeightPerturbSpec
+    from xmetai_inference.weights.spw import (WeightPerturbSpec, load_model,
+                                              select_initializers)
 
     onnx = args.onnx or DEFAULT_ONNX
     if not osp.isfile(onnx):
@@ -98,7 +98,7 @@ def cmd_balance(args) -> int:
 # members：成员数 M 的隐藏偏差
 # --------------------------------------------------------------------------- #
 def cmd_members(args) -> int:
-    from xmetai_inference.perturbation.spread import analyse_run
+    from xmetai_inference.analysis.spread import analyse_run
 
     requested = list(range(2, args.max_m + 1))
     for root in args.paths:

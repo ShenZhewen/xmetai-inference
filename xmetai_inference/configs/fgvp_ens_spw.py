@@ -1,138 +1,125 @@
 # -*- coding: utf-8 -*-
-r"""fgvp_ens_spw：**集合模型 + 权重扰动** —— 把 SPW 叠到 FGVP 集合图（图内随机算子）上。
+r"""fgvp_ens_spw：**集合模型 + SPW（权重扰动）** 的标准档 —— 完整自包含。
 
-思路（2026-10-12 定档）：fgvp_ens 的 51 个成员全靠图内随机算子，而「不同 session 的
-随机序列逐位相同」（README 坑 1）意味着多卡拆成员后，成员多样性只剩每进程的
-ceil(51/卡数) 条独立轴——这是「FGVP 集合 spread 只有 AIFS 的 1/4」的头号嫌疑
-（fgvp_ens.py 文件头的待验怀疑）。本配置把 m1a 的冻结权重作为**第二条独立轴**叠上去：
+SPW 有两种用法，本文件是第二种：
 
-    成员 m = 第 g 份扰动图（冻结权重，g = 摊分序号）× 该图 session 内的第 j 次前向
-    （图内随机算子），m = g * J + j 由 cli._graph_member_split 摊好（51/8 = 7x3 + 6x5）。
+  1) **确定性模型 + SPW**（m1a，成员在外层）
+     扰动 N 份权重 = N 个成员；每份冻结权重要跑完全部起报，每个起报只出 1 条
+     轨迹，一个成员就是一份 onnx。见 ``configs/fgvp_spw_prod_s2b.py``（N=51）。
 
-即使所有 session 的图内随机流逐位相同，不同权重图出的成员照样不同——成员多样性
-不再赌跨进程 RNG 分歧。编舞是「图外层」（cli 的 _run_graph_outer）：每份图一个
-session 驱动 J 条轨迹（复用 _run_plain_block 的 members>1 分支，含 rollout_batch 前向批），
-多卡按**图**切（range(rank, G, 卡数)），一图的成员永不跨进程。
+  2) **集合模型 + SPW**（图在外层，本文件）
+     集合图自带图内随机算子，同一份权重每次前向给一个不同样本，所以：
 
-消融轴就在 `PERTURB_GRAPHS` 一个字面量上：0/不写 = 纯 fgvp_ens（对照）；
-1 = 扰动一份图服务全部成员；8 = 生产档（配 8 卡一卡一图）；16 = 「16 图 × ~3 成员」
-的另一种拆法（注意 members >= 2G 的下限：G 最多 25）。
+         成员 = n 份扰动图 x 每份图在同一 session 里跑 M 次前向 = n x M
 
-⚠⚠ 开跑前必须先在服务器上做的三件事（groups / σ 是从确定性 gdn2 图标定的，
-**没有**在集合图上验证过）：
+     本档 n = ``PERTURB_GRAPHS`` = 8、M = ``RUNS_PER_GRAPH`` = 6 -> **48 成员**。
+     成员 m 的权重身份是 g = m // M，图内序号 j = m % M。同一份图的 M 个成员
+     必须在同一进程的同一 session 里连跑（``cli._run_graph_outer``），不能按
+     成员拆到不同进程——否则图内随机算子按「worker 内第几次前向」对齐的序号
+     就断了。
 
-  1) 看集合图的注入组（latent_mixer 是 gdn2 的张量名前缀，集合图是 Mamba 骨干，
-     组名结构未必相同）：
-       P="python -m xmetai_inference.perturbation"
-       $P groups /workspace/tmp/douzsh/models/20261008/iwc_gssp_im_fp16.onnx
-     下面的 weight_perturb["groups"] 按这个输出改。
-  2) σ 不许直接抄 0.027：集合图自带图内离散度，σ̂ 目标值与确定性档不同。先用探针
-     量基线再定（$P probe 的 --m1a-members 8）。
-  3) 零成本旧账：fgvp_ens.py 文件头那条「挑一个已完整的起报日，比对
-     member_000/001/002/003 的 060.nc 是否逐字节相同」还没人做。做了它才知道图内
-     随机轴的真实自由度——若跨 rank 序列相同，(g, j) 两轴是**耦合**的（各图共享同一
-     套图内噪声序列），方案照样成立但解读要变。
+---- 为什么取 8 x 6 ----
 
-预算与算力（2 x H100 口径可参考 fgvp_spw_prod_s2b 的实测锚点）：
+  * 8 份图 / 4 卡 = 每卡 2 份图；每卡每起报跑 2 x 6 = 12 条轨迹，卡间完全均衡。
+  * M = 6 与 ``rollout_batch`` = 6 对齐：一份图的 6 条轨迹在每步只需要一次前向批。
+  * 48 与 FGVP 原生 51 成员只差 3，CRPS / spread 的成员数偏差可以忽略。
+    要严格 51 只能拆成 17 x 3（17 图 / 4 卡 = 5+4+4+4，卡间约 25% 尾巴），或者
+    放弃等 M（51/8 = 7x3 + 6x5）；本档不这么做。
 
-  * 成员集：PERTURB_GRAPPS 份（不是 51 份！）× 每份被扰动张量字节数 —— 具体多大
-    取决于集合图的组结构（第 1 步的输出），gdn2 上 latent_mixer 是 1.49 GB/份，
-    集合图按 groups 实测后再算。这是本方案相对 51 份成员集（~76 GB）的主要节省。
-  * 前向总量与 fgvp_ens 完全相同：起报 × 51 × 60，一个不多。
-  * 输出 29 起报 × 51 成员 × 60 帧 × 20.8 MB（5 变量）≈ **1.85 TB**，与 S2B 生产档
-    同口径（开跑前确认卷装得下）。
-  * 每 rank 显存：1 份图 + J 条轨迹 state（J<=7 × 645 MB ≈ 4.5 GB）+ rollout_batch 的
-    前向批（k x 648 MB，fp16 减半），8 卡一卡一图。
+改 n / M 时保持 ``MEMBERS = PERTURB_GRAPHS * RUNS_PER_GRAPH``，否则
+``_graph_member_split`` 会按 51/8 那种「前几份多一个」摊分，M 不再相等。
 
-跑法（服务器，先 smoke 再正式 —— **smoke 务必加 --out**，别写进生产目录）：
+---- 两条随机轴 ----
+
+权重扰动（本文件的 SPW）与图内随机算子是两条独立轴：换卡数只改「图分给哪个
+rank」，不改 (g, j) -> 成员号的映射；但图内随机序列按 session 内的前向顺序对齐，
+**换卡数 / 换 session 次序后不要拿新产物与在盘旧档逐位横比**（同批同卡数才可比）。
+``perturb_graphs`` 不进入权重指纹，加/减图不会重造已有的那几份成员权重。
+
+---- groups / sigma 的来历 ----
+
+沿用确定性档 s2b 的 ``latent_mixer`` + ``noise_struct="channel"`` +
+``sigma_full=0.027``。README 2O 记录：集合图（Mamba 骨干）的注入组尚未单独做
+审计记录。这是本臂现行配方；若服务器上还没核过 groups，SPW 这条腿的解读要打
+折扣，不是「效果不好」而是「跑的可能不是想跑的臂」。
+
+---- 时段、预算、跑法 ----
+
+时段：夏季 20250702-0730（29 起报）+ 冬季 20251101-1130（30 起报）= **59 起报**，
+评测侧必须同步。60 步 x 6 h = +360 h，5 变量 z500/u200/v200/msl/tp。
+
+输出预算：59 x 48 x 60 x 20.8 MB ≈ **3.5 TB**；成员权重集 8 份（不随成员数变，
+按 latent_mixer 与 gdn2 同量级估算约 12 GB）。
 
     cd /workspace/szwCode/xmetai-inference2
-    nvidia-smi -L                     # 卡号与 cuda_devices 对齐
+    nvidia-smi -L
 
-    # 先验链路（1 起报 / 全部图 × 少量成员 / 6 步，几分钟）：
+    # smoke：1 起报 / 8 图 x 2 成员 / 6 步，务必给 --out
     xmetai-infer --model fgvp_ens_spw --times 2025070200 --steps 6 \
-        --members 16 --gpus 1 --cuda-devices 0 \
-        --out /workspace/data/shenzw/fgvp_ens_spw_smoke
-    # members 必须 >= 2 x PERTURB_GRAPHS（每图至少 2 成员的校验），16 = 每图 2 个。
+        --members 16 --gpus 1 --cuda-devices 0 --out /tmp/smoke_ens_spw
 
-    # 正式：
+    # 正式
     xmetai-infer --model fgvp_ens_spw
 
-跑完之后（顺序：先对账、再谈指标）：
-
-  1. 体检：python -m xmetai_inference.perturbation check <out_dir>（成员互异、帧数齐全）。
-  2. 跨图独立性抽查：同一图内两成员差 vs 跨图两成员差（后者应显著大于前者；
-     若跨图成员差≈0，说明成员集没接上、所有图加载了同一份权重——加载期自检
-     本该拦住，这里双保险）。
-  3. spread 曲线 + 与 fgvp_ens 原档并排（$P spread 多目录对比），看 1/4 欠离散
-     是否被第二条轴抬起来。
-  4. 评测走 xmetai-evaluation-v2 现成裁判（口径同 spw_prod_s2b 那套）。
-
-本配置与 fgvp_ens.py 的 diff 只有：weight_perturb 块、PERTURB_GRAPHS、
-member_dir / output_dir、resident_members、times 窗口。数据集 / dataloader /
-rollout_batch / gpu 旋钮逐字照抄 fgvp_ens（第 5 轮已验证的配方）。
+smoke 的 ``--members`` 必须 >= 2 x PERTURB_GRAPHS = 16（每图至少 2 成员的校验）。
 """
-from __future__ import annotations
-
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
+# ---------------------------------------------------------------------------
+# 路径（服务器上的固定位置，直接改这里）
+# ---------------------------------------------------------------------------
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
+# 只读源集合图（fp16、动态 batch 轴）与插件。
 MODEL_DIR = "/workspace/tmp/douzsh/models"
-# 扰动权重（<stem>.mNNN.onnx / perturbed.mNNN.data）的落盘根目录。框架按指纹在下面
-# 建子目录（与 fgvp_spw_prod_s2b 同一套协议；换 member_dir 不改指纹）。
+SRC_GRAPH = f"{MODEL_DIR}/20261008/iwc_gssp_im_fp16.onnx"
+OPS_LIBRARY = f"{MODEL_DIR}/xmetai_onnx_plugins.ort1_24.cuda12.so"
+# 扰动权重的落盘根目录；框架按指纹在下面建子目录（member_dir 不进指纹）。
 MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"
 
-FGVP_ENS_SPW_DYNAMIC_STORES = [
+FGVP_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
     f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
 ]
 
-MEMBERS = 51
-# 扰动图数 G：members 摊到 G 份图上（51/8 = 7x3 + 6x5）。改这个值会**改成员集份数**
-# 但不改指纹（指纹只含 spec：groups/sigma/seed/...，不含 G）——同一 spec 目录下
-# 造满 G 份即可，加 G 不需要重造已有的那些份。
-# 卡数对齐：G >= gpus 才不空卡（8 图配 8 卡一卡一图，本配方现值）。
-PERTURB_GRAPHS = 8
+# ---------------------------------------------------------------------------
+# 成员结构：n 份扰动图 x 每份 M 次图内前向
+# ---------------------------------------------------------------------------
+PERTURB_GRAPHS = 8      # n：扰动图份数（每卡 2 份）
+RUNS_PER_GRAPH = 6      # M：每份图在每个起报上跑几条轨迹（= 图内随机样本）
+MEMBERS = PERTURB_GRAPHS * RUNS_PER_GRAPH   # 48：总成员数，必须等 M
 
-# 与 fgvp_spw_prod_s2b 逐字相同（exclude 那 7 个）。是否适用于集合图见文件头 ⚠ 第 1 步。
+# 与确定性档 s2b 逐字相同（exclude 那 7 个）。
 BASE_EXCLUDE = ("mean", "std", "const", "mask", "attn_mask", "ones", "zeros")
 
 
 cfg = InferConfig(
     name="fgvp_ens_spw",
-    # ⚠ 源是**集合图**（iwc_gssp_im 的 **fp16** 版，图内随机算子出成员），不是 s2b
-    # 用的确定性 iwc_fgvp_gdn2.onnx。源进指纹（size/mtime），挪动 = G 份图全部重造。
-    # fp16 + 动态 batch 轴：一次 forward 堆 k 条轨迹（下面的 rollout_batch）。
-    # 批的仍是**同图的成员**（图外层编舞下每 rank 一份图、J<=7 条轨迹），k=6 时
-    # 7 成员图批成 6+1、6 成员图一批完。显存按 k 倍涨（fp16 减半），
-    # k 超出 batch_axis_dynamic 的实测能力时 runner 会打 WARNING 退回 1。
-    model_path=f"{MODEL_DIR}/20261008/iwc_gssp_im_fp16.onnx",
-    ops_library=f"{MODEL_DIR}/xmetai_onnx_plugins.ort1_24.cuda12.so",
-    # 必须 False：单步型图，GPU 常驻分支绕过滑窗回填（同 fgvp_ens 的理由）。
+    model_path=SRC_GRAPH,
+    ops_library=OPS_LIBRARY,
+    # 必须 False：单步型图，GPU 常驻分支会绕过滑窗回填。
     gpu_state=False,
+    # 一份图的 M 条轨迹按这个宽度做前向批；M=6 时一批正好跑完。
     rollout_batch=6,
     gpu_mem=0.9,
     model_class="iwc_fgvp_mamba_ens_onnx",
     weight_perturb={
-        # ⚠⚠ 占位值：latent_mixer 是 gdn2 图的张量组名。集合图（Mamba 骨干）的组
-        # 结构没探过 —— 先跑文件头 ⚠ 第 1 步的 groups 命令，按输出改这里。
+        # 注入点与幅度沿用 s2b；集合图上的组审计见文件头。
         "groups": ("latent_mixer",),
-        # ⚠⚠ 占位值：0.027 是确定性档在「短时效 CRPS 代价 vs sigma 斜率」上的靶心。
-        # 集合图自带图内离散度，sigma 应显著**小于**它 —— 先 probe 再定，改值留痕。
         "sigma_full": 0.027,
         "balance": "energy",
         "exclude": BASE_EXCLUDE,
+        # 定义性字段：逐输出通道共享一个 xi，不是逐元素 iid。
         "noise_struct": "channel",
         "min_elements": 64,
         "member_dir": MODEL_ONNX_DIR,
         "seed": 0,
     },
-    # 集合模型 + 权重扰动的编舞开关（见 configs/base.py 的字段说明与本文件头）。
+    # >0 才走图外层编舞（集合模型专有；确定性模型配了会直接报错）。
     perturb_graphs=PERTURB_GRAPHS,
     dataset={
         "type": "processed_multi_zarr",
-        "paths": FGVP_ENS_SPW_DYNAMIC_STORES,
+        "paths": FGVP_DYNAMIC_STORES,
         "processors": [
             {
                 "name": "unit_convert",
@@ -159,9 +146,7 @@ cfg = InferConfig(
         ],
     },
     dataloader={
-        # batch_size 只是 I/O 装载分组（一次装几个起报），不碰 GPU 与速度；
-        # 前向批是上面的 rollout_batch。图外层编舞下数据集要被本 rank 的每份图各
-        # 迭代一遍（8 图 = 8 遍），预取深度 = workers x 2 x batch x 645 MB。
+        # batch_size 只是 I/O 装载分组；前向批是上面的 rollout_batch。
         "batch_size": 2,
         "num_workers": 2,
         "pin_memory": True,
@@ -173,22 +158,19 @@ cfg = InferConfig(
         recurrent=[],
         output=[],
     ),
-    # 与 fgvp_spw_prod_s2b 同窗口（20250702-0730 的 29 个起报）：spw_prod_s2b / AIFS /
-    # fgvp_ens 归档都在这个窗口上有数，三方并排读。全年口径照 fgvp_ens.py 写
-    # "2025010200..2025121500:24"。
-    times="2025070200..2025073000:24",
+    # 夏季 29 起报 + 冬季 30 起报（与 fgvp_spa / aBt15 同窗口）。
+    times="2025070200..2025073000:24,2025110100..2025113000:24",
     steps=60,
     hour_interval=6,
     members=MEMBERS,
     vars="z500,u200,v200,msl,tp",
-    # 图外层按图切卡：G=8 配 8 卡一卡一图。卡数 > G 会有卡空转（cli 打「没有分到图」
-    # 退出，不报错，但别这么配）；想减卡数就同步减 PERTURB_GRAPHS 或用 --gpus 覆盖。
-    gpus=8,
-    cuda_devices="0,1,2,3,4,5,6,7",
+    # 4 卡：每卡领 2 份图（range(rank, G, 卡数)），卡间轨迹数完全相等。
+    gpus=4,
+    cuda_devices="0,1,2,3",
     intra_op_threads=0,
     cudnn_algo_search="",
-    # 图外层的池子语义与 m1a 相同：换图 = 换权重 = 重装 session。本配方下同一张卡
-    # 只有一份图常驻（一 rank 一图），2 = 留一个余量槽（同 s2b 的给法）。
+    # 编舞逐图 load/release，同一时刻一张卡只有一份图是活的；2 留一个余量槽。
     resident_members=2,
-    output_dir="/workspace/data/shenzw/fgvp_ens_spw",
+    # 新成员数（48）与旧 29 起报 x 51 成员档不同，另开目录避免 resume 串档。
+    output_dir="/workspace/data/shenzw/fgvp_ens_spw_std",
 )

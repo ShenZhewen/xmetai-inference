@@ -11,8 +11,8 @@ import os
 import numpy as np
 import onnxruntime as ort
 
-from .base import BaseInferModel, _default_gpu_mem_limit
-from .session_pool import SessionPool, normalize_budget
+from .base import (BaseInferModel, SessionPool, _default_gpu_mem_limit,
+                   normalize_budget)
 
 log = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class OnnxInferModel(BaseInferModel):
     backend = "onnx"
     supports_weight_perturb = True
     # 潜空间 AR(1) 的能力位：与 supports_weight_perturb 分开声明（pt2 后端实现了
-    # latent_forcing 的 fx 图改写，但不支持 m1a 权重扰动——见 perturbation/latent_pt2.py）。
+    # latent_forcing 的 fx 图改写，但不支持 m1a 权重扰动——见 weights/spa_pt2.py）。
     supports_latent_forcing = True
     # 潜空间 AR(1) 强迫规格（config 的 latent_forcing）；None = 不加。
     # 与 weight_perturb 共用 supports_weight_perturb 这一个能力位：两者都是「改图 / 改权重」
@@ -91,8 +91,8 @@ class OnnxInferModel(BaseInferModel):
     #   1 = 缺省，换模型就把上一份还给 ORT —— 与小显存假设一致的资源行为；
     #   N > 1 = 最多同时驻留 N 份 session（换回来不重建、不重新预热 cuDNN）；
     #   -1 = 不限（全常驻）。
-    # 只有「逐成员换权重」的路径（m1a，以及它的分段 E3）会真的反复换模型，所以这个开关
-    # 在那些配方上才有意义；确定性模型只有一份 session，池子恒为 1 份。
+    # 只有「逐成员换权重」的路径（m1a）会真的反复换模型，所以这个开关在那些配方上
+    # 才有意义；确定性模型只有一份 session，池子恒为 1 份。
     resident_members = 1
     # 池子本体与「上一次 load 是否命中池」（cli 的日志要用）。池子在 load() 里惰性建。
     _pool = None
@@ -193,7 +193,7 @@ class OnnxInferModel(BaseInferModel):
         spec = getattr(self, "weight_perturb", None)
         forcing = getattr(self, "latent_forcing", None)
         if spec or forcing:
-            from xmetai_inference.perturbation import resolve_stack_path
+            from xmetai_inference.weights.spa import resolve_stack_path
 
             # 两步是正交的：先按 SPW 机制解析出「该加载哪份权重」（m1a 会落到成员图），
             # 再在它之上叠加潜空间强迫（只改图结构，一个权重字节都不动）。
@@ -232,7 +232,7 @@ class OnnxInferModel(BaseInferModel):
         # ⚠ _latent_n_targets 不在这里清零：它在上面 _verify_forcing 里按图 metadata 设定
         # （无 forcing 时它自己会先清零再早退）。这里再清一次会把刚设好的目标数抹回 0，
         # _latent_step_stream 恒返回 None，forward 喂不上 spw/xi —— 2026-09-29 A32 首跑实踩。
-        from xmetai_inference.perturbation.latent import LatentStepStream
+        from xmetai_inference.backends.spa import LatentStepStream
 
         self._latent_stream = LatentStepStream()
 
@@ -260,7 +260,7 @@ class OnnxInferModel(BaseInferModel):
                 f"启用了 m1a，但加载进来的图没有 m1a 的成员元数据"
                 f"（spw.mechanism={meta.get('spw.mechanism')!r}, spw.member={got!r}）。"
                 "多半是路径指向了源模型或 m3 的扰动图，而不是成员模型。"
-                "成员模型路径应由 perturbation.weights.member_model_path 给出。")
+                "成员模型路径应由 weights.spw.member_model_path 给出。")
         if got != str(want):
             raise RuntimeError(
                 f"加载到的成员图编号是 {got}，但本实例要跑的是 member "
@@ -290,7 +290,7 @@ class OnnxInferModel(BaseInferModel):
                 f"启用了 latent_forcing，但加载进来的图没有潜空间强迫的元数据"
                 f"（spw.ar1.method={meta.get('spw.ar1.method')!r}）。"
                 "多半是路径指向了源模型 / m3 的扰动图 / m1a 的成员图，而不是叠加了 "
-                "spw/xi 输入的那份。路径应由 perturbation.latent.resolve_stack_path 给出。")
+                "spw/xi 输入的那份。路径应由 weights.spa.resolve_stack_path 给出。")
         if meta.get("spw.ar1.input") != forcing.input_name:
             raise RuntimeError(
                 f"图里的强迫输入名是 {meta.get('spw.ar1.input')!r}，但本例要喂的是 "
@@ -347,9 +347,9 @@ class OnnxInferModel(BaseInferModel):
         `width` = 本次 forward 堆了几条轨迹（rollout_batch）。返回的 index 配合
         `ar1.row(index, width)` 取 [width, T, R] 一次喂进图。缺省 1 = 逐轨迹调用。
 
-        实现在 perturbation.latent.LatentStepStream（onnx / pt2 后端共享——这段逻辑出过
-        A32 接线事故，两份拷贝比一次受控共享危险）。完整语义、以及原接线错误的判决
-        见该类的 docstring。
+        实现在 backends.spa.LatentStepStream（onnx / pt2 后端共享——这段
+        逻辑出过 A32 接线事故，两份拷贝比一次受控共享危险）。完整语义、以及原接线
+        错误的判决见该类的 docstring。
         """
         forcing = getattr(self, "latent_forcing", None)
         if not forcing or self._latent_n_targets <= 0:
@@ -448,7 +448,7 @@ class OnnxInferModel(BaseInferModel):
     def _acquire_session(self, path):
         """按**解析后的路径**取 session：池里命中就复用，否则新建并入池。
 
-        键是路径而不是成员号，理由见 backends/session_pool.py 的模块注释（扰动/潜空间
+        键是路径而不是成员号，理由见 backends/base.py 里 SessionPool 的注释（扰动/潜空间
         强迫把指纹烘进了文件名，所以同一个路径 = 同一份权重、同一张图）。
         """
         if self._pool is None:
