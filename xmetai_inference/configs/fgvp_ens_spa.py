@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tongyun 集合图 + SPA（潜空间 AR(1) 强迫）。
-
-78 通道 / 2 帧输入 / 1 帧输出 / 0.25°；图内自带 RandomNormalLike，
-SPA 在其上增加时间相关的潜空间强迫。
-"""
+"""Tongyun 集合图（ERA5 版）+ SPA（潜空间 AR(1) 强迫）。78 通道 / 2 帧进 / 1 帧出。"""
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
@@ -13,8 +9,7 @@ FGVP_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
     f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
 ]
-# Tongyun 20261013 导出（不是 20261008 的 iwc_gssp_im 那张图）
-SRC_GRAPH = "/workspace/tmp/douzsh/models/20261013/tongyun_ens_era5_fp16.onnx"
+SRC_GRAPH = "/workspace/tmp/douzsh/models/20261013/tongyun_ens_era5_fp16.onnx"  # 20261013 导出
 OPS_LIBRARY = "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so"
 MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"
 
@@ -24,7 +19,6 @@ cfg = InferConfig(
     ops_library=OPS_LIBRARY,
     gpu_state=False,  # 单帧输出图，不能开 GPU 常驻
     model_class="iwc_fgvp_mamba_ens_onnx",
-    weight_perturb=None,
     latent_forcing={
         "targets": ("add_35722", "add_35727", "add_35732"),  # 三组 decoder 入口
         "sigma": 0.04,
@@ -46,9 +40,9 @@ cfg = InferConfig(
             (60, 7.05),
         ),
     },
-    perturb_graphs=0,
     model_batch=6,
     gpu_mem=0.9,
+
     dataset={
         "type": "processed_multi_zarr",
         "paths": FGVP_DYNAMIC_STORES,
@@ -67,12 +61,7 @@ cfg = InferConfig(
             {"name": "geometry"},
             {
                 "name": "fill_missing",
-                "rules": {
-                    "sst": {
-                        "method": "constant",
-                        "value": 287.066,
-                    },
-                },
+                "rules": {"sst": {"method": "constant", "value": 287.066}},
                 "unconfigured": "error",
             },
         ],
@@ -84,7 +73,9 @@ cfg = InferConfig(
         "shuffle": False,
         "drop_last": False,
     },
+
     model_processing=ModelProcessingConfig(input=[], recurrent=[], output=[]),
+
     times="2025070200..2025073000:24,2025110100..2025113000:24",
     steps=60,
     hour_interval=6,

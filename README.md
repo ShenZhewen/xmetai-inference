@@ -1,126 +1,163 @@
-# 气象模型推理框架
+# Weather Model Inference Framework
 
-把 ERA5 再分析数据转换成模型输入，执行自回归天气预报并将结果保存为 NetCDF。
+Converts ERA5 reanalysis data into model input, runs autoregressive weather forecasting, and saves the results as NetCDF.
 
-## 目录
+## Table of Contents
 
-- [支持的模型](#支持的模型)
-- [核心特性](#核心特性)
-- [目录结构](#目录结构)
-- [架构与数据流](#架构与数据流)
-- [快速开始](#快速开始)
-- [配置参考](#配置参考)
-- [扩展自己的模型和数据集](#扩展自己的模型和数据集)
+- [Supported Models](#supported-models)
+- [Supported Datasets](#supported-datasets)
+- [Key Features](#key-features)
+- [Directory Structure](#directory-structure)
+- [Architecture & Data Flow](#architecture--data-flow)
+- [Quick Start](#quick-start)
+- [Configuration Reference](#configuration-reference)
 - [License](#license)
 
-## 支持的模型
+## Supported Models
 
-| 模型 | 后端 | 类型 | 成员 | 通道 | 归一化 |
+| Model | Backend | Type | Members | Channels | Normalization |
 |------|------|------|------|------|--------|
-| FuXi-Ens | `onnx`（ONNX Runtime） | 集合 `ensemble` | 51 | 78 | 已烘焙进图，输入/输出均为物理量 |
-| FuXi-2.1 | `pt2`（torch.export） | 确定性 `deterministic` | 1 | 85 | 输入侧 `normalize`、输出侧 `denormalize`（mean.nc/std.nc） |
-| IWC FGVP GDN2 | `onnx`（ONNX Runtime） | 确定性 `deterministic` | 1 | 78 | 已烘焙进图；骨干用自定义算子，需注册 `.so` |
-| FengQing V1.5Beta | `onnx`（ONNX Runtime） | 确定性 `deterministic` | 1 | 70 | 输入 `normalize_fengqing`、输出 `denormalize_fengqing`（图出残差） |
-| Pangu-Weather | `onnx`（ONNX Runtime） | 确定性 `deterministic` | 1 | 69 | 已烘焙进图，输入/输出均为物理量 |
+| FuXi-Ens | `onnx` (ONNX Runtime) | Ensemble | 51 | 78 | Baked into graph; physical units in/out |
+| FuXi-2.1 | `pt2` (torch.export) | Deterministic | 1 | 85 | Input `normalize`, output `denormalize` (mean.nc/std.nc) |
+| IWC FGVP GDN2 | `onnx` (ONNX Runtime) | Deterministic | 1 | 78 | Baked into graph; custom ops in backbone, `.so` registration required |
+| FengQing V1.5Beta | `onnx` (ONNX Runtime) | Deterministic | 1 | 70 | Input `normalize_fengqing`, output `denormalize_fengqing` (graph emits residual) |
+| Pangu-Weather | `onnx` (ONNX Runtime) | Deterministic | 1 | 69 | Baked into graph; physical units in/out |
+| Tongyun-Ens (CRA) | `onnx` (ONNX Runtime) | Ensemble | 51 | 71 | Datasource stores normalized values → data-side `denormalize`; graph normalizes at its head, outputs physical units |
 
-五种模型共用 0.25° 全球规则网格（721×1440，纬度北→南、经度 0–360°）。除 Pangu 外
-时间窗口均为 2 帧历史；Pangu 单帧历史（`history_steps=1`）、6 小时步长，但每 4 步
-（lead 24h）改用 24h 模型从锚点直接跳 24h（官方「方案B」）。
+The first five ERA5 models share the 0.25° global regular grid (721×1440, latitude north→south, longitude 0–360°).
+All use a 2-frame history window except Pangu; Pangu uses a single history frame (`history_steps=1`), 6-hour steps,
+but every 4 steps (lead 24h) switches to a 24h model that jumps 24h directly from the anchor (official "Plan B").
+**Tongyun-Ens (CRA) is the exception**: it uses `GRID_025_S` (latitude south→north, the store's native orientation),
+and its preprocessing **must not configure `geometry`** (doing so feeds the field in reversed).
 
-> 模型名有两套，别混：**config 名**（`--model` / `--config` 用的，如 `fuxi_ens`、
-> `fuxi21`、`fgvp`、`fengqing`、`pangu`）对应 `configs/` 下同名配方文件；**模型类
-> 注册名**（config 里 `model_class=` 引用的，如 `fuxi_ens_onnx`、`fuxi21_pt2`、
-> `iwc_fgvp_gdn2_onnx`、`fengqing_pre_onnx`、`pangu_onnx`）对应
-> `models/MODEL_REGISTRY`。
+> There are two model-naming schemes — don't mix them: **config names** (for `--model` / `--config`, e.g. `fuxi_ens`,
+> `fuxi21`, `fgvp`, `fengqing`, `pangu`, `tongyun_cra`) map to the eponymous recipe files under `configs/`;
+> **model-class registry names** (the `model_class=` in configs, e.g. `fuxi_ens_onnx`, `fuxi21_pt2`,
+> `iwc_fgvp_gdn2_onnx`, `fengqing_pre_onnx`, `pangu_onnx`, `tongyun_cra_ens_onnx`) map to
+> `models/MODEL_REGISTRY`.
 
-## 核心特性
+### Perturbation Schemes SPA / SPW (composable on any model)
 
-- **数据源统一走 `processed_multi_zarr`**：底层是 `xmetai-core` 的
-  `MultiZarrDataset`，按起报时间读取历史帧、按模型通道序取变量。输入前处理
-  （单位换算 / 几何对齐 / 归一化 / 填缺测）由 `dataset.processors` 声明，在
-  DataLoader worker 里经 `tensor_processors.py` 执行。
-- **后端可插拔**：`onnx` / `pt2` 两种执行引擎与模型语义分离。
-- **模型契约驱动**：通道、网格、历史窗口、成员语义和状态表示由模型类声明。
-- **完整运行配方**：config 同时声明 `dataset`（含 `processors`）、`dataloader` 和
-  `model_processing`（`recurrent`、`output` 两阶段）。
-- **统一自回归编排**：`runner.py` 的 `Rollout`/`Trajectory` 把单步 `forward` 串成
-  多轨迹循环，`state = result` 回填与 `windowed_output` 两种输出形状在此汇合。
-- **异步落盘**：后台单线程写 NetCDF；写失败时按 step 兜底存 `raw_step_XXX.npy`。
-- **多卡数据并行**：按「起报时间 × 成员」分摊到多卡，每进程经 `CUDA_VISIBLE_DEVICES`
-  隔离单卡。
+SPA and SPW are two **perturbation schemes**, not standalone base models — they act on a base model to turn a
+deterministic model into an ensemble (or to perturb an existing ensemble), and are **decoupled from the base model**,
+applicable to any model (as long as that model's backend implements support).
 
-## 目录结构
+| Scheme | What it does | Declared by | Key parameters | Supported backends |
+|---|---|---|---|---|
+| **SPA** | Latent-space AR(1) noise forcing: injects time-evolving AR(1) random noise into the model's **latent state**; members = different noise samples | `latent_forcing` | `targets` (injection points), `sigma`, `tau_days`, `rank`, `length_scale`, `seed` | ONNX (graph rewrite), PT2 (fx graph rewrite) |
+| **SPW** | Weight perturbation: perturbs specified weight tensors under **energy balance** to produce a set of member weight copies; members = different weight copies | `weight_perturb` | `groups`, `sigma_full`, `balance`, `noise_struct`, `seed` | ONNX |
+
+The two are **orthogonal and composable**: SPA rewrites the graph, SPW rewrites the weights, and both can be enabled on
+the same model (currently only ONNX supports them together).
+Recipe examples: `fgvp_spa.py`, `fgvp_ens_spa.py` (SPA); `fgvp_spw.py`, `fgvp_ens_spw.py` (SPW);
+`fuxi_spa.py` (SPA on PT2).
+
+## Supported Datasets
+
+Datasources are uniformly ingested via `processed_multi_zarr`, backed by `xmetai-core`'s `MultiZarrDataset`.
+There are two kinds of **store layout**; identify the layout before plugging in a new datasource
+(see `skills/xmetai-inference/references/datasets.md`):
+
+| Datasource | Layout | What it stores | Where normalization happens | `dataset.processors` chain |
+|---|---|---|---|---|
+| ERA5 foundation store (`era5_pl/sfc/cldrad/soil/wave`) | **Raw** | Physical units (q=kg/kg, tp/radiation = 1h accumulation) | Baked into graph, or framework-side mean.nc/std.nc | `unit_convert` → `geometry` → (optional) `normalize` / `fill_missing` |
+| CRA c71 store (`cra...c71.p25.h6.v1`) | **Normalized** | Already-normalized values; mean/std arrays live inside the store | Store normalization + graph head `Div(Sub(x,mean),std)` | `denormalize` (`stats_path`=that store), **no geometry** |
+
+The key to telling them apart: for a **raw** layout, normalization lives on the "graph/framework" side, and the store
+provides physical units; for a **normalized** layout, normalization lives on the "store" side, so you must
+`denormalize` on the data side to recover physical values before feeding the graph, which then normalizes again.
+For a normalized store's log1p channel (CRA's tp), denormalization yields `log1p(physical_value)`, exactly what the
+graph expects as input — don't `expm1` it.
+
+## Key Features
+
+- **Datasources uniformly go through `processed_multi_zarr`**: backed by `xmetai-core`'s
+  `MultiZarrDataset`, it reads history frames by initialization time and selects variables in model channel order.
+  Input preprocessing (unit conversion / geometry alignment / normalization / fill missing) is declared by
+  `dataset.processors` and executed in a DataLoader worker via `tensor_processors.py`.
+- **Pluggable backends**: the `onnx` / `pt2` execution engines are decoupled from model semantics.
+- **Contract-driven models**: channels, grid, history window, member semantics, and state representation are declared by the model class.
+- **Complete run recipes**: a config declares `dataset` (incl. `processors`), `dataloader`, and
+  `model_processing` (the `recurrent` and `output` stages).
+- **Unified autoregressive orchestration**: `runner.py`'s `Rollout`/`Trajectory` chain single-step `forward`
+  into a multi-trajectory loop, where `state = result` feedback and `windowed_output` output shapes converge.
+- **Asynchronous disk-write**: a single background thread writes NetCDF; on write failure, it falls back to per-step `raw_step_XXX.npy`.
+- **Multi-GPU data parallelism**: work is sharded over cards by "initialization time × member"; each process is isolated to one card via `CUDA_VISIBLE_DEVICES`.
+
+## Directory Structure
 
 ```
 .
-├── pyproject.toml           # PyPI 构建元数据和 CLI 入口
-├── xmetai_inference/        # 可安装的 Python 包（包名为 xmetai-inference）
-│   ├── cli.py               # 配置加载、多卡调度、自回归主循环与异步落盘
-│   ├── runner.py            # Rollout / Trajectory 自回归编排层
-│   ├── data/                # 数据源工厂 + processed_multi_zarr（包 xmetai-core）
-│   ├── processing/          # 模型侧管线（recurrent/output）+ 数据侧 tensor processor
-│   ├── backends/            # BaseInferModel + onnx / pt2 执行引擎
-│   ├── models/              # 具体模型与按需加载注册表 MODEL_REGISTRY
-│   ├── configs/             # 内置完整运行配方
-│   └── logging_util.py      # 推理日志配置
-└── model_artifacts/         # 本地模型产物，整个目录不上传 Git
+├── pyproject.toml           # PyPI build metadata and CLI entry
+├── xmetai_inference/        # The installable Python package (package name: xmetai-inference)
+│   ├── cli.py               # Config loading, multi-GPU scheduling, the autoregressive main loop, async disk-write
+│   ├── runner.py            # Rollout / Trajectory autoregressive orchestration layer
+│   ├── data/                # Datasource factory + processed_multi_zarr (package xmetai-core)
+│   ├── processing/          # Model-side pipeline (recurrent/output) + data-side tensor processors
+│   ├── backends/            # BaseInferModel + onnx / pt2 execution engines
+│   ├── models/              # Concrete models + the lazy-loading registry MODEL_REGISTRY
+│   ├── configs/             # Built-in complete run recipes
+│   └── logging_util.py      # Inference logging configuration
+├── skills/                  # Integration guide: this skill (SKILL.md routing hub + references/ details)
+├── tests/                   # Unit + integration tests (integration runs only with `-m realdata`)
+└── model_artifacts/         # Local model artifacts; the whole directory is excluded from Git
 ```
 
-## 架构与数据流
+## Architecture & Data Flow
 
-一条预报从数据到落盘的完整链路：
+The full chain from data to disk for one forecast:
 
 ```
-zarr store  →  xmetai-core MultiZarrDataset          （读历史帧，按模型通道取变量）
-            →  dataset.processors                    （DataLoader worker 里，torch）
-                 unit_convert → geometry → normalize → fill_missing
-            →  prepare_dataset_batch                 （[B,T,C,H,W] tensor）
-            →  Rollout 自回归                        （state=result 回填）
-                 recurrent processors（zero_channels）
-            →  output processors（denormalize）       （工作空间 → 物理量）
-            →  to_dataset                            （xarray，tp 非负兜底）
-            →  _AsyncWriter                          （后台单线程写 NetCDF）
+zarr store  →  xmetai-core MultiZarrDataset          (read history frames, select variables by model channel)
+            →  dataset.processors                    (in DataLoader worker, torch; chain depends on store layout)
+                 unit_convert → geometry → normalize → fill_missing     ← raw store (ERA5)
+                 denormalize (stats_path=store)                         ← normalized store (CRA)
+            →  prepare_dataset_batch                 ([B,T,C,H,W] tensor)
+            →  Rollout (autoregressive)              (state = result feedback)
+                 recurrent processors (zero_channels)
+            →  output processors (denormalize)       (workspace → physical units)
+            →  to_dataset                            (xarray, non-negative fallback for tp)
+            →  _AsyncWriter                          (single background thread writes NetCDF)
 ```
 
-| 步骤 | 谁负责 | 干什么 |
+| Step | Owner | What it does |
 |------|--------|--------|
-| 数据读取 | `xmetai-core` | 打开 Zarr、选历史帧、按模型通道名映射变量 |
-| 输入前处理 | `dataset.processors` | 物理量 → 模型工作空间：单位换算、几何对齐、归一化、填缺测 |
-| 自回归 | `Rollout` | `state = result` 回填；`windowed_output` 决定滑窗在哪做 |
-| 回填 Processor | `model_processing.recurrent` | 回填前原地改（如诊断通道 `zero_channels` 置归一化 0） |
-| 输出 Processor | `model_processing.output` | 模型工作空间 → 物理量（`denormalize` / `denormalize_fengqing`） |
-| 落盘 | `_AsyncWriter` / `to_dataset` | 物理量 → xarray/NetCDF；`tp` 统一在此做非负兜底 |
+| Data read | `xmetai-core` | Opens Zarr, selects history frames, maps variables by model channel names |
+| Input preprocessing | `dataset.processors` | Raw: physical units → model workspace (unit conversion/geometry alignment/normalization/fill missing); normalized: `denormalize` recovers physical units |
+| Autoregression | `Rollout` | `state = result` feedback; `windowed_output` decides where the sliding window is done |
+| Recurrent Processor | `model_processing.recurrent` | In-place edits before feedback (e.g. `zero_channels` sets diagnostic channels to normalized 0) |
+| Output Processor | `model_processing.output` | Model workspace → physical units (`denormalize` / `denormalize_fengqing`) |
+| Disk-write | `_AsyncWriter` / `to_dataset` | Physical units → xarray/NetCDF; `tp` gets a non-negative fallback here |
 
-> 输入前处理走 `dataset.processors`，`model_processing.input` 必须为空（误配会直接
-> 报错）。模型文件内部已融合的归一化不在框架重复执行。
+> Input preprocessing goes through `dataset.processors`; `model_processing.input` must be empty (misconfiguring
+> it errors out). Normalization already fused into the model file is not re-executed by the framework.
 
-## 快速开始
+## Quick Start
 
-### 前置条件
+### Prerequisites
 
-- Linux 环境（驱动脚本为 bash；Windows 建议 WSL2 或 Git Bash）
-- NVIDIA GPU + CUDA（ONNX / PT2 推理）
-- 模型权重文件与 ERA5 输入数据（两者均不进 git）
+- Linux environment (driver scripts are bash; on Windows prefer WSL2 or Git Bash)
+- NVIDIA GPU + CUDA (ONNX / PT2 inference)
+- Model weight files and Zarr store input data (ERA5 / CRA; both are excluded from git)
 
-### 安装依赖
+### Installing Dependencies
 
 ```bash
 pip install -e .
 ```
 
-可选依赖按运行内容安装：
+Install optional extras depending on what you run:
 
 ```bash
-pip install -e ".[netcdf,zarr,onnx]"   # ONNX 模型（FuXi-Ens / FGVP / FengQing）需 onnxruntime
-pip install -e ".[netcdf,zarr]"        # 仅需 NetCDF 读/写引擎（FuXi-2.1 / 评测）
+pip install -e ".[netcdf,zarr,onnx]"   # ONNX models (FuXi-Ens / FGVP / FengQing) need onnxruntime
+pip install -e ".[netcdf,zarr]"        # NetCDF read/write engines only (FuXi-2.1 / evaluation)
 ```
 
-> `torch` 是核心依赖，随 `pip install -e .` 一并装好。写输出 NetCDF 和读
-> `mean.nc`/`std.nc` 需要 `netCDF4` 或 `h5netcdf`（`netcdf` extra）；底层 Zarr
-> 存储由 `xmetai-core` 读取（`zarr` extra）；ONNX 模型运行时需要 `onnxruntime`
-> （`onnx` extra）。
+> `torch` is a core dependency installed along with `pip install -e .`. Writing output NetCDF and reading
+> `mean.nc`/`std.nc` requires `netCDF4` or `h5netcdf` (`netcdf` extra); the underlying Zarr storage is read by
+> `xmetai-core` (`zarr` extra); ONNX model runtime needs `onnxruntime` (`onnx` extra).
 
-### 一条命令推理
+### One-Command Inference
 
 ```bash
 xmetai-infer --model fuxi_ens
@@ -128,21 +165,23 @@ xmetai-infer --model fuxi21
 xmetai-infer --model fgvp
 xmetai-infer --model fengqing
 xmetai-infer --model pangu
+xmetai-infer --model tongyun_cra
 ```
 
-`--model` / `--config` 都选择一份内置运行配方（`configs/<name>.py`），配方里声明了
-权重路径、数据集、前处理链、起报时间、步数、卡数和输出目录；起报时间、步数、成员数、
-GPU 和输出目录可用命令行参数覆盖，见 [配置参考](#配置参考)。
+Both `--model` and `--config` select a built-in run recipe (`configs/<name>.py`); the recipe declares the weight path,
+dataset, preprocessing chain, initialization times, step count, card count, and output directory. Initialization times,
+steps, member count, GPU count, and output directory can be overridden on the command line
+(see [Configuration Reference](#configuration-reference)).
 
-未安装、直接从源码根目录运行时：
+When running from the source root without installation:
 
 ```bash
 python -m xmetai_inference --model fuxi21
 ```
 
-`xmetai-infer --worker ...` 是多卡调度的内部子进程入口，不应手工调用。
+`xmetai-infer --worker ...` is the internal subprocess entrypoint for multi-GPU scheduling and should not be called manually.
 
-### 覆盖参数
+### Overriding Parameters
 
 ```bash
 xmetai-infer --model fuxi_ens \
@@ -152,141 +191,51 @@ xmetai-infer --model fuxi_ens \
   --out /workspace/data/shenzw/fuxi_ens_output
 ```
 
-- `--model-path` 可替换配方中的权重文件，`--model` 选择配方。
-- `--times` 语法见 [configs/base.py `parse_times`](xmetai_inference/configs/base.py)：单次
-  `2025010600`、逗号列表、闭区间 `A..B`（默认 24h 步长）、`:N` 覆盖步长。
-- 外部 `.py` 配方用 `xmetai-infer /path/to/config.py`（或 `--config`）加载，见
-  [扩展自己的模型和数据集](#扩展自己的模型和数据集)。
+- `--model-path` replaces the recipe's weight file; `--model` selects the recipe.
+- `--times` syntax is documented in [configs/base.py `parse_times`](xmetai_inference/configs/base.py): a single
+  `2025010600`, a comma-separated list, a closed interval `A..B` (24h step by default), and `:N` to override the step.
+- An external `.py` recipe loads via `xmetai-infer /path/to/config.py` (or `--config`); how to add a new model /
+  dataset / processor is covered in [skills/xmetai-inference](skills/xmetai-inference/).
 
-## 配置参考
+## Configuration Reference
 
-### `xmetai-infer` 参数
+### `xmetai-infer` Options
 
-| 参数 | 默认 | 说明 |
+| Option | Default | Description |
 |------|------|------|
-| `config_path` | — | 位置参数，`--config` 的外部配置文件写法 |
-| `--model` | 与 `--config` 二选一 | 内置配方名，如 `fuxi_ens`、`fuxi21`、`fgvp`、`fengqing` |
-| `--config` | 与 `--model` 二选一 | 内置配置名或外部 `.py` 配置路径 |
-| `--model-path` | 配方值 | 覆盖模型权重路径 |
-| `--times` | 配方值 | 覆盖起报时间（`parse_times` 语法） |
-| `--members` | 配方值 | 覆盖集合成员数 |
-| `--steps` | 配方值 | 覆盖预报步数 |
-| `--vars` | 配方值 | 覆盖输出变量，逗号分隔 |
-| `--out` | 配方值 | 覆盖输出目录 |
-| `--gpus` | 配方值 | 覆盖使用的 GPU 数量 |
-| `--cuda-devices` | 配方值 | 覆盖物理卡号，逗号分隔 |
-| `--batch-size` | 配方值 | 覆盖 DataLoader batch size |
-| `--num-workers` | 配方值 | 覆盖 DataLoader worker 数 |
-| `--log-level` | 配方值 | 覆盖控制台日志级别 |
+| `config_path` | — | Positional; the external config file form of `--config` |
+| `--model` | mutually exclusive with `--config` | Built-in recipe name, e.g. `fuxi_ens`, `fuxi21`, `fgvp`, `fengqing` |
+| `--config` | mutually exclusive with `--model` | Built-in config name or an external `.py` config path |
+| `--model-path` | recipe value | Overrides the model weight path |
+| `--times` | recipe value | Overrides initialization times (`parse_times` syntax) |
+| `--members` | recipe value | Overrides ensemble member count |
+| `--steps` | recipe value | Overrides forecast step count |
+| `--vars` | recipe value | Overrides output variables, comma-separated |
+| `--out` | recipe value | Overrides output directory |
+| `--gpus` | recipe value | Overrides the number of GPUs used |
+| `--cuda-devices` | recipe value | Overrides physical card IDs, comma-separated |
+| `--batch-size` | recipe value | Overrides DataLoader batch size |
+| `--num-workers` | recipe value | Overrides DataLoader worker count |
+| `--log-level` | recipe value | Overrides console log level |
 
-### 环境变量
+### Environment Variables
 
-| 变量 | 作用于 | 说明 |
+| Variable | Applies to | Description |
 |------|--------|------|
-| `XMETAI_INFERENCE_ROOT` | 全部 | 项目根目录（config 相对路径/内置权重查找基准） |
-| `ERA5_STORE_ROOT` | fuxi21 / fuxi_ens / fgvp | foundation store2 数据根目录 |
-| `FUXI21_MODEL_PATH` | fuxi21 | FuXi-2.1 权重 `.pt2` 路径 |
-| `FUXI_ENS_ONNX` | fuxi_ens | FuXi-Ens 权重 `.onnx` 路径 |
-| `FGVP_ONNX` | fgvp | IWC FGVP GDN2 权重 `.onnx` 路径 |
-| `FGVP_OPS_LIBRARY` | fgvp | 自定义算子库 `.so` 路径 |
-| `XMETAI_GPU_STATE` | fuxi_ens / fgvp | `1`/`0` 覆盖 GPU 常驻开关 |
-| `FENGQING_MEAN_STD_DIR` | fengqing | FengQing `mean_std/` 目录 |
-| `FENGQING_MASKS_PATH` | fengqing | FengQing `constant_masks.npy` 路径 |
-| `PANGU_ONNX_24` | pangu | Pangu 24h 跳步模型 `.onnx` 路径（默认取 6h 同目录 `pangu_weather_24.onnx`） |
-
-## 扩展自己的模型和数据集
-
-用户安装主框架后，在自己的项目中编写 Model 和 config 即可，无需修改 `xmetai_inference`
-源码。
-
-#### 1. 编写 Model
-
-Model 声明输入/输出通道、网格、历史窗口、成员语义，并继承合适的后端。PT2、ONNX 模型
-分别继承 `Pt2InferModel`、`OnnxInferModel`；其他执行方式继承 `BaseInferModel` 并实现
-`load()` / `forward()`。
-
-```python
-# models/my_model.py
-from xmetai_inference.backends.pt2 import Pt2InferModel
-
-
-class MyModel(Pt2InferModel):
-    input_channels = ("z500", "t850", "msl", "tp")
-    output_channels = input_channels
-    grid = {
-        "lat": {"start": 90.0, "step": -0.25, "size": 721},
-        "lon": {"start": 0.0, "step": 0.25, "size": 1440},
-    }
-    history_steps = 2
-    hour_interval = 6
-    forecast_type = "deterministic"
-    members = 1
-```
-
-图内已烘焙归一化的模型（如 FuXi-Ens）可只配 `unit_convert` + `geometry`；图只出预报
-那一帧的模型要加 `windowed_output = False`，滑窗由 `Rollout` 完成。
-
-#### 2. 编写 config
-
-config 直接引用自定义 Model，声明数据集、`dataset.processors` 输入前处理链和
-`model_processing` 回填/输出链。相对路径按 `config.py` 所在目录解析。
-
-```python
-# config.py
-from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
-from models.my_model import MyModel
-
-
-cfg = InferConfig(
-    name="my_model",
-    model_path="./weights/my_model.pt2",
-    model_class=MyModel,                     # 直接传模型类，绕过内置注册表
-    dataset={
-        "type": "processed_multi_zarr",
-        "paths": ["./data/era5.zarr"],
-        "processors": [
-            {"name": "unit_convert", "scales": {"tp": 6000.0}},
-            {"name": "geometry"},
-            {"name": "normalize", "mean_file": "mean.nc", "std_file": "std.nc",
-             "log1p_channels": ["tp"]},
-        ],
-    },
-    dataloader={"batch_size": 1, "num_workers": 0},
-    model_processing=ModelProcessingConfig(
-        input=[],                             # 必须为空（前处理在 dataset.processors）
-        recurrent=[],
-        output=[{"name": "denormalize", "expm1_channels": ["tp"],
-                 "nonnegative": ["tp"]}],
-    ),
-    times="2025010200",
-    steps=10,
-    members=1,
-    gpus=1,
-    output_dir="./output",
-)
-```
-
-`dataset.processors` 可选名字：`unit_convert`、`geometry`、`normalize`、
-`normalize_fengqing`、`fill_missing`；`model_processing` 的 `recurrent`/`output` 可选
-`zero_channels`、`denormalize`、`denormalize_fengqing`。两组是相互独立的注册表。
-
-#### 3. 启动推理
-
-```bash
-cd /workspace/my_forecast_project
-xmetai-infer config.py
-xmetai-infer /workspace/my_forecast_project/config.py   # 绝对路径
-xmetai-infer config.py --times 2025010300 --steps 10 --gpus 4
-```
-
-多卡模式下每个 worker 会各自重新加载同一份 `config.py`。
-
-评测工具（单档评测 / 集合评测 / 两次输出互比）在另一个仓库 `xmetai-evaluation`，
-不随本包安装。
+| `XMETAI_INFERENCE_ROOT` | All | Project root (base for config relative paths / built-in weights lookup) |
+| `ERA5_STORE_ROOT` | fuxi21 / fuxi_ens / fgvp | Foundation store2 data root |
+| `FUXI21_MODEL_PATH` | fuxi21 | FuXi-2.1 weight `.pt2` path |
+| `FUXI_ENS_ONNX` | fuxi_ens | FuXi-Ens weight `.onnx` path |
+| `FGVP_ONNX` | fgvp | IWC FGVP GDN2 weight `.onnx` path |
+| `FGVP_OPS_LIBRARY` | fgvp | Custom ops library `.so` path |
+| `XMETAI_GPU_STATE` | fuxi_ens / fgvp | `1`/`0` overrides the persistent-GPU switch |
+| `FENGQING_MEAN_STD_DIR` | fengqing | FengQing `mean_std/` directory |
+| `FENGQING_MASKS_PATH` | fengqing | FengQing `constant_masks.npy` path |
+| `PANGU_ONNX_24` | pangu | Pangu 24h jump model `.onnx` path (defaults to `pangu_weather_24.onnx` next to the 6h model) |
 
 ## License
 
-本项目自身尚未声明许可证。`TODO:` 如需开源，请补充 `LICENSE` 文件。
+This project does not yet declare its own license. `TODO:` add a `LICENSE` file if open-sourced.
 
-集成的 Pangu-Weather 模型权重遵循 **CC BY-NC-SA 4.0**（署名-非商业-相同方式共享），
-仅限非商业用途；详见 `model_artifacts/Pangu-Weather-main/README.md`。
+The bundled Pangu-Weather model weights are licensed under **CC BY-NC-SA 4.0** (Attribution-NonCommercial-ShareAlike),
+for non-commercial use only; see `model_artifacts/Pangu-Weather-main/README.md`.

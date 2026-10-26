@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
-"""iwc_fgvp_gdn2（FuXi-Ens 的 Gated DeltaNet 骨干变体）确定性推理。
-
-输入是物理量，ONNX 图内已烘焙归一化；sst 等缺测用物理值填充。必须在匹配的
-onnxruntime 镜像里跑（算子库与 onnxruntime ABI 绑定）。
-"""
+"""iwc_fgvp_gdn2（FuXi-Ens 的 Gated DeltaNet 骨干变体）确定性推理。"""
 import os
 
-from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig, ROOT
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
 ERA5_ROOT = os.environ.get(
     "ERA5_STORE_ROOT",
@@ -14,9 +10,9 @@ ERA5_ROOT = os.environ.get(
 )
 
 FGVP_DYNAMIC_STORES = [
-    os.path.join(ERA5_ROOT, "era5_pl_2025.01-2026.07.c84.p25.h6.zarr"),
-    os.path.join(ERA5_ROOT, "era5_sfc_2025.01-2026.07.c15.p25.h6.zarr"),
-    os.path.join(ERA5_ROOT, "era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr"),
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
 ]
 
 cfg = InferConfig(
@@ -25,10 +21,10 @@ cfg = InferConfig(
         "FGVP_ONNX", "/workspace/tmp/douzsh/models/iwc_fgvp_gdn2_260901.onnx"),
     ops_library=os.environ.get(
         "FGVP_OPS_LIBRARY", "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so"),
-    # 统一开关 XMETAI_GPU_STATE="1"/"0" 覆盖；本模型必须为 0（图只出 1 帧），
-    # 即使显式设 1 也会被 OnnxInferModel.load 的启动期断言拦下。
+    # 必须为 0：图只出 1 帧（如显式设 1）会被 load 的启动期断言拦下。
     gpu_state=os.environ.get("XMETAI_GPU_STATE", "0") == "1",
     model_class="iwc_fgvp_gdn2_onnx",
+
     dataset={
         "type": "processed_multi_zarr",
         "paths": FGVP_DYNAMIC_STORES,
@@ -47,12 +43,7 @@ cfg = InferConfig(
             {"name": "geometry"},
             {
                 "name": "fill_missing",
-                "rules": {
-                    "sst": {
-                        "method": "constant",
-                        "value": 287.066,
-                    },
-                },
+                "rules": {"sst": {"method": "constant", "value": 287.066}},
                 "unconfigured": "error",
             },
         ],
@@ -64,11 +55,9 @@ cfg = InferConfig(
         "shuffle": False,
         "drop_last": False,
     },
-    model_processing=ModelProcessingConfig(
-        input=[],
-        recurrent=[],
-        output=[],
-    ),
+
+    model_processing=ModelProcessingConfig(input=[], recurrent=[], output=[]),
+
     times="2025010200..2025010500:24",
     steps=60,
     hour_interval=6,

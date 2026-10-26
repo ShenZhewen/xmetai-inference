@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """确定性 FGVP（gdn2）+ SPA（潜空间 AR(1) 强迫）。
 
-三处 latent_mixer 出口（512 通道、16200 token），sigma=0.04、tau=3 天。
-扫描时直接改 latent_forcing 里的 sigma / tau_days，用 --out 分目录。
+三处 latent_mixer 出口；扫描时改 latent_forcing 的 sigma / tau_days，--out 分目录。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
@@ -35,6 +34,7 @@ cfg = InferConfig(
         "verify_on_load": True,
         "cache_dir": "/workspace/data/shenzw/model_onnx",
     },
+
     dataset={
         "type": "processed_multi_zarr",
         "paths": FGVP_DYNAMIC_STORES,
@@ -53,12 +53,7 @@ cfg = InferConfig(
             {"name": "geometry"},
             {
                 "name": "fill_missing",
-                "rules": {
-                    "sst": {
-                        "method": "constant",
-                        "value": 287.066,
-                    },
-                },
+                "rules": {"sst": {"method": "constant", "value": 287.066}},
                 "unconfigured": "error",
             },
         ],
@@ -70,7 +65,9 @@ cfg = InferConfig(
         "shuffle": False,
         "drop_last": False,
     },
+
     model_processing=ModelProcessingConfig(input=[], recurrent=[], output=[]),
+
     # 默认冬季 16 起报（1216-1231）是扫描窗口；正式跑请用 --times 覆盖。
     times="2025121600..2025123100:24",
     steps=60,

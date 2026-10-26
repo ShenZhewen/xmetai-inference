@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """FuXi-2.1 + SPA（潜空间 AR(1) 强迫）。
 
-默认臂 F32：sigma=0.04、tau=3 天，注入第 0/3/6 层残差流（layer_stream）。
-扫描时直接改 latent_forcing 里的 sigma / tau_days，用 --out 分目录。
+默认臂 F32：注入第 0/3/6 层残差流（layer_stream）；扫描时改 sigma / tau_days。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
@@ -21,7 +20,7 @@ cfg = InferConfig(
     model_path="/workspace/szwCode/xmetai-inference2/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
     model_class="fuxi21_pt2",
     latent_forcing={
-        "targets": ("layer_stream:0,3,6",),  # 上游三站点；全 30 层改成 ("layer_stream",)
+        "targets": ("layer_stream:0,3,6",),  # 全 30 层改成 ("layer_stream",)
         "sigma": 0.04,
         "tau_days": 3.0,
         "rank": 16,
@@ -31,7 +30,8 @@ cfg = InferConfig(
         "hour_interval": 6.0,
         "verify_on_load": True,
     },
-    model_batch=1,  # pt2 的 ξ 缓冲无 batch 轴，latent_forcing 只支持 1
+    model_batch=1,  # pt2 的 ξ 缓冲无 batch 轴，只支持 1
+
     dataset={
         "type": "processed_multi_zarr",
         "paths": FUXI21_DYNAMIC_STORES,
@@ -68,6 +68,7 @@ cfg = InferConfig(
         "shuffle": False,
         "drop_last": False,
     },
+
     model_processing=ModelProcessingConfig(
         input=[],
         recurrent=[
@@ -86,7 +87,8 @@ cfg = InferConfig(
             },
         ],
     ),
-    # 默认 3 个起报（0701-0703）是冒烟窗口；FuXi SPA 端到端正式跑请用 --times 覆盖。
+
+    # 默认 3 起报（0701-0703）是冒烟窗口；正式跑请用 --times 覆盖。
     times="2025070100..2025070300:24",
     steps=60,
     hour_interval=6,

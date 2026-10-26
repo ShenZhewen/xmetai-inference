@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """fgvp_ens：FGVP 集合预报（51 成员，骨干自带随机轴出成员）。
 
-权重是 20261008 导出的 iwc_gssp_im；该 onnx 带 .data 外部权重，两个文件必须
-同目录，挪权重要一起挪。集合图为动态 batch 轴，可设 model_batch>1。
+权重 20261008 导出 iwc_gssp_im（带 .data 外部权重，需同目录）；集合图为动态 batch 轴。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
@@ -17,17 +16,12 @@ FGVP_ENS_DYNAMIC_STORES = [
 cfg = InferConfig(
     name="fgvp_ens",
     model_path="/workspace/tmp/douzsh/models/20261008/iwc_gssp_im.onnx",
-    # 文件名里 ort1_24 = 按 ONNX Runtime 1.24 构建，跨环境先对版本，对不上加载/
-    # 运行期会崩（ABI 绑定）。旧的 xmetai_onnx_plugins.so 留着做回滚，别删。
     ops_library="/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so",
-    # 必须 False：单步型图，GPU 常驻分支会跳过滑窗回填。
-    gpu_state=False,
-    # 前向批：一次 forward 堆几条成员轨迹。每 rank 只领 ceil(51/卡数) 条，
-    # k 的上限是那个数；图 batch 轴非符号维时会 WARNING 退回 1。
-    model_batch=6,
-    # 占卡总显存的比例（80 GiB 卡 × 0.9 ≈ 72 GiB）；报 bfc_arena 就是撞了这个顶。
-    gpu_mem=0.9,
+    gpu_state=False,  # 单步型图，GPU 常驻会跳过滑窗回填
     model_class="iwc_fgvp_mamba_ens_onnx",
+    model_batch=6,   # 一次 forward 堆几条成员轨迹；图 batch 轴非符号维则退回 1
+    gpu_mem=0.9,
+
     dataset={
         "type": "processed_multi_zarr",
         "paths": FGVP_ENS_DYNAMIC_STORES,
@@ -46,30 +40,22 @@ cfg = InferConfig(
             {"name": "geometry"},
             {
                 "name": "fill_missing",
-                "rules": {
-                    "sst": {
-                        "method": "constant",
-                        "value": 287.066,
-                    },
-                },
+                "rules": {"sst": {"method": "constant", "value": 287.066}},
                 "unconfigured": "error",
             },
         ],
     },
     dataloader={
-        # batch_size 只影响数据装载分组、不碰 GPU；前向批见上面的 model_batch。
+        # batch_size 只影响数据装载分组；前向批见上面的 model_batch。
         "batch_size": 4,
         "num_workers": 4,
         "pin_memory": True,
         "shuffle": False,
         "drop_last": False,
     },
-    model_processing=ModelProcessingConfig(
-        input=[],
-        recurrent=[],
-        output=[],
-    ),
-    # 起报范围，改这里调范围（语法见 base.parse_times）。
+
+    model_processing=ModelProcessingConfig(input=[], recurrent=[], output=[]),
+
     times="2025010200..2025121500:24",
     steps=60,
     members=51,

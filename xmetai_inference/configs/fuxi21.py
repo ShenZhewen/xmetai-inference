@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FuXi-2.1 确定性推理配置（era5_foundation_store2 h6 多店）。
-
-新 foundation store 是原始物理量，输入前处理由 dataset.processors 显式声明
-（unit_convert -> geometry -> normalize -> fill_missing）；tp 归一化前 log1p，
-输出 denormalize 用 expm1 恢复。
-"""
+"""FuXi-2.1 确定性推理（era5_foundation_store2 h6 多店；tp/辐射单位换算 + log1p 归一化）。"""
 import os
 
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
@@ -15,17 +10,16 @@ ERA5_ROOT = os.environ.get(
 )
 
 FUXI21_DYNAMIC_STORES = [
-    os.path.join(ERA5_ROOT, "era5_pl_2025.01-2026.07.c84.p25.h6.zarr"),
-    os.path.join(ERA5_ROOT, "era5_sfc_2025.01-2026.07.c15.p25.h6.zarr"),
-    os.path.join(ERA5_ROOT, "era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr"),
-    os.path.join(ERA5_ROOT, "era5_soil_2025.01-2026.07.c4.p25.h6.zarr"),
-    os.path.join(ERA5_ROOT, "era5_wave_2025.01-2026.07.c5.p25.h6.zarr"),
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_soil_2025.01-2026.07.c4.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_wave_2025.01-2026.07.c5.p25.h6.zarr",
 ]
 
 cfg = InferConfig(
     name="fuxi21",
-    # 写绝对路径：权重在旧仓库 xmetai-inference（无 2）下，用 ROOT 拼会指错。
-    # 可用 FUXI21_MODEL_PATH 覆盖。
+    # 绝对路径：权重在旧仓库 xmetai-inference（无 2）；FUXI21_MODEL_PATH 可覆盖。
     model_path=os.environ.get(
         "FUXI21_MODEL_PATH",
         "/workspace/szwCode/xmetai-inference/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
@@ -61,8 +55,6 @@ cfg = InferConfig(
             },
         ],
     },
-
-    # Loader 只负责把不同起报时间组成 [B,T,C,H,W]。
     dataloader={
         "batch_size": 4,
         "num_workers": 4,
@@ -89,6 +81,7 @@ cfg = InferConfig(
             },
         ],
     ),
+
     times="2025010200..2025010500:24",
     steps=60,
     hour_interval=6,
