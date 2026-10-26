@@ -47,8 +47,13 @@ def _preload_onnxruntime_lib():
     return None
 
 
-def _scalar_feeds(valid_time, step):
-    """构造 step/hour/doy 标量输入（模型签名里没有的键会被 drop）。"""
+def _scalar_feeds(valid_time, step, perturb_std_scale=1.0):
+    """构造 step/hour/doy/perturb_std_scale 标量输入（模型签名里没有的键会被 drop）。
+
+    perturb_std_scale 是图内扰动的幅度旋钮（CRA 版 Tongyun 有，ERA5 版没有）：
+    1.0 = 训练时的标称噪声。调用点都按 ``self._input_names`` 过滤，没有这个输入的
+    图不会收到它，行为逐位不变。
+    """
     times = [valid_time] if np.ndim(valid_time) == 0 else list(valid_time)
     return {
         "step": np.full((len(times),), step, dtype=np.float32),
@@ -57,6 +62,8 @@ def _scalar_feeds(valid_time, step):
             [min(365, value.day_of_year) / 365.0 for value in times],
             dtype=np.float32,
         ),
+        "perturb_std_scale": np.full(
+            (len(times),), perturb_std_scale, dtype=np.float32),
     }
 
 

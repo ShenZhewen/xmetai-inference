@@ -237,6 +237,85 @@ class TensorNormalize(TensorProcessor):
         return (out - mean) / std
 
 
+@register_tensor_processor("denormalize")
+class TensorDenormalize(TensorProcessor):
+    """Recover model input space from an already-normalized store: ``x*std + mean``.
+
+    与 ``normalize`` 对称。用于「store 里存的就是归一化值、而图自己会归一化」的数据
+    源（CRA c71 store）：图头是 ``Div(Sub(x, mean), std)``，所以喂进去的必须是反
+    归一化后的值。
+
+    统计量从 ``stats_path`` 指向的 zarr store 的 ``mean``/``std`` 数组读取（与数据
+    同一个 store 时，正是训练用的那一套；图中烘焙的常量须与它一致）。
+
+    注意经 log1p 再归一化的通道（CRA 的 tp）：反归一化得到的是 ``log1p(物理值)``，
+    不是物理值本身 —— 那正是这类图期望的输入表示，不要再 expm1。
+    """
+
+    def __init__(
+        self,
+        context: TensorProcessorContext,
+        stats_path="",
+        mean_name="mean",
+        std_name="std",
+        **kwargs,
+    ):
+        super().__init__(context=context, **kwargs)
+        self.channel_names = list(context.channel_names)
+        if not stats_path:
+            raise ValueError(
+                "denormalize 需要 stats_path（含 mean/std 数组的 zarr store）")
+        stats_path = os.fspath(stats_path)
+        if not os.path.isdir(stats_path):
+            raise FileNotFoundError(f"归一化统计量所在 store 不存在：{stats_path}")
+        with xr.open_zarr(stats_path, consolidated=True) as stats:
+            for name in (mean_name, std_name):
+                if name not in stats:
+                    raise ValueError(
+                        f"store {stats_path} 里没有 {name!r} 数组"
+                        f"（有 {list(stats.data_vars)}）")
+            self.mean = np.asarray(
+                stats[mean_name].values, dtype=np.float32).reshape(-1)
+            self.std = np.asarray(
+                stats[std_name].values, dtype=np.float32).reshape(-1)
+            names = None
+            if "channel" in stats.coords:
+                names = tuple(str(v) for v in stats.channel.values)
+
+        if self.mean.shape != self.std.shape:
+            raise ValueError(
+                f"mean/std shape 不一致：{self.mean.shape} vs {self.std.shape}")
+        if self.mean.size != len(self.channel_names):
+            raise ValueError(
+                f"统计量通道数 {self.mean.size} 与模型输入通道数 "
+                f"{len(self.channel_names)} 不一致")
+        if (
+            not np.all(np.isfinite(self.mean))
+            or not np.all(np.isfinite(self.std))
+            or np.any(self.std <= 0)
+        ):
+            raise ValueError("mean/std 包含非有限值或非正标准差")
+        # store 里可能写成 z_50、模型写成 z50（或反过来），比较前先归一化。
+        if names is not None:
+            normalized = tuple(str(v).replace("_", "").lower() for v in names)
+            expected = tuple(
+                str(v).replace("_", "").lower() for v in self.channel_names)
+            if normalized != expected:
+                raise ValueError(
+                    "store 的 channel 顺序与模型 input_channels 不一致"
+                    f"（store 前 3 个 {names[:3]}，模型前 3 个 {self.channel_names[:3]}）")
+
+    def process(self, value):
+        value = value if torch.is_tensor(value) else torch.as_tensor(value)
+        out = value.to(torch.float32)
+        shape = [1] * (out.ndim - 3) + [len(self.channel_names), 1, 1]
+        mean = torch.as_tensor(
+            self.mean, dtype=out.dtype, device=out.device).reshape(shape)
+        std = torch.as_tensor(
+            self.std, dtype=out.dtype, device=out.device).reshape(shape)
+        return out * std + mean
+
+
 def _resolve_fengqing_mean_std_dir(model_path, mean_std_dir=None):
     """解析 FengQing mean/std 目录。
 

@@ -16,6 +16,15 @@ GRID_025 = {
     "lon": {"start": 0.0, "step": 0.25, "size": 1440},
 }
 
+# 同一个 0.25° 网格的南→北版本：直接照 CRA store 的原生朝向建模的模型用
+# （Tongyun-CRA 的图内 mean/std 就是从该 store 烘焙的）。用它就不配 geometry
+# 处理器——那个处理器看到 lat 在南→北就无条件翻转，会把这种模型喂反。
+# 输出文件的 lat 坐标取自模型的 grid，必须跟着一起切，否则数据与坐标错配。
+GRID_025_S = {
+    "lat": {"start": -90.0, "step": 0.25, "size": 721},
+    "lon": {"start": 0.0, "step": 0.25, "size": 1440},
+}
+
 LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 PL_VARS = ["z", "t", "u", "v", "q"]
 FUXI_ENS_SFC_VARS = [
@@ -56,6 +65,11 @@ PANGU_PL_VARS = FENGQING_PL_VARS
 PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
 PANGU_CHANNELS = _expand_channels(
     PANGU_PL_VARS, PANGU_LEVELS, PANGU_SFC_VARS)
+
+# CRA（CRA-40 再分析 c71 store）：上层 z/t/u/v/q × 13 层（50→1000 升序），地面
+# [t2m,q2m,u10m,v10m,msl,tp]，共 71 通道。与 FengQing 的层级顺序与上层变量序都不同。
+CRA_SFC_VARS = ["t2m", "q2m", "u10m", "v10m", "msl", "tp"]
+CRA_CHANNELS = _expand_channels(PL_VARS, LEVELS, CRA_SFC_VARS)
 
 
 def grid_coords(grid):
@@ -98,6 +112,10 @@ MODEL_REGISTRY = {
     "pangu_onnx": (
         "xmetai_inference.models.pangu_onnx",
         "PanguOnnxModel",
+    ),
+    "tongyun_cra_ens_onnx": (
+        "xmetai_inference.models.tongyun_cra_ens",
+        "TongyunCraEnsModel",
     ),
 }
 
@@ -169,10 +187,13 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
 
 
 __all__ = [
+    "CRA_CHANNELS",
+    "CRA_SFC_VARS",
     "FENGQING_CHANNELS",
     "FUXI_ENS_CHANNELS",
     "FUXI21_CHANNELS",
     "GRID_025",
+    "GRID_025_S",
     "PANGU_CHANNELS",
     "MODEL_REGISTRY",
     "create_model",
