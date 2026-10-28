@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Config-driven tensor preprocessors for dataset inputs.
+"""数据侧（DataLoader worker 里跑）：原始 store → 模型输入的 tensor 前处理链。
 
 Each processor is torch.Tensor -> torch.Tensor of shape [T, C, H, W] and is
 selected by name from a dataset ``processors`` list; ``build_tensor_processors``
 is the only entry point configuration uses.
+
+模型侧（自回归回填 / 输出反变换）在 ``model_processors.py``，跑在主进程。
 """
 from __future__ import annotations
 

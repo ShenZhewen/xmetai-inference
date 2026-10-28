@@ -1,0 +1,166 @@
+# fengshun2.0：先推理、再评测，一个 Job 串起来。
+#
+# 推理：xmetai_inference/configs/fengshun20.py
+#   times="2024090100,2024100100,2024110100"（3 起报日）
+#   steps=60  members=51  gpus=4  cuda_devices="0,1,2,3"
+#   输入盘 /workspace/data/zarr_refresh_v3/cra.1979_2024.c87.p25.h24.v1
+#   输出   /workspace/data/shenzw/fengshun_output/<YYYYMMDD>/member_XXX/0NN.nc
+#   3 × (51 成员 × 60 步 × 11 变量 × 721×1440 fp32) ≈ 420 GB（不压缩）
+#   每个起报约 3060 次前向 ÷ 4 卡 × 2.24 s ≈ 30 分钟，三个约 1.5 小时
+#
+# 评测：xmetai-evaluation-v2 的 weather_rmse_ens_fengshun.py
+#   实况 = **同一个** cra.1979_2024.c87.p25.h24.v1（不换源、不插值、tp 不换算）
+#   评 z500/msl/t2m/tp，24…1440h 共 60 个时效；RMSE / CRPS / spread（+z500 谱）
+#   输出 /workspace/data/shenzw/evaluation_results/weather_rmse_ens_fengshun/
+#
+# 依赖：镜像里没有 xmetai（xmetai_inference.data 依赖它）和 scipy，启动时先装 wheel。
+#
+# 用法（spec.template 不可变，重跑前先删）：
+#     kubectl delete job szw-fengshun20-infer-eval -n bktk8bmh-default --ignore-not-found
+#     kubectl apply -f tools/fengshun20_infer_eval_job.yaml
+#     kubectl logs -f job/szw-fengshun20-infer-eval -n bktk8bmh-default
+# 分卡日志：/workspace/data/shenzw/fengshun_output/rank_{0,1,2,3}.log
+# 评测日志：/workspace/data/shenzw/evaluation_results/weather_rmse_ens_fengshun/run.log
+#
+# 推理失败（set -e）不会继续跑评测；评测开了 resume，中断后重跑会跳过已完成块。
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: &job_name szw-fengshun20-infer-eval
+  namespace: bktk8bmh-default
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 60000000
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  suspend: false
+  template:
+    metadata:
+      annotations:
+        bingomatrix.bingosoft.net/ai-device-type: container0:Device,
+        bingomatrix.bingosoft.net/isRDMAHostModel: "true"
+        bingomatrix.bingosoft.net/vgpu-model-to-use: '[NVIDIA H100 80GB HBM3]'
+        bingomatrix.bingosoft.net/vgpu-type: full
+      labels:
+        job-name: *job_name
+    spec:
+      containers:
+      - name: container0
+        image: registry.bingosoft.net/pytorch/pytorch:2.11.0-cuda12.8-mamba3-20260403
+        imagePullPolicy: IfNotPresent
+        command:
+          - "bash"
+          - "-c"
+        args:
+          - |
+            set -eu
+            export PYTHONIOENCODING=utf-8
+            TREE=/workspace/szwCode/xmetai-inference-main
+            ETREE=/workspace/szwCode/xmetai-evalation-v2
+            CFG=$TREE/xmetai_inference/configs/fengshun20.py
+            ECFG=$ETREE/xmetai_evaluation/configs/weather_rmse_ens_fengshun.py
+            STORE=/workspace/data/zarr_refresh_v3/cra.1979_2024.c87.p25.h24.v1
+            MODELS=/workspace/tmp/douzsh/models
+            OUT=/workspace/data/shenzw/fengshun_output
+            EOUT=/workspace/data/shenzw/evaluation_results/weather_rmse_ens_fengshun
+
+            echo "=================== 依赖 ==================="
+            python3 -m pip install --break-system-packages \
+              /workspace/szwCode/xmetai-inference2/h5py-3.16.0-cp312-cp312-manylinux_2_28_x86_64.whl \
+              /workspace/szwCode/xmetai-inference2/xmetai_core-0.1.0-py3-none-any.whl
+            python3 -m pip install --break-system-packages \
+              $ETREE/scipy-1.18.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+
+            echo "=================== 前置自检 ==================="
+            test -f "$CFG"  || { echo "FAIL: 缺 $CFG"; exit 1; }
+            test -f "$ECFG" || { echo "FAIL: 缺 $ECFG"; exit 1; }
+            grep -q 'times="2024090100,2024100100,2024110100"' "$CFG" \
+              || { echo "FAIL: times 不是 20240901/20241001/20241101 三个起报日"; exit 1; }
+            grep -q 'steps=60'  "$CFG" || { echo "FAIL: steps 不是 60"; exit 1; }
+            grep -q 'members=51' "$CFG" || { echo "FAIL: members 不是 51"; exit 1; }
+            grep -q 'gpus=4'    "$CFG" || { echo "FAIL: gpus 不是 4"; exit 1; }
+            grep -q '20240901' "$ECFG" || { echo "FAIL: 评测配置没覆盖 20240901"; exit 1; }
+            test -d "$STORE/data" || { echo "FAIL: 缺输入盘 $STORE"; exit 1; }
+            test -f "$MODELS/fengshun2.0_260901.onnx" || { echo "FAIL: 缺 onnx"; exit 1; }
+            test -f "$MODELS/xmetai_onnx_plugins.ort1_24.cuda12.so" || { echo "FAIL: 缺自定义算子 .so"; exit 1; }
+            python3 -c 'import xmetai' || { echo "FAIL: xmetai_core 没装上"; exit 1; }
+            python3 -c 'import scipy'  || { echo "FAIL: scipy 没装上"; exit 1; }
+
+            # 先 import torch，它才会把 nvidia-* 的 .so 目录挂上
+            python3 - <<'PY'
+            import torch
+            import numpy, onnxruntime, zarr, netCDF4, xarray
+            print("torch =", torch.__version__, "| ort =", onnxruntime.__version__,
+                  "| numpy =", numpy.__version__, "| zarr =", zarr.__version__,
+                  "| netCDF4 =", netCDF4.__version__, "| xarray =", xarray.__version__)
+            from xmetai_inference.configs import load_config
+            from xmetai_inference.models import get_model_class, FENGSHUN_CHANNELS
+            cfg = load_config("fengshun20")
+            cls = get_model_class("fengshun20_onnx")
+            print("config =", cfg.name, "| times =", cfg.times, "| steps =", cfg.steps,
+                  "| members =", cfg.members, "| gpus =", cfg.gpus,
+                  "| devices =", cfg.cuda_devices)
+            print("model =", cls.model_name, "| channels =", len(cls.input_channels),
+                  "| matches table =", list(cls.input_channels) == list(FENGSHUN_CHANNELS),
+                  "| hist =", cls.history_steps, "| interval =", cls.hour_interval)
+            print("out =", cfg.output_dir, "| vars =", cfg.vars)
+            PY
+
+            echo "=================== 1/2 推理（3 起报 × 51 成员 × 60 步）==================="
+            cd "$TREE"
+            PYTHONPATH=$TREE python3 -m xmetai_inference \
+              --config fengshun20 --gpus 4 --cuda-devices 0,1,2,3
+
+            for D in 20240901 20241001 20241101; do
+              test -d "$OUT/$D/member_000" || { echo "FAIL: 推理没产出 $OUT/$D"; exit 1; }
+              N=$(ls "$OUT/$D/member_000" | wc -l)
+              echo "  $D: member_000 下 $N 个文件（应为 60）"
+            done
+
+            echo "=================== 2/2 评测（z500/msl/t2m/tp）==================="
+            mkdir -p "$EOUT"
+            cd "$ETREE"
+            python3 -m xmetai_evaluation.cli \
+              --config weather_rmse_ens_fengshun \
+              --log-file "$EOUT/run.log"
+
+            echo "=================== 完成 ==================="
+            echo "推理: $OUT/{20240901,20241001,20241101}"
+            echo "评测: $EOUT"
+        resources: &resource_spec
+          limits: &limits_spec
+            cpu: "16"
+            memory: 256Gi
+            nvidia.com/vgpu: "4" # number of vGPUs
+            nvidia.com/vgpu-cores: "100"
+            nvidia.com/vgpu-mem: "81089"
+          requests: *limits_spec
+        volumeMounts:
+        - mountPath: /workspace/
+          name: &pvc_name pvc-8xxpvc
+        - mountPath: /workspace/data
+          name: &data_name hostpath-8xcmad
+        - mountPath: /workspace/tmp
+          name: &tmp_name hostpath-8xcmat
+        - mountPath: /dev/shm
+          name: &shm_name shm-e3tzzc
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      volumes:
+      - name: *pvc_name
+        persistentVolumeClaim:
+          claimName: shenzw
+      - name: *data_name
+        hostPath:
+          path: /share/data
+          type: ""
+      - name: *tmp_name
+        hostPath:
+          path: /share/tmp
+          type: ""
+      - name: *shm_name
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1024Gi

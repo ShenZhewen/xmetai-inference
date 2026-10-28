@@ -77,7 +77,7 @@ new stores.
 - **Datasources uniformly go through `processed_multi_zarr`**: backed by `xmetai-core`'s
   `MultiZarrDataset`, it reads history frames by initialization time and selects variables in model channel order.
   Input preprocessing (unit conversion / geometry alignment / normalization / fill missing) is declared by
-  `dataset.processors` and executed in a DataLoader worker via `tensor_processors.py`.
+  `dataset.processors` and executed in a DataLoader worker via `dataset_processors.py`.
 - **Pluggable backends**: the `onnx` / `pt2` execution engines are decoupled from model semantics.
 - **Contract-driven models**: channels, grid, history window, member semantics, and state representation are declared by the model class.
 - **Complete run recipes**: a config declares `dataset` (incl. `processors`), `dataloader`, and
@@ -95,12 +95,11 @@ new stores.
 ├── xmetai_inference/        # The installable Python package (package name: xmetai-inference)
 │   ├── cli.py               # Config loading, multi-GPU scheduling, the autoregressive main loop, async disk-write
 │   ├── runner.py            # Rollout / Trajectory autoregressive orchestration layer
-│   ├── data/                # Datasource factory + processed_multi_zarr (package xmetai-core)
-│   ├── processing/          # Model-side pipeline (recurrent/output) + data-side tensor processors
+│   ├── data/                # Dataset 构造：loader 按 type 分发，实现按分类放子包（weather/）
+│   ├── utils/               # Model-side pipeline (recurrent/output), data-side tensor processors, logging
 │   ├── backends/            # BaseInferModel + onnx / pt2 execution engines
 │   ├── models/              # Concrete models + the lazy-loading registry MODEL_REGISTRY
-│   ├── configs/             # Built-in complete run recipes
-│   └── logging_util.py      # Inference logging configuration
+│   └── configs/             # Built-in complete run recipes
 ├── skills/                  # Integration guide: this skill (SKILL.md routing hub + references/ details)
 ├── tests/                   # Unit + integration tests (integration runs only with `-m realdata`)
 └── model_artifacts/         # Local model artifacts; the whole directory is excluded from Git

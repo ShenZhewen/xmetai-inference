@@ -36,7 +36,7 @@
 
 ## 3. 归一化态 store 怎么配
 
-数据侧 `denormalize`（`processing/tensor_processors.py` 的 `TensorDenormalize`，
+数据侧 `denormalize`（`utils/dataset_processors.py` 的 `TensorDenormalize`，
 `@register_tensor_processor("denormalize")`）：
 
 ```python

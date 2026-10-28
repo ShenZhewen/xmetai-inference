@@ -51,6 +51,17 @@ FUXI_ENS_CHANNELS = _expand_channels(
 FUXI21_CHANNELS = _expand_channels(
     PL_VARS, LEVELS, FUXI21_SFC_VARS)
 
+# fengshun2.0：87 通道 = z/t/u/v/q × 13 层（50→1000 升序）+ 22 个地面/诊断通道
+# （比 FuXi-2.1 多 t2m_min/t2m_max，共 87）。顺序与输入盘
+# cra.1979_2024.c87.p25.h24.v1 的 channel 数组逐位一致（era5.1959_2025.c87 同序
+# 同统计量）；图内的 mean/std 也是按这个顺序烘焙的，改顺序不会报错、只会整场错位。
+FENGSHUN_SFC_VARS = [
+    "msl", "t2m", "t2m_min", "t2m_max", "d2m", "sst", "ws10m", "ws100m",
+    "u10m", "v10m", "u100m", "v100m", "lcc", "mcc", "hcc", "tcc",
+    "ssr", "ssrd", "fdir", "ttr", "tcw", "tp",
+]
+FENGSHUN_CHANNELS = _expand_channels(PL_VARS, LEVELS, FENGSHUN_SFC_VARS)
+
 
 FENGQING_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
 FENGQING_PL_VARS = ["z", "q", "t", "u", "v"]
@@ -116,6 +127,10 @@ MODEL_REGISTRY = {
     "tongyun_cra_ens_onnx": (
         "xmetai_inference.models.tongyun_cra_ens",
         "TongyunCraEnsModel",
+    ),
+    "fengshun20_onnx": (
+        "xmetai_inference.models.fengshun20_onnx",
+        "Fengshun20OnnxModel",
     ),
 }
 
@@ -189,6 +204,8 @@ def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
 __all__ = [
     "CRA_CHANNELS",
     "CRA_SFC_VARS",
+    "FENGSHUN_CHANNELS",
+    "FENGSHUN_SFC_VARS",
     "FENGQING_CHANNELS",
     "FUXI_ENS_CHANNELS",
     "FUXI21_CHANNELS",

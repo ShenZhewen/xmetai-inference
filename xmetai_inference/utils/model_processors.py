@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""模型侧处理管线：自回归回填（recurrent）与输出反变换（output）两个阶段。
+"""模型侧（主进程里跑）：自回归回填（recurrent）与输出反变换（output）两个阶段。
 
 热路径全程 torch tensor，numpy 只用于统计量加载和最终落盘。
+数据侧（store → 模型输入，DataLoader worker）在 ``dataset_processors.py``。
 """
 import logging
 import os

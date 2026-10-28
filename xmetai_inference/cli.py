@@ -30,7 +30,7 @@ import pandas as pd
 import xarray as xr
 
 from xmetai_inference.configs.base import load_config, parse_times
-from xmetai_inference.logging_util import configure_logging
+from xmetai_inference.utils.logging_util import configure_logging
 
 
 # 推理后端和具体模型在 worker 启动后按需导入，配置帮助不依赖可选模型运行环境。
@@ -516,7 +516,7 @@ def _pool_summary(model):
         "不限" if info["budget"] < 0 else info["budget"])
 
 
-def _run_member_outer(model, processors, dataset_source, writer, args, init_times,
+def _run_member_outer(model, processors, dataloader, writer, args, init_times,
                       member_indices, save_names, lat, lon, interval, local_rank,
                       world_size):
     """m1a 的集合编排：成员在外层、数据集在内层（每个成员把数据集走一遍）。
@@ -529,7 +529,7 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
 
     total_t0 = perf_counter()
     _run_member_block(
-        model, processors, dataset_source, writer, args, init_times, member_indices,
+        model, processors, dataloader, writer, args, init_times, member_indices,
         save_names, lat, lon, interval, local_rank, world_size)
     errors = writer.close()
     if errors:
@@ -541,7 +541,7 @@ def _run_member_outer(model, processors, dataset_source, writer, args, init_time
     return 0
 
 
-def _run_member_block(model, processors, dataset_source, writer, args, init_times,
+def _run_member_block(model, processors, dataloader, writer, args, init_times,
                       member_indices, save_names, lat, lon, interval, local_rank,
                       world_size, model_batch=1):
     """逐成员跑完 member_indices：每人先 load，再逐 batch 走一遍数据集并 flush。"""
@@ -557,7 +557,7 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
                  order, len(member_indices), member_id,
                  _fmt_dur(perf_counter() - t_member))
         completed = 0
-        for data_batch_index, batch in enumerate(dataset_source):
+        for data_batch_index, batch in enumerate(dataloader):
             t_fetch = perf_counter()
             state, batch_inits = model.prepare_dataset_batch(batch)
             if data_batch_index == 0:
@@ -611,7 +611,7 @@ def _run_member_block(model, processors, dataset_source, writer, args, init_time
                  member_id, _fmt_dur(perf_counter() - t_member))
 
 
-def _run_graph_outer(model, processors, dataset_source, writer, args, init_times,
+def _run_graph_outer(model, processors, dataloader, writer, args, init_times,
                      graph_members, save_names, lat, lon, interval, local_rank,
                      world_size, num_workers=0, model_batch=1):
     """集合模型 + 权重扰动的编舞：扰动图在外层，图内成员在内层。
@@ -633,7 +633,7 @@ def _run_graph_outer(model, processors, dataset_source, writer, args, init_times
                  member_ids[0], member_ids[-1], len(member_ids),
                  _fmt_dur(perf_counter() - t_graph))
         _run_plain_block(
-            model, processors, dataset_source, writer, args, member_ids,
+            model, processors, dataloader, writer, args, member_ids,
             save_names, lat, lon, interval, local_rank, world_size,
             members=len(member_ids), total_inits=len(init_times),
             num_workers=num_workers, model_batch=model_batch)
@@ -654,7 +654,7 @@ def _run_graph_outer(model, processors, dataset_source, writer, args, init_times
     return 0
 
 
-def _run_plain_block(model, processors, dataset_source, writer, args, member_indices,
+def _run_plain_block(model, processors, dataloader, writer, args, member_indices,
                      save_names, lat, lon, interval, local_rank, world_size, members,
                      total_inits, num_workers=0, model_batch=1):
     """确定性 / 同 session 集合的一段编舞：数据集在内层遍历，逐 batch 落盘并 flush。
@@ -671,7 +671,7 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
     t_fetch = perf_counter()
     # 注意：循环体内已有局部 batch_index（按 batch_inits 枚举），这里用
     # data_batch_index 区分，避免遮蔽/改绑。
-    for data_batch_index, batch in enumerate(dataset_source):
+    for data_batch_index, batch in enumerate(dataloader):
         fetch_dur = perf_counter() - t_fetch
         state, batch_inits = model.prepare_dataset_batch(batch)
         if data_batch_index == 0:
@@ -770,9 +770,9 @@ def _run_plain_block(model, processors, dataset_source, writer, args, member_ind
 
 def _worker_main(argv=None):
     from xmetai_inference.backends.base import _fmt_dur, normalize_budget
-    from xmetai_inference.data import create_dataset_source
+    from xmetai_inference.data import create_dataloader
     from xmetai_inference.models import create_model, get_model_class, grid_coords
-    from xmetai_inference.processing.pipeline import build_pipeline
+    from xmetai_inference.utils.model_processors import build_pipeline
     from xmetai_inference.runner import Rollout, Trajectory
 
     p = argparse.ArgumentParser(description="气象模型自回归推理（后端可插拔）")
@@ -950,18 +950,17 @@ def _worker_main(argv=None):
     t_dataset = perf_counter()
     log.info("正在构建数据集（打开 zarr 存储、装配时间窗），起报 %d 个...",
              len(init_times))
-    dataset_source = create_dataset_source(
+    dataloader = create_dataloader(
         dataset_spec,
         model_cls=cls,
         init_times=init_times,
         history_steps=history,
         hour_interval=interval,
         model_path=args.model,
-        dataloader=dataloader_config,
+        dataloader_options=dataloader_config,
     )
-    data_source = dataset_source
     log.info("数据集就绪：%d 个 batch（batch_size=%s），构建耗时 %s",
-             len(dataset_source),
+             len(dataloader),
              dataloader_config.get("batch_size"),
              _fmt_dur(perf_counter() - t_dataset))
 
@@ -970,7 +969,7 @@ def _worker_main(argv=None):
     processors = build_pipeline(
         input_specs,
         cls,
-        data_source,
+        dataloader,
         model_path=args.model,
         recurrent_specs=recurrent_specs,
         output_specs=output_specs,
@@ -990,10 +989,10 @@ def _worker_main(argv=None):
         cudnn_algo_search=args.cudnn_algo_search,
         resident_members=resident_members,
     )
-    model.configure_processing(processors, data_source)
+    model.configure_processing(processors, dataloader)
 
     if args.out is None:
-        model.prepare_dataset_batch(next(iter(dataset_source)), verbose=True)
+        model.prepare_dataset_batch(next(iter(dataloader)), verbose=True)
         log.info("未指定 --out，仅完成首个起报时间的输入构建检查")
         return 0
 
@@ -1039,37 +1038,36 @@ def _worker_main(argv=None):
 
     if graph_outer:
         return _run_graph_outer(
-            model, processors, dataset_source, writer, args, init_times,
+            model, processors, dataloader, writer, args, init_times,
             graph_members, save_names, lat, lon, interval, local_rank, world_size,
             num_workers=dataloader_config.get("num_workers", 0),
             model_batch=worker_cfg.model_batch)
 
     if member_outer:
         return _run_member_outer(
-            model, processors, dataset_source, writer, args, init_times,
+            model, processors, dataloader, writer, args, init_times,
             member_indices, save_names, lat, lon, interval, local_rank, world_size)
 
-    if dataset_source is not None:
-        total_t0 = perf_counter()
-        _run_plain_block(
-            model, processors, dataset_source, writer, args, member_indices,
-            save_names, lat, lon, interval, local_rank, world_size, members,
-            total_inits=len(init_times),
-            num_workers=dataloader_config.get("num_workers", 0),
-            model_batch=worker_cfg.model_batch)
-        errors = writer.close()
-        if errors:
-            log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))
-            return 1
-        log.info(
-            "全部完成：起报=%d steps=%d batch_size=%s output=%s 总耗时=%.1fs",
-            len(init_times),
-            args.steps,
-            getattr(dataset_source.dataloader, "batch_size", None),
-            args.out,
-            perf_counter() - total_t0,
-        )
-        return 0
+    total_t0 = perf_counter()
+    _run_plain_block(
+        model, processors, dataloader, writer, args, member_indices,
+        save_names, lat, lon, interval, local_rank, world_size, members,
+        total_inits=len(init_times),
+        num_workers=dataloader_config.get("num_workers", 0),
+        model_batch=worker_cfg.model_batch)
+    errors = writer.close()
+    if errors:
+        log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))
+        return 1
+    log.info(
+        "全部完成：起报=%d steps=%d batch_size=%s output=%s 总耗时=%.1fs",
+        len(init_times),
+        args.steps,
+        getattr(dataloader, "batch_size", None),
+        args.out,
+        perf_counter() - total_t0,
+    )
+    return 0
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)

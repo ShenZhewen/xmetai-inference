@@ -5,7 +5,7 @@
 
 1) **现用盘** ``ERA5_STORE2_ROOT``（原始态、物理量、按变量族拆多个 store）：
    ``era5_pl/sfc/cldrad/soil/wave_2025.01-2026.07.*.zarr``。
-   各 config 直接拼路径，单位约定见 ``processing/tensor_processors.py`` 顶部注释。
+   各 config 直接拼路径，单位约定见 ``utils/dataset_processors.py`` 顶部注释。
 
 2) **新盘** ``ERA5_V3_*``（zarr_refresh_v3，归一化态、zscore float16、单 store 全通道）：
    ``era5.202501_202607.c116.p25.h6.v3``  116 通道，2025-01-01 … 2026-07-31

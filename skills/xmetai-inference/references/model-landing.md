@@ -123,7 +123,7 @@ cfg = InferConfig(
 )
 ```
 
-**`model_processing.input` 必须为空**（`pipeline.py:263` 硬报错）——
+**`model_processing.input` 必须为空**（`model_processors.py` 的 `build_pipeline` 硬报错）——
 输入侧前处理一律写在 `dataset.processors`，那里跑在 DataLoader worker 里。
 
 **processor 链的顺序决定语义**，典型顺序（原始态 store）：
@@ -214,14 +214,14 @@ unit_convert  →  geometry  →  normalize  →  fill_missing
 
 两条路，都**不用改 schema**（config 是 Python 文件，没有 JSON schema）：
 
-**数据侧**（`processing/tensor_processors.py`，跑在 DataLoader worker）：
+**数据侧**（`utils/dataset_processors.py`，跑在 DataLoader worker）：
 
 1. 定义 `class Xxx(TensorProcessor)`，实现 `process(self, value)`，
    输入输出都是 `[T,C,H,W]`
 2. 加 `@register_tensor_processor("xxx")`
 3. config 里 `dataset.processors` 挂 `{"name": "xxx", ...kwargs}`
 
-**模型侧**（`processing/pipeline.py`，回填前 / 落盘前）：
+**模型侧**（`utils/model_processors.py`，回填前 / 落盘前）：
 
 1. 定义 `class Xxx(Processor)`，声明类属性 `stage = "recurrent"|"output"`，
    实现 `process_array(self, value)`

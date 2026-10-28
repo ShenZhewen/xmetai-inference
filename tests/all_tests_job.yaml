@@ -1,0 +1,132 @@
+# 测试 Job：tests/unit 全量 + tests/integration 的 realdata 档（真起 GPU 推理对拍）。
+#
+# 和 tests/fgvp_realdata_job.yaml 的区别：那个 cd 到评测仓（xmetai-evalation-test），
+# 是评测仓的模板；这份指回本仓。
+#
+# 集成档必须显式 -m realdata（pyproject 的 addopts 默认排除）；fixture 不齐时整模块
+# skip、退出码仍是 0，所以加 -rs 把 skip 原因打出来。
+#
+# 用法（Job 的 spec.template 不可变，重跑前先删）：
+#     kubectl delete job szw-test-all -n bktk8bmh-default --ignore-not-found
+#     kubectl apply -f tests/all_tests_job.yaml
+#     kubectl logs -f job/szw-test-all -n bktk8bmh-default
+#
+# 只看集成档结论：
+#     kubectl logs job/szw-test-all -n bktk8bmh-default | sed -n '/集成测试/,$p'
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: &job_name szw-test-all
+  namespace: bktk8bmh-default
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 60000000
+  completionMode: NonIndexed
+  completions: 1
+  parallelism: 1
+  suspend: false
+  template:
+    metadata:
+      annotations:
+        bingomatrix.bingosoft.net/ai-device-type: container0:Device,
+        bingomatrix.bingosoft.net/isRDMAHostModel: "true"
+        bingomatrix.bingosoft.net/vgpu-model-to-use: '[NVIDIA H100 80GB HBM3]'
+        bingomatrix.bingosoft.net/vgpu-type: full
+      labels:
+        job-name: *job_name
+    spec:
+      containers:
+      - name: container0
+        image: registry.bingosoft.net/pytorch/pytorch:2.11.0-cuda12.8-mamba3-20260403
+        imagePullPolicy: IfNotPresent
+        command:
+          - "bash"
+          - "-c"
+        args:
+          - |
+            set -eu
+            export PYTHONIOENCODING=utf-8
+            export PYTHONPATH=/workspace/szwCode/xmetai-inference-main
+            export XMETAI_INFERENCE_ROOT=/workspace/szwCode/xmetai-inference-main
+
+            # --- 依赖：这个环境连不上 PyPI，全走本地 wheel ---
+            # 独立成行 + set -eu：一条 pip 失败就停，不要静默跑下去。
+            pip install /workspace/szwCode/iniconfig-2.3.1-py3-none-any.whl  --break-system-packages
+            pip install /workspace/szwCode/pluggy-1.6.0-py3-none-any.whl --break-system-packages
+            pip install /workspace/szwCode/pytest-9.1.1-py3-none-any.whl --break-system-packages
+            pip install /workspace/szwCode/xmetai-inference2/h5py-3.16.0-cp312-cp312-manylinux_2_28_x86_64.whl --break-system-packages
+            pip install /workspace/szwCode/xmetai-inference2/xmetai_core-0.1.0-py3-none-any.whl --break-system-packages
+
+            # pytest 收相对路径，容器 WORKDIR 不是仓库根，必须先 cd。
+            cd /workspace/szwCode/xmetai-inference-main
+
+            echo "=================== 环境自检 ==================="
+            echo "cwd                  = $(pwd)"
+            echo "python               = $(python -V 2>&1)"
+            echo "CUDA_VISIBLE_DEVICES = ${CUDA_VISIBLE_DEVICES-<未设>}"
+            echo "xmetai_inference     = $(python -c 'import xmetai_inference,os;print(os.path.dirname(xmetai_inference.__file__))')"
+            # 集成档缺 onnxruntime 会整模块 skip（退出码仍是 0），这里显式看一眼。
+            python -c 'import onnxruntime as o; print("onnxruntime          =", o.__version__)' \
+              || echo "onnxruntime          = <缺失，集成档会 skip>"
+            echo "--- 关键依赖 ---"
+            pip list 2>/dev/null | grep -Ei '^(pytest|zarr|xarray|h5netcdf|h5py|netCDF4|onnxruntime|xmetai)' || true
+
+            echo "=================== fixture 清单 ==================="
+            ls -la /workspace/data/shenzw/inference_test_data/ || true
+            for d in fgvp_test_data fgvp_ens_test_data fuxi_test_data; do
+              echo "--- $d ---"
+              ls -la "/workspace/data/shenzw/inference_test_data/$d" 2>/dev/null || echo "<缺失>"
+            done
+
+            # 两档都跑：单元档挂了不拦集成档，最后按「任一失败」退出。
+            rc=0
+
+            echo "=================== 单元测试 ==================="
+            python -m pytest tests/unit -v || rc=$?
+
+            echo "=================== 集成测试（真起 GPU 推理）==================="
+            python -m pytest tests/integration -m realdata -v -s -rs || rc=$?
+
+            echo "=================== 汇总 ==================="
+            if [ "$rc" -eq 0 ]; then
+              echo "全部通过（集成档若有 skip，原因见上面 -rs 输出）"
+            else
+              echo "有失败，退出码 $rc"
+            fi
+            exit "$rc"
+        resources: &resource_spec
+          limits: &limits_spec
+            cpu: "8"
+            memory: 256Gi
+            nvidia.com/vgpu: "1" # number of vGPUs
+            nvidia.com/vgpu-cores: "100"
+            nvidia.com/vgpu-mem: "81089"
+          requests: *limits_spec
+        volumeMounts:
+        - mountPath: /workspace/
+          name: &pvc_name pvc-8xxpvc
+        - mountPath: /workspace/data
+          name: &data_name hostpath-8xcmad
+        - mountPath: /workspace/tmp
+          name: &tmp_name hostpath-8xcmat
+        - mountPath: /dev/shm
+          name: &shm_name shm-e3tzzc
+      restartPolicy: Never
+      schedulerName: default-scheduler
+      volumes:
+      - name: *pvc_name
+        persistentVolumeClaim:
+          claimName: shenzw
+      - name: *data_name
+        hostPath:
+          path: /share/data
+          type: ""
+      - name: *tmp_name
+        hostPath:
+          path: /share/tmp
+          type: ""
+      - name: *shm_name
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1024Gi

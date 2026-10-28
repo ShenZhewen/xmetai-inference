@@ -100,7 +100,7 @@ class BaseInferModel(ABC):
         """Convert a DataLoader batch into this model's input representation."""
         if self.processing is None or self.data_source is None:
             raise RuntimeError("模型尚未绑定 processing 和 data_source")
-        from xmetai_inference.processing.pipeline import build_dataset_batch
+        from xmetai_inference.utils.model_processors import build_dataset_batch
 
         return build_dataset_batch(batch, verbose=verbose)
 

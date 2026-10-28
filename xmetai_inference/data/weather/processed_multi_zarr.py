@@ -1,7 +1,9 @@
-"""Raw-reading wrapper around xmetai-core MultiZarrDataset.
+"""``processed_multi_zarr``：直接读原始 Zarr，选通道后逐样本跑处理器链。
 
-Opens the Zarr stores, selects channels and inference positions, and applies the
-tensor processor chain declared in ``dataset.processors``.
+    {"type": "processed_multi_zarr", "paths": [...], "processors": [...]}
+
+读盘交给 xmetai-core 的 ``MultiZarrDataset``；前处理由 ``dataset.processors``
+声明，在 ``__getitem__`` 里执行（DataLoader worker 中）。
 """
 from __future__ import annotations
 
@@ -15,9 +17,8 @@ import torch
 from torch.utils.data import Dataset
 from xmetai.data.weather.multi_zarr_dataset import MultiZarrDataset
 
-from xmetai_inference.processing.tensor_processors import (
+from xmetai_inference.utils.dataset_processors import (
     TensorProcessorContext,
-    aligned_coordinates,
     build_tensor_processors,
 )
 
@@ -90,20 +91,16 @@ def create_processed_multi_zarr_dataset(
     init_times: Sequence[object],
     history_steps: int,
     hour_interval: int,
-    data_root: str | None = None,
     model_path: str | None = None,
 ):
-    """Create a raw-reading processed MultiZarrDataset.
+    """Create the raw-reading processed torch Dataset.
 
-    前处理由 ``dataset.processors`` 声明，逐样本在 ``__getitem__`` 里执行。
+    只建数据集，不建 DataLoader；``type`` 由 :func:`create_dataloader`
+    统一校验。前处理由 ``dataset.processors`` 声明，逐样本在 ``__getitem__``
+    里执行。
     """
     config = dict(spec)
-    dataset_type = config.pop("type", None)
-    if dataset_type != "processed_multi_zarr":
-        raise ValueError(
-            f"processed_multi_zarr 只接受 type='processed_multi_zarr'，"
-            f"实际为 {dataset_type!r}"
-        )
+    config.pop("type", None)
     paths = config.pop("paths", None)
     processor_specs = config.pop("processors", ())
     if not paths:
@@ -158,14 +155,4 @@ def create_processed_multi_zarr_dataset(
         model_path=model_path,
     )
     processors = build_tensor_processors(processor_specs, context)
-
-    aligned_lat, aligned_lon = aligned_coordinates(
-        latitudes, longitudes, expected_shape
-    )
-    dataset = RawMultiZarrTensorDataset(base, positions, processors)
-    metadata = {
-        "channel_names": model_names,
-        "latitudes": aligned_lat,
-        "longitudes": aligned_lon,
-    }
-    return dataset, metadata
+    return RawMultiZarrTensorDataset(base, positions, processors)
