@@ -237,19 +237,42 @@ class TensorNormalize(TensorProcessor):
         return (out - mean) / std
 
 
+def _channel_key(name):
+    """通道名归一化：``z_50``/``z50``、``T2M``/``t2m`` 视为同一个通道。"""
+    return str(name).replace("_", "").strip().lower()
+
+
+def _open_stats_zarr(path):
+    """打开统计量 store：优先 consolidated，缺元数据合并的盘退回普通模式。
+
+    zarr v2 的合并元数据在 ``.zmetadata``、v3 在根 ``zarr.json`` 里，缺了不一定是
+    坏盘（zarr_refresh_v3 的盘就没有），所以读不到就退回逐节点模式再试一次；
+    真坏盘在第二次打开时照样报错。
+    """
+    try:
+        return xr.open_zarr(path, consolidated=True)
+    except Exception:  # noqa: BLE001 —— 退回非 consolidated 后仍有错会原样抛出
+        return xr.open_zarr(path, consolidated=False)
+
+
 @register_tensor_processor("denormalize")
 class TensorDenormalize(TensorProcessor):
     """Recover model input space from an already-normalized store: ``x*std + mean``.
 
     与 ``normalize`` 对称。用于「store 里存的就是归一化值、而图自己会归一化」的数据
-    源（CRA c71 store）：图头是 ``Div(Sub(x, mean), std)``，所以喂进去的必须是反
-    归一化后的值。
+    源（CRA c71 store、zarr_refresh_v3 的 ERA5 盘）：图头是 ``Div(Sub(x, mean), std)``，
+    所以喂进去的必须是反归一化后的值。
 
     统计量从 ``stats_path`` 指向的 zarr store 的 ``mean``/``std`` 数组读取（与数据
     同一个 store 时，正是训练用的那一套；图中烘焙的常量须与它一致）。
 
-    注意经 log1p 再归一化的通道（CRA 的 tp）：反归一化得到的是 ``log1p(物理值)``，
-    不是物理值本身 —— 那正是这类图期望的输入表示，不要再 expm1。
+    通道按**名字**对齐（``z_50`` 与 ``z50`` 视为同一个），不要求 store 的通道数与
+    顺序等于模型：zarr_refresh_v3 的 ERA5 盘是 116/78 通道的超集，模型只取自己
+    要的那几十个，按名字挑统计量。
+
+    注意经 log1p 再归一化的通道：反归一化得到的是 ``log1p(物理值)``。CRA 的 tp
+    正是图期望的输入表示，**不要** expm1；zarr_refresh_v3 的 tp 则要用
+    ``expm1_channels=["tp"]`` 还原成物理量（与 CRA 相反）。
     """
 
     def __init__(
@@ -258,6 +281,8 @@ class TensorDenormalize(TensorProcessor):
         stats_path="",
         mean_name="mean",
         std_name="std",
+        expm1_channels=None,
+        exp_clip_max=20.0,
         **kwargs,
     ):
         super().__init__(context=context, **kwargs)
@@ -268,42 +293,63 @@ class TensorDenormalize(TensorProcessor):
         stats_path = os.fspath(stats_path)
         if not os.path.isdir(stats_path):
             raise FileNotFoundError(f"归一化统计量所在 store 不存在：{stats_path}")
-        with xr.open_zarr(stats_path, consolidated=True) as stats:
+        with _open_stats_zarr(stats_path) as stats:
             for name in (mean_name, std_name):
                 if name not in stats:
                     raise ValueError(
                         f"store {stats_path} 里没有 {name!r} 数组"
                         f"（有 {list(stats.data_vars)}）")
-            self.mean = np.asarray(
+            mean = np.asarray(
                 stats[mean_name].values, dtype=np.float32).reshape(-1)
-            self.std = np.asarray(
+            std = np.asarray(
                 stats[std_name].values, dtype=np.float32).reshape(-1)
             names = None
             if "channel" in stats.coords:
                 names = tuple(str(v) for v in stats.channel.values)
 
-        if self.mean.shape != self.std.shape:
+        if mean.shape != std.shape:
             raise ValueError(
-                f"mean/std shape 不一致：{self.mean.shape} vs {self.std.shape}")
-        if self.mean.size != len(self.channel_names):
-            raise ValueError(
-                f"统计量通道数 {self.mean.size} 与模型输入通道数 "
-                f"{len(self.channel_names)} 不一致")
+                f"mean/std shape 不一致：{mean.shape} vs {std.shape}")
+        if names is None:
+            # 没有 channel 坐标只能按下标对齐（旧行为）。
+            if mean.size != len(self.channel_names):
+                raise ValueError(
+                    f"统计量通道数 {mean.size} 与模型输入通道数 "
+                    f"{len(self.channel_names)} 不一致")
+            self.mean, self.std = mean, std
+        else:
+            index = {}
+            for position, name in enumerate(names):
+                index.setdefault(_channel_key(name), position)
+            missing = [
+                name for name in self.channel_names
+                if _channel_key(name) not in index
+            ]
+            if missing:
+                raise ValueError(
+                    f"store {stats_path} 缺模型输入通道 {missing[:5]}"
+                    f"（模型要 {len(self.channel_names)} 个，store 有 {len(names)} 个）")
+            order = np.asarray(
+                [index[_channel_key(name)] for name in self.channel_names])
+            self.mean, self.std = mean[order], std[order]
+
         if (
             not np.all(np.isfinite(self.mean))
             or not np.all(np.isfinite(self.std))
             or np.any(self.std <= 0)
         ):
             raise ValueError("mean/std 包含非有限值或非正标准差")
-        # store 里可能写成 z_50、模型写成 z50（或反过来），比较前先归一化。
-        if names is not None:
-            normalized = tuple(str(v).replace("_", "").lower() for v in names)
-            expected = tuple(
-                str(v).replace("_", "").lower() for v in self.channel_names)
-            if normalized != expected:
-                raise ValueError(
-                    "store 的 channel 顺序与模型 input_channels 不一致"
-                    f"（store 前 3 个 {names[:3]}，模型前 3 个 {self.channel_names[:3]}）")
+
+        wanted = {_channel_key(name) for name in (expm1_channels or ())}
+        unknown = wanted - {_channel_key(name) for name in self.channel_names}
+        if unknown:
+            raise ValueError(
+                f"expm1_channels 不在模型输入通道里：{sorted(unknown)}")
+        self.expm1_indices = [
+            position for position, name in enumerate(self.channel_names)
+            if _channel_key(name) in wanted
+        ]
+        self.exp_clip_max = float(exp_clip_max)
 
     def process(self, value):
         value = value if torch.is_tensor(value) else torch.as_tensor(value)
@@ -313,7 +359,12 @@ class TensorDenormalize(TensorProcessor):
             self.mean, dtype=out.dtype, device=out.device).reshape(shape)
         std = torch.as_tensor(
             self.std, dtype=out.dtype, device=out.device).reshape(shape)
-        return out * std + mean
+        out = out * std + mean
+        for position in self.expm1_indices:
+            channel = out[..., position, :, :]
+            torch.clamp(channel, max=self.exp_clip_max, out=channel)
+            torch.expm1(channel, out=channel)
+        return out
 
 
 def _resolve_fengqing_mean_std_dir(model_path, mean_std_dir=None):

@@ -62,12 +62,15 @@ There are two kinds of **store layout**; identify the layout before plugging in 
 |---|---|---|---|---|
 | ERA5 foundation store (`era5_pl/sfc/cldrad/soil/wave`) | **Raw** | Physical units (q=kg/kg, tp/radiation = 1h accumulation) | Baked into graph, or framework-side mean.nc/std.nc | `unit_convert` → `geometry` → (optional) `normalize` / `fill_missing` |
 | CRA c71 store (`cra...c71.p25.h6.v1`) | **Normalized** | Already-normalized values; mean/std arrays live inside the store | Store normalization + graph head `Div(Sub(x,mean),std)` | `denormalize` (`stats_path`=that store), **no geometry** |
+| zarr_refresh_v3 ERA5 stores (`era5.202501_202607.c116...`, `era5.1979_2024.c78...`) | **Normalized** (superset) | zscore float16, all channels in one store (116 / 78); q in g/kg, radiation in W/m², tp = log1p(6h mm) | Store normalization + graph head | `denormalize` (`stats_path`=store, `expm1_channels=["tp"]`) → `unit_convert` → `geometry` → … ; ready-made per-model chains in `configs/era5_stores.py` |
 
 The key to telling them apart: for a **raw** layout, normalization lives on the "graph/framework" side, and the store
 provides physical units; for a **normalized** layout, normalization lives on the "store" side, so you must
 `denormalize` on the data side to recover physical values before feeding the graph, which then normalizes again.
-For a normalized store's log1p channel (CRA's tp), denormalization yields `log1p(physical_value)`, exactly what the
-graph expects as input — don't `expm1` it.
+For a normalized store's log1p channel, denormalization yields `log1p(physical_value)`. Whether to `expm1` it depends
+on the graph: CRA's graph expects the log1p value (don't), while FuXi/FGVP/FengQing expect physical mm/6h (do, via
+`expm1_channels`). Configs still default to the raw store2 root; `configs/fgvp_v3.py` is an opt-in A/B recipe for the
+new stores.
 
 ## Key Features
 

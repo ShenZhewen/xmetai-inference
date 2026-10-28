@@ -269,6 +269,60 @@ def test_denormalize_rejects_stats_channel_mismatch(tmp_path):
             output_specs=["denormalize"])
 
 
+def _write_stats_zarr(path, mean, std, channels):
+    """归一化态 store 的最小替身：根上的 mean/std 数组 + channel 坐标。"""
+    xr.Dataset(
+        {
+            "mean": ("channel", np.asarray(mean, dtype="f4")),
+            "std": ("channel", np.asarray(std, dtype="f4")),
+        },
+        coords={"channel": list(channels)},
+    ).to_zarr(path, mode="w")
+
+
+def test_denormalize_matches_stats_by_name_not_position(tmp_path):
+    # 新 ERA5 盘是超集、顺序也和模型不同：z_50 排第二、t2m 排第一。
+    store = tmp_path / "stats.zarr"
+    _write_stats_zarr(
+        store, mean=[9.0, 10.0, 7.0], std=[3.0, 4.0, 1.0],
+        channels=["t2m", "z_50", "tp"])
+    processor = tp.TensorDenormalize(
+        _context(channels=("z50", "t2m")), stats_path=str(store))
+    out = processor(torch.zeros(1, 2, 2, 3))
+    assert torch.allclose(out[:, 0], torch.full((1, 2, 3), 10.0)), "z50 ← z_50"
+    assert torch.allclose(out[:, 1], torch.full((1, 2, 3), 9.0)), "t2m ← t2m"
+
+
+def test_denormalize_rejects_channel_missing_from_store(tmp_path):
+    store = tmp_path / "stats.zarr"
+    _write_stats_zarr(store, mean=[0.0], std=[1.0], channels=["a"])
+    with pytest.raises(ValueError, match="缺模型输入通道"):
+        tp.TensorDenormalize(
+            _context(channels=("a", "b")), stats_path=str(store))
+
+
+def test_denormalize_expm1_after_restore(tmp_path):
+    # tp 在新盘里是 log1p 归一化，模型要物理量：反归一化后 expm1，其余通道不动。
+    store = tmp_path / "stats.zarr"
+    _write_stats_zarr(store, mean=[0.0, 0.0], std=[1.0, 1.0],
+                      channels=["tp", "a"])
+    processor = tp.TensorDenormalize(
+        _context(channels=("tp", "a")), stats_path=str(store),
+        expm1_channels=["tp"])
+    out = processor(torch.tensor([[[[2.0, 3.0]], [[2.0, 3.0]]]]))
+    assert torch.allclose(out[0, 0, 0, 0], torch.expm1(torch.tensor(2.0)))
+    assert torch.allclose(out[0, 1, 0, 0], torch.tensor(2.0))
+
+
+def test_denormalize_expm1_rejects_unknown_channel(tmp_path):
+    store = tmp_path / "stats.zarr"
+    _write_stats_zarr(store, mean=[0.0, 0.0], std=[1.0, 1.0],
+                      channels=["a", "b"])
+    with pytest.raises(ValueError, match="expm1_channels"):
+        tp.TensorDenormalize(
+            _context(), stats_path=str(store), expm1_channels=["tp"])
+
+
 def test_build_dataset_batch_parses_shape_and_times():
     ts = pd.Timestamp("2025-01-02T00:00")
     batch = {

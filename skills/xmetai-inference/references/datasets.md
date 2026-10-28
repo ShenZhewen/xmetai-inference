@@ -12,7 +12,7 @@
 | 形态 | 存的是什么 | 图怎么归一化 | 喂图前要做什么 | 典型 |
 |---|---|---|---|---|
 | **原始态** | 物理单位（q=kg/kg、z=m²/s²、tp/辐射=1h 累积，需 `unit_convert`） | 图内已烘焙，或框架侧 mean.nc/std.nc | 物理量直接喂（配 `unit_convert`+`geometry`，或再配 `normalize`/`denormalize`） | ERA5 foundation store（`era5_pl/sfc/cldrad/soil/wave`） |
-| **归一化态** | **已经归一化过的值**，mean/std 数组就存在 store 里 | 图头自带 `Div(Sub(x, mean), std)`、图尾 `Add(Mul(x,std),mean)`，常量与 store 的 mean/std 逐位一致 | **数据侧 `denormalize`**（`stats_path`=该 store），还原成物理量再喂图 | CRA c71 store（`cra...c71.p25.h6.v1`） |
+| **归一化态** | **已经归一化过的值**，mean/std 数组就存在 store 里 | 图头自带 `Div(Sub(x, mean), std)`、图尾 `Add(Mul(x,std),mean)`，常量与 store 的 mean/std 逐位一致 | **数据侧 `denormalize`**（`stats_path`=该 store），还原成物理量再喂图 | CRA c71 store（`cra...c71.p25.h6.v1`）；zarr_refresh_v3 的 ERA5 盘（`era5.202501_202607.c116...` / `era5.1979_2024.c78...`） |
 
 一句话：**原始态 store 的归一化在「图 / 框架」侧；归一化态 store 的归一化在「store」侧**。
 前者框架负责 normalize 或图内烘焙；后者 store 已经把值压到归一化空间（通常为无损存储），
@@ -28,8 +28,11 @@
 3. **lat 朝向**：北→南（FuXi 系惯例）还是南→北（CRA 的 store 原生朝向）？
    南→北 → 用 `GRID_025_S`，**别配 `geometry`**（`geometry` 会无条件把南→北翻成北→南，
    图照着南→北练的话场就被喂反，+6h z500 RMSE 90→486）。
-4. **log1p 通道**（CRA 的 tp）：反归一化得到的是 `log1p(物理值)`，**不是物理值本身**——
-   那正是图期望的输入表示，**不要再 expm1**。
+4. **log1p 通道**（tp）：反归一化得到的是 `log1p(物理值)`，**不是物理值本身**。
+   要不要 expm1 看图的输入表示，两套盘相反：
+   - CRA 的图要的就是 log1p 空间 → **不要** expm1；
+   - zarr_refresh_v3 的 ERA5 盘是 `log1p(6h 累积 mm)` 归一化，而 FuXi / FGVP /
+     风清要物理量 mm/6h → 配 `expm1_channels=["tp"]` 还原。
 
 ## 3. 归一化态 store 怎么配
 
@@ -55,9 +58,33 @@ cfg = InferConfig(
 要点：
 
 - `stats_path` 指向含 `mean`/`std` 数组的 zarr store；均值化常量必须与图头烘焙的**逐位一致**。
-  `__init__` 会核验通道数和顺序（`_` 归一化后比对，兼容 `z_50` vs `z50`）。
+  `__init__` 按**名字**对齐通道（`_` 归一化后比对，兼容 `z_50` vs `z50`）：store 的
+  通道数与顺序**不必**等于模型，超集盘也能用（模型要的通道缺一个就报错）。
 - 输出侧 `model_processing.output` **恒等**：图尾已把结果还原成物理量，落盘不用再处理。
 - `model_processing.input` 恒为空（前处理在 `dataset.processors`）。
+
+### 3.1 归一化态的 ERA5 新盘（zarr_refresh_v3）
+
+`/workspace/data/zarr_refresh_v3/` 两套，单 store 全通道、zscore float16：
+
+| store | 通道 | 时段 |
+|---|---|---|
+| `era5.202501_202607.c116.p25.h6.v3` | 116（五家 ERA5 模型输入的超集） | 2025-01-01 … 2026-07-31 |
+| `era5.1979_2024.c78.p25.h6.v1` | 78（= FuXi-Ens / FGVP 的输入集） | 1979-01-01 … 2024-12-31（回算） |
+
+反归一化后与 store2 的单位约定**不同**，必须按模型期望再换算：
+
+| 通道 | 新盘（还原后） | 模型期望 → 处理 |
+|---|---|---|
+| `q` | g/kg | FuXi / FGVP 直接用；风清 / Pangu 要 kg/kg ⇒ `unit_convert {"q": 1e-3}`（风清的单位烧在逐像素 `mean_std/*.npy` 里，漏乘**不报错**，只会整场偏 1000×） |
+| `ssr/ssrd/fdir/ttr` | W/m²（时段平均通量） | 6h Wh/m² ⇒ `unit_convert` ×6 |
+| `tp` | log1p(6h 累积 mm) | mm/6h ⇒ `denormalize` 的 `expm1_channels` |
+| 其余 | 物理量 | 直接用 |
+
+各模型的完整链已封装在 `configs/era5_stores.py` 的 `*_dataset()`（`fgvp_dataset`、
+`fuxi_ens_dataset`、`fuxi21_dataset`、`fengqing_dataset`、`pangu_dataset`），
+与各自 store2 版本的 processor 顺序、`fill_missing` 规则一一对应；`configs/fgvp_v3.py`
+是直接可跑的 A/B 示例。现用盘的 config **没有改**，切新盘只在显式调用这些函数时发生。
 
 ## 4. 三种数据源↔处理器链总表
 
@@ -66,6 +93,7 @@ cfg = InferConfig(
 | 原始态 | 图内烘焙 | `unit_convert` → `geometry` →（可选）`fill_missing` | 三阶段恒等 | `fgvp.py` / `fengqing.py` |
 | 原始态 | 框架 mean.nc/std.nc | `unit_convert` → `geometry` → `normalize` → `fill_missing` | `recurrent`=`zero_channels`；`output`=`denormalize` | `fuxi21.py` |
 | **归一化态** | store（图头再收一遍） | `denormalize`（`stats_path`=store），**不配 geometry** | 三阶段恒等 | `tongyun_cra.py` |
+| **归一化态（超集）** | store | `denormalize`（`stats_path`=store，`expm1_channels` 视模型）→ `unit_convert` → `geometry` →（可选）`normalize`/`fill_missing` | 三阶段恒等 | `fgvp_v3.py`；其余见 `configs/era5_stores.py` |
 
 ## 5. `fill_missing` 位置语义（原始态常见坑）
 
