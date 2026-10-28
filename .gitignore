@@ -42,3 +42,6 @@ dist/
 
 # ===== 本地跑集成测试用的 k8s Job（写死了集群内的 pvc/hostPath 和 namespace）=====
 tests/fgvp_realdata_job.yaml
+
+# ===== 本地临时脚本：Job yaml / 探针 / 复现（写死了本机或集群内的临时路径）=====
+tools/
