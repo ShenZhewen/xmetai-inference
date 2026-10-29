@@ -25,6 +25,13 @@ GRID_025_S = {
     "lon": {"start": 0.0, "step": 0.25, "size": 1440},
 }
 
+# s2s 系列的 1.5° 全球网格：lat 90→−90（121）、lon 0→358.5（240），
+# 与盘 s2s.19500101_20260417.c76.1p5.h24.v1 / cra.1979_2025.c87.1p5.h24.v1 原生朝向一致。
+GRID_1P5 = {
+    "lat": {"start": 90.0, "step": -1.5, "size": 121},
+    "lon": {"start": 0.0, "step": 1.5, "size": 240},
+}
+
 LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 PL_VARS = ["z", "t", "u", "v", "q"]
 FUXI_ENS_SFC_VARS = [
@@ -61,6 +68,20 @@ FENGSHUN_SFC_VARS = [
     "ssr", "ssrd", "fdir", "ttr", "tcw", "tp",
 ]
 FENGSHUN_CHANNELS = _expand_channels(PL_VARS, LEVELS, FENGSHUN_SFC_VARS)
+
+
+# 风顺 ERA 1.5°（源图 s2s_gssp_gdn2.onnx）：76 通道、1.5°，顺序与训练盘
+# s2s.19500101_20260417.c76.1p5.h24.v1 的 channel 数组逐位一致 —— 上层 [z,t,u,v,q]
+# × 13 层（**1000→50 降序**，与 fengshun2.0 的 50→1000 升序相反），地面
+# [t2m,d2m,sst,ttr,u10m,v10m,u100m,v100m,msl,tcwv,tp]。
+# 图内 mean/std 也是按这个顺序烘焙的，改顺序不会报错、只会整场错位。
+S2S_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+S2S_PL_VARS = ["z", "t", "u", "v", "q"]
+S2S_SFC_VARS = [
+    "t2m", "d2m", "sst", "ttr", "u10m", "v10m", "u100m", "v100m",
+    "msl", "tcwv", "tp",
+]
+S2S_CHANNELS = _expand_channels(S2S_PL_VARS, S2S_LEVELS, S2S_SFC_VARS)
 
 
 FENGQING_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
@@ -131,6 +152,10 @@ MODEL_REGISTRY = {
     "fengshun20_onnx": (
         "xmetai_inference.models.fengshun20_onnx",
         "Fengshun20OnnxModel",
+    ),
+    "fengshun_era_1p5_onnx": (
+        "xmetai_inference.models.fengshun_era_1p5",
+        "FengshunEra1p5Model",
     ),
 }
 
@@ -211,7 +236,10 @@ __all__ = [
     "FUXI21_CHANNELS",
     "GRID_025",
     "GRID_025_S",
+    "GRID_1P5",
     "PANGU_CHANNELS",
+    "S2S_CHANNELS",
+    "S2S_SFC_VARS",
     "MODEL_REGISTRY",
     "create_model",
     "get_model_class",

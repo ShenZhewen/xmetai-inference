@@ -63,9 +63,10 @@ class Fengshun20OnnxModel(OnnxInferModel):
     gpu_state = False
     # 时间条件按 valid_time 原值喂（offset=0 ⇒ valid_time = init + step*24h）。
     valid_time_step_offset = 0
-    # forward 自己拼 feeds、不走 backends/onnx.py 的 _scalar_feeds，也就没有
-    # 潜空间强迫的接入点；声明不支持，避免开了以后静默不生效。
-    supports_latent_forcing = False
+    # forward 自己拼 feeds、不走 backends/onnx.py 的 _scalar_feeds，所以潜空间强迫
+    # 要在这里自己接（见 forward 末尾）。打开能力位后，配了 latent_forcing 的 config
+    # 才会把 ``spw/xi`` 真的喂进图；不配时行为与原来逐位相同。
+    supports_latent_forcing = True
 
     def forward(self, x, step, valid_time):
         """一步前向：物理量进 / 物理量出，只出预报那一帧。
@@ -80,6 +81,13 @@ class Fengshun20OnnxModel(OnnxInferModel):
                 [_hour_of(value) for value in times], dtype=np.float32)
             feeds["doy"] = np.asarray(
                 [_doy_of(value) for value in times], dtype=np.float32)
-        # 图签名里没有的键会被 drop（本模型只有 input/step/hour/doy）。
+        # 图签名里没有的键会被 drop（本模型只有 input/step/hour/doy；
+        # 改写过的强迫图多一个 spw/xi）。
         feeds = {key: value for key, value in feeds.items() if key in self._input_names}
+        # 潜空间 AR(1) 强迫（SPA）：未配 latent_forcing 时 row 为 None，行为不变。
+        # width = 本次堆了几条轨迹；fengshun 的 dataloader batch_size=1 ⇒ 恒 1。
+        width = int(x.shape[0])
+        row = self._latent_step_stream(step, width=width)
+        if row is not None:
+            feeds[self.latent_forcing.input_name] = self._latent_stream.ar1.row(row, width)
         return self.session.run([self._pred_name], feeds)[0]

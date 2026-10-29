@@ -262,6 +262,12 @@ class LatentForcingSpec(SpecBase):
     input_name: str = FORCING_INPUT
     cache_dir: str | None = None
     verify_on_load: bool = True
+    #: 空间基的谱形状："gaussian"（默认，**只在**这种模式下用 length_scale）或
+    #: "powerlaw"（功率 ∝ k^-α）。随机抽样序列与同参数的高斯基完全相同（seed 含
+    #: length_scale），所以两臂可配对，只差空间谱形状。（cov 基未移植。）
+    space_spectrum: str = "gaussian"
+    #: 幂律指数 α：功率 ∝ k^-α、幅度滤波器 ∝ k^(-α/2)。只在 powerlaw 时生效。
+    spectrum_alpha: float = 2.5
 
     def __post_init__(self):
         if isinstance(self.targets, str):
@@ -281,6 +287,16 @@ class LatentForcingSpec(SpecBase):
         for name, value in (("tau_days", self.tau_days), ("length_scale", self.length_scale)):
             if not (value > 0):
                 raise ValueError(f"latent_forcing.{name} 必须 > 0，实际 {value!r}")
+        self.space_spectrum = str(self.space_spectrum or "gaussian").strip().lower()
+        if self.space_spectrum not in ("gaussian", "powerlaw"):
+            raise ValueError(
+                "latent_forcing.space_spectrum 只能是 'gaussian' / 'powerlaw'，"
+                f"实际 {self.space_spectrum!r}")
+        self.spectrum_alpha = float(2.5 if self.spectrum_alpha is None else self.spectrum_alpha)
+        if self.space_spectrum == "powerlaw" and not (0 < self.spectrum_alpha <= 8):
+            raise ValueError(
+                "latent_forcing.spectrum_alpha 必须在 (0, 8] 内（功率 ∝ k^-α），"
+                f"实际 {self.spectrum_alpha!r}")
         if self.rank < 1:
             raise ValueError(f"latent_forcing.rank 必须 >= 1，实际 {self.rank}")
         for name, value in (("tokens", self.tokens), ("channels", self.channels)):
@@ -334,8 +350,12 @@ class LatentForcingSpec(SpecBase):
         return float(np.exp(-(step_hours / 24.0) / self.tau_days))
 
     def budgets(self) -> dict:
-        """参与图指纹的字段；τ / a(t) 只在驱动侧起作用，不进指纹。"""
-        return {
+        """参与图指纹的字段；τ / a(t) 只在驱动侧起作用，不进指纹。
+
+        ``space_spectrum`` / ``spectrum_alpha`` 只在**非默认**时加进去：默认高斯基的载荷
+        必须与改动前逐字节相同，否则已有的缓存改写图会全部失效。
+        """
+        payload = {
             "targets": list(self.targets),
             "sigma": float(self.sigma),
             "rank": int(self.rank),
@@ -347,6 +367,11 @@ class LatentForcingSpec(SpecBase):
             "input_name": self.input_name,
             "format": FORCING_FORMAT,
         }
+        if self.space_spectrum != "gaussian":
+            payload["space_spectrum"] = self.space_spectrum
+        if self.space_spectrum == "powerlaw":
+            payload["spectrum_alpha"] = float(self.spectrum_alpha)
+        return payload
 
     def describe(self) -> str:
         amp = ""
@@ -354,9 +379,11 @@ class LatentForcingSpec(SpecBase):
             amp = " a(t)=%d点 %.2f→%.2f" % (
                 len(self.amp_profile), self.amp_profile[0][1], self.amp_profile[-1][1])
         demean = "" if int(self.demean_members) <= 1 else " demean=%d成员" % self.demean_members
-        return ("latent-ar1 targets=%s sigma=%g tau=%gd rank=%d length_scale=%g%s%s"
+        spectrum = ("" if self.space_spectrum == "gaussian"
+                    else " spectrum=powerlaw(alpha=%g)" % self.spectrum_alpha)
+        return ("latent-ar1 targets=%s sigma=%g tau=%gd rank=%d length_scale=%g%s%s%s"
                 % (" | ".join(self.targets), self.sigma, self.tau_days, self.rank,
-                   self.length_scale, amp, demean))
+                   self.length_scale, spectrum, amp, demean))
 
 
 # 图格式版本：改「图怎么改写」（输入名、节点结构、基归一化、外部数据落位）就 +1，
@@ -511,6 +538,22 @@ def _lowpass(field: np.ndarray, sigma_tokens: float) -> np.ndarray:
     return np.fft.ifft2(np.fft.fft2(field) * kernel).real
 
 
+def _powerlaw(field: np.ndarray, alpha: float) -> np.ndarray:
+    """循环幂律整形（FFT）：功率 ∝ k^-α，即幅度滤波器 ∝ k^(-α/2)。
+
+    k 是 (rows, cols) 索引空间里的循环波数，不做球面/纬度加权 —— 「最小改动的物理谱」
+    版本：只把空间基的谱从「几乎全在行星尺度」铺到 5–20 天气尺度。DC 置 0（与高斯基
+    一样防整场一致偏移）。
+    """
+    rows, cols = field.shape
+    fy = np.fft.fftfreq(rows)[:, None]
+    fx = np.fft.fftfreq(cols)[None, :]
+    k = np.sqrt(fy * fy + fx * fx)
+    filt = np.maximum(k, 1e-12) ** (-0.5 * float(alpha))
+    filt[0, 0] = 0.0
+    return np.fft.ifft2(np.fft.fft2(field) * filt).real
+
+
 def _unit_columns(matrix: np.ndarray) -> np.ndarray:
     """QR 正交化：返回列正交且单位范数的同形矩阵（列数 <= 行数）。"""
     q, _ = np.linalg.qr(matrix, mode="reduced")
@@ -518,39 +561,57 @@ def _unit_columns(matrix: np.ndarray) -> np.ndarray:
 
 
 def build_basis(tokens: int, channels: int, rank: int, length_scale: float,
-                grid: tuple, seed: int | None, sigma: float) -> dict:
+                grid: tuple, seed: int | None, sigma: float, *,
+                space_spectrum: str = "gaussian",
+                spectrum_alpha: float = 2.5) -> dict:
     """构造空间基 V[N,R] 与通道基 U[C,R]，把 σ 与归一化常数折叠进 U。
 
     返回 {"Vt": [R,N], "Ut": [R,C], "report": {...}}；图里算
     ``n = Σ_r ξ_r · Ut[r] ⊗ Vt[r]``。U 的缩放取 ``σ·sqrt(C·N/R)``，使 RMS(n) ≈ σ，
     与 SPW 的 σ 同量纲。
+
+    ``space_spectrum="powerlaw"`` 时用 ``_powerlaw(white, spectrum_alpha)`` 代替高斯低通；
+    随机抽样序列与同参数的高斯基**完全相同**（seed 不含谱形状），所以两臂是配对对照，
+    只差空间谱形状。QR 正交化把总能量固定回 R，σ 语义不变。
     """
     if rank > channels:
         raise ValueError(
             f"latent_forcing.rank={rank} 不能大于通道数 {channels}"
             "（通道基最多只有 channels 个正交方向）")
+    if space_spectrum not in ("gaussian", "powerlaw"):
+        raise ValueError(
+            f"space_spectrum 只能是 'gaussian' / 'powerlaw'，实际 {space_spectrum!r}")
     rows, cols = int(grid[0]), int(grid[1])
     rng = np.random.default_rng(np.random.SeedSequence(
         [int(seed or 0), 104729, tokens, channels, int(length_scale * 1000)]))
-    # 空间基：低通随机场 -> 去 DC（防整场偏移）-> 正交化。
+    # 空间基：整形随机场 -> 去 DC（防整场偏移）-> 正交化。
     # length_scale 相对网格过大时，低通会压掉除 DC 外的全部模，去 DC 后撑不起基；
     # 逐个方向检查残余能量，不达标就退回白噪声。
     space = []
     fallbacks = 0
     for _ in range(rank):
         white = rng.standard_normal((rows, cols))
-        flat = _lowpass(white, float(length_scale)).reshape(-1)
+        flat_white = white.reshape(-1)
+        if space_spectrum == "powerlaw":
+            flat = _powerlaw(white, float(spectrum_alpha)).reshape(-1)
+        else:
+            flat = _lowpass(white, float(length_scale)).reshape(-1)
         centred = flat - flat.mean()
-        if float(centred @ centred) < 1e-8 * float(white.reshape(-1) @ white.reshape(-1)):
-            centred = white.reshape(-1)
-            centred = centred - centred.mean()
+        if float(centred @ centred) < 1e-8 * float(flat_white @ flat_white):
+            centred = flat_white - flat_white.mean()
             fallbacks += 1
         space.append(centred)
     if fallbacks:
-        log.warning(
-            "latent_forcing：%d/%d 个空间基方向在 %dx%d 的网格上退化了（length_scale=%g 的"
-            "低通把除 DC 以外的模全压没），这些方向已退回白噪声。请把 length_scale 调到 %d 以下。",
-            fallbacks, rank, rows, cols, float(length_scale), max(1, min(rows, cols) // 4))
+        if space_spectrum == "powerlaw":
+            log.warning(
+                "latent_forcing：%d/%d 个幂律空间基方向在 %dx%d 的网格上退化"
+                "（spectrum_alpha=%g 把所有非 DC 模压没），这些方向已退回白噪声。",
+                fallbacks, rank, rows, cols, float(spectrum_alpha))
+        else:
+            log.warning(
+                "latent_forcing：%d/%d 个空间基方向在 %dx%d 的网格上退化了（length_scale=%g 的"
+                "低通把除 DC 以外的模全压没），这些方向已退回白噪声。请把 length_scale 调到 %d 以下。",
+                fallbacks, rank, rows, cols, float(length_scale), max(1, min(rows, cols) // 4))
     basis_v = np.stack(space, axis=1)
     basis_v = _unit_columns(basis_v)
     # 通道基：随机正交
@@ -560,6 +621,9 @@ def build_basis(tokens: int, channels: int, rank: int, length_scale: float,
             "Ut": (basis_u.T * scale).astype(np.float32),
             "report": {"tokens": tokens, "channels": channels, "grid": (rows, cols),
                        "rank": rank, "length_scale": float(length_scale),
+                       "space_spectrum": space_spectrum,
+                       "spectrum_alpha": (float(spectrum_alpha)
+                                          if space_spectrum == "powerlaw" else None),
                        "sigma": float(sigma), "scale": scale,
                        "fallbacks": int(fallbacks)}}
 
@@ -673,6 +737,9 @@ def _stamp_forcing(onnx, model, src_path, spec, targets, layout, report):
         "spw.ar1.grid": "%dx%d" % tuple(layout["grid"]),
         "spw.ar1.rank": str(int(spec.rank)),
         "spw.ar1.length_scale": "%.6g" % float(spec.length_scale),
+        "spw.ar1.space_spectrum": spec.space_spectrum,
+        "spw.ar1.spectrum_alpha": ("%.6g" % float(spec.spectrum_alpha)
+                                   if spec.space_spectrum == "powerlaw" else ""),
         "spw.ar1.sigma": "%.6g" % float(spec.sigma),
         "spw.ar1.tau_days": "%.6g" % float(spec.tau_days),
         "spw.ar1.rho": "%.6g" % spec.rho(),
@@ -747,7 +814,9 @@ def build_forcing_model(src_path: str, spec: LatentForcingSpec, out_path: str | 
     targets = resolve_targets(model, spec)
     layout = detect_layout(model, targets, spec)
     basis = build_basis(layout["tokens"], layout["channels"], spec.rank,
-                        spec.length_scale, layout["grid"], spec.seed, spec.sigma)
+                        spec.length_scale, layout["grid"], spec.seed, spec.sigma,
+                        space_spectrum=spec.space_spectrum,
+                        spectrum_alpha=spec.spectrum_alpha)
     added = inject_forcing(onnx, model, targets, basis, spec)
     _stamp_forcing(onnx, model, src_path, spec, targets, layout, basis["report"])
 
@@ -861,6 +930,8 @@ def audit_forcing(path: str) -> dict:
         "sigma": meta.get("spw.ar1.sigma"),
         "tau_days": meta.get("spw.ar1.tau_days"),
         "length_scale": meta.get("spw.ar1.length_scale"),
+        "space_spectrum": meta.get("spw.ar1.space_spectrum"),
+        "spectrum_alpha": meta.get("spw.ar1.spectrum_alpha"),
         "rho": meta.get("spw.ar1.rho"),
         "tokens": meta.get("spw.ar1.tokens"),
         "channels": meta.get("spw.ar1.channels"),
@@ -886,9 +957,12 @@ def format_forcing_audit(report: Mapping) -> list:
     lines.append("  强迫节点数        %s" % report.get("nodes"))
     lines.append("  布局              tokens=%s channels=%s grid=%s"
                  % (report.get("tokens"), report.get("channels"), report.get("grid")))
-    lines.append("  参数              sigma=%s tau=%s 天（ρ=%s）rank=%s length_scale=%s"
+    spectrum = str(report.get("space_spectrum") or "-")
+    if report.get("spectrum_alpha"):
+        spectrum += "(α=%s)" % report.get("spectrum_alpha")
+    lines.append("  参数              sigma=%s tau=%s 天（ρ=%s）rank=%s length_scale=%s 谱=%s"
                  % (report.get("sigma"), report.get("tau_days"), report.get("rho"),
-                    report.get("rank"), report.get("length_scale")))
+                    report.get("rank"), report.get("length_scale"), spectrum))
     lines.append("  种子（驱动侧）    %s" % report.get("seed"))
     lines.append("  源图              %s" % report.get("source"))
     lines.append("  ⇒ %s" % ("结构自洽" if report.get("ok") else "**结构不自洽，别拿它跑推理**"))
