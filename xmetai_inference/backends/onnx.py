@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""ONNX Runtime 后端（CUDAExecutionProvider）。
+"""ONNX Runtime 后端：通用加载 + 一步前向。
 
-通用 ONNX 加载 + 一步前向。这里只放后端机制（session 建立、显存调优、run），
-模型特定的东西（喂料、取帧、归一化）由各模型子类覆盖。
+时间标量的编码差异用类属性 ``time_features`` 声明，不必重写 forward。
 """
 import gc
 import logging
@@ -47,24 +46,56 @@ def _preload_onnxruntime_lib():
     return None
 
 
-def _scalar_feeds(valid_time, step, perturb_std_scale=1.0):
-    """构造 step/hour/doy/perturb_std_scale 标量输入（模型签名里没有的键会被 drop）。
+# 时间标量输入的默认编码（Tongyun-CRA 口径，逐位等于旧版实现）。
+# 模型类用 ``time_features`` 覆盖任意一项，没写的键沿用这里；调用点按图签名过滤。
+DEFAULT_TIME_FEATURES = {
+    "step": {"divisor": 1.0},
+    "hour": {"divisor": 24.0},
+    "doy": {"divisor": 365.0, "clip_max": 365},
+    # 图内扰动的幅度旋钮（CRA 版 Tongyun 有，ERA5 版没有）：1.0 = 训练时的标称噪声。
+    "perturb_std_scale": {"value": 1.0},
+}
 
-    perturb_std_scale 是图内扰动的幅度旋钮（CRA 版 Tongyun 有，ERA5 版没有）：
-    1.0 = 训练时的标称噪声。调用点都按 ``self._input_names`` 过滤，没有这个输入的
-    图不会收到它，行为逐位不变。
+
+def _day_of_year(value):
+    """day-of-year：pandas Timestamp 有 day_of_year / dayofyear，datetime 走 timetuple。"""
+    for attr in ("day_of_year", "dayofyear"):
+        day = getattr(value, attr, None)
+        if day is not None:
+            return float(day)
+    return float(value.timetuple().tm_yday)
+
+
+def _scalar_feeds(valid_time, step, features=None):
+    """构造图内标量输入（模型签名里没有的键会被 drop）。
+
+    每项可给 ``divisor`` / ``clip_max`` / ``value``；hour/doy 取输入窗末帧的时刻。
+    编码在 float64 上做、最后转 float32，与旧实现逐位相同。
     """
+    table = DEFAULT_TIME_FEATURES if features is None else features
     times = [valid_time] if np.ndim(valid_time) == 0 else list(valid_time)
-    return {
-        "step": np.full((len(times),), step, dtype=np.float32),
-        "hour": np.asarray([value.hour / 24.0 for value in times], dtype=np.float32),
-        "doy": np.asarray(
-            [min(365, value.day_of_year) / 365.0 for value in times],
-            dtype=np.float32,
-        ),
-        "perturb_std_scale": np.full(
-            (len(times),), perturb_std_scale, dtype=np.float32),
-    }
+    feeds = {}
+    for name, spec in table.items():
+        if "value" in spec:
+            feeds[name] = np.full(
+                (len(times),), float(spec["value"]), dtype=np.float32)
+            continue
+        if name == "step":
+            raw = np.full((len(times),), step, dtype=np.float64)
+        elif name == "hour":
+            raw = np.asarray(
+                [getattr(value, "hour", 0.0) for value in times], dtype=np.float64)
+        elif name == "doy":
+            raw = np.asarray(
+                [_day_of_year(value) for value in times], dtype=np.float64)
+        else:
+            raise KeyError(
+                f"未知的时间标量输入 {name!r}（只认 step/hour/doy）")
+        clip = spec.get("clip_max")
+        if clip is not None:
+            raw = np.minimum(raw, float(clip))
+        feeds[name] = (raw / float(spec.get("divisor", 1.0))).astype(np.float32)
+    return feeds
 
 
 class OnnxInferModel(BaseInferModel):
@@ -72,15 +103,34 @@ class OnnxInferModel(BaseInferModel):
     backend = "onnx"
     supports_weight_perturb = True
     supports_latent_forcing = True
-    # config 的 latent_forcing；与 weight_perturb 正交、可叠加
-    latent_forcing = None
+    # 时间标量编码的覆盖，只写要改的键（图接口契约）
+    time_features = {}
     use_cpu_initializers = True
-    # 常驻 session 额度：1 = 一换一，N = 最多 N 份，-1 = 全常驻
-    resident_members = 1
+    resident_members = 1                 # 常驻 session 额度：1 = 一换一，-1 = 全常驻
     _pool = None
-    _pool_hit = False
-    # 自定义算子库路径（.so）；None = 不需要
-    ops_library = None
+    ops_library = None                   # 自定义算子库 .so，None = 不需要
+
+    def __init__(self, device_id=0, gpu_mem_fraction=0.7):
+        super().__init__(device_id=device_id, gpu_mem_fraction=gpu_mem_fraction)
+        overrides = dict(self.time_features or {})
+        unknown = set(overrides) - set(DEFAULT_TIME_FEATURES)
+        if unknown:
+            raise ValueError(
+                f"{type(self).__name__}.time_features 里有未知的时间标量输入 "
+                f"{sorted(unknown)}（可选 {sorted(DEFAULT_TIME_FEATURES)}）")
+        allowed_keys = {"divisor", "clip_max", "value"}
+        for name, spec in overrides.items():
+            if not isinstance(spec, dict):
+                raise ValueError(
+                    f"time_features[{name!r}] 应为 dict（如 {{\"divisor\": 1.0}}），"
+                    f"实际 {type(spec).__name__}")
+            bad = set(spec) - allowed_keys
+            if bad:
+                raise ValueError(
+                    f"time_features[{name!r}] 有未知字段 {sorted(bad)}"
+                    f"（可选 {sorted(allowed_keys)}）")
+        # 合并成实例表：子类只写要覆盖的项，行为与「照抄整张表」等价
+        self._time_features = {**DEFAULT_TIME_FEATURES, **overrides}
 
     def _make_session(self, path):
         """建 ONNX InferenceSession（路径校验 + 选项 + provider + 自定义算子）。"""
@@ -97,14 +147,13 @@ class OnnxInferModel(BaseInferModel):
             raise ValueError(
                 f"指向的文件是 JSON（{path}），不是 ONNX 模型。"
                 f"请改成 .onnx 模型路径。")
-        # 压掉 ScatterND 等模型内噪音提示
         ort.set_default_logger_severity(3)
         options = ort.SessionOptions()
         options.enable_mem_pattern = False
         options.enable_cpu_mem_arena = True
         options.enable_mem_reuse = True
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        # 不设 intra_op 时 ORT 吃满物理核，多个 worker 会超订；inter_op 在
+        # 不设 intra_op 时 ORT 吃满物理核，多 worker 会超订；inter_op 在
         # ORT_SEQUENTIAL 下无效，恒为 1。
         if int(getattr(self, "intra_op_threads", 0) or 0) > 0:
             options.intra_op_num_threads = int(self.intra_op_threads)
@@ -143,11 +192,12 @@ class OnnxInferModel(BaseInferModel):
         return ort.InferenceSession(path, sess_options=options, providers=providers)
 
     def load(self, path):
-        """加载 ONNX 会话，并按 weight_perturb / latent_forcing 解析实际路径。
+        """加载 ONNX 会话；按 weight_perturb / latent_forcing 解析实际路径并自检。
 
-        加载后做一次自检（只读 metadata、不跑前向），抓「看着注入了、其实没生效」
-        的静默失败。
+        自检只读 metadata、不跑前向，抓「看着注入了、其实没生效」的静默失败。
         """
+        # 重新 load = 新的一批轨迹，丢掉旧的驱动状态（与旧版每次新建等价）
+        self._latent_stream.release()
         spec = getattr(self, "weight_perturb", None)
         forcing = getattr(self, "latent_forcing", None)
         if spec or forcing:
@@ -177,14 +227,7 @@ class OnnxInferModel(BaseInferModel):
             and isinstance(_in_shape[0], str) and isinstance(_out_dim[0], str))
         self._check_gpu_state_frames()
         self._verify_forcing(forcing)
-        # 输出 buffer 复用池，避免每步重新分配显存
-        self._spare = None
-        # 潜空间强迫的驱动状态，每个成员一份
-        # ⚠ 不要在这里清 _latent_n_targets：它刚由 _verify_forcing 按 metadata 设好，
-        # 清零会让 forward 喂不上 spw/xi。
-        from xmetai_inference.backends.spa import LatentStepStream
-
-        self._latent_stream = LatentStepStream()
+        self._spare = None    # 输出 buffer 复用，避免每步重新分配显存
 
     def _verify_perturbation(self, spec):
         """加载后的扰动自检：确认图就是 self.member_index 那个成员。"""
@@ -272,29 +315,18 @@ class OnnxInferModel(BaseInferModel):
             "补齐帧数。"
         )
 
-    def _latent_step_stream(self, step, width=1):
-        """本步本块的起始 ξ 行号（None = 不强迫）；实现见 backends.spa。"""
-        forcing = getattr(self, "latent_forcing", None)
-        if not forcing or self._latent_n_targets <= 0:
-            return None
-        return self._latent_stream(
-            forcing, step,
-            n_targets=self._latent_n_targets,
-            member_index=getattr(self, "member_index", 0),
-            hour_interval=getattr(self, "hour_interval", None),
-            width=width)
-
     def forward(self, x, step, valid_time):
         feeds = {"input": _as_numpy_onnx(x)}
         if valid_time is not None:
-            for k, v in _scalar_feeds(valid_time, step).items():
+            for k, v in _scalar_feeds(
+                    valid_time, step, self._time_features).items():
                 if k in self._input_names:
                     feeds[k] = v
-        # batch 维 = 本次堆了几条轨迹；块内 k 条要同一 index 起的 k 行独立 ξ
+        # batch 维 = 本次堆了几条轨迹；块内 k 条各吃一行独立 ξ
         width = int(x.shape[0])
-        row = self._latent_step_stream(step, width=width)
-        if row is not None:
-            feeds[self.latent_forcing.input_name] = self._latent_stream.ar1.row(row, width)
+        xi = self._latent_row(step, width=width)
+        if xi is not None:
+            feeds[self.latent_forcing.input_name] = xi
         # 返回完整滑动窗口，末帧是本步预报；回填由 Rollout 负责
         result = self.session.run([self._pred_name], feeds)[0]
         return result
@@ -313,7 +345,8 @@ class OnnxInferModel(BaseInferModel):
         binding = self.session.io_binding()
         binding.bind_ortvalue_input("input", state)
         if valid_time is not None:
-            for k, v in _scalar_feeds(valid_time, step).items():
+            for k, v in _scalar_feeds(
+                    valid_time, step, self._time_features).items():
                 if k in self._input_names:
                     binding.bind_cpu_input(k, v)
         binding.bind_ortvalue_output(self._pred_name, out)
@@ -326,8 +359,7 @@ class OnnxInferModel(BaseInferModel):
         """丢掉当前 session；额度为 1 时连常驻池一起清空（全清用 release_all）。"""
         self.session = None
         self._spare = None
-        if getattr(self, "_latent_stream", None) is not None:
-            self._latent_stream.release()
+        super().release()
         if self._pool is not None and self._pool.budget == 1:
             self._pool.purge()
 
@@ -335,8 +367,7 @@ class OnnxInferModel(BaseInferModel):
         """把当前 session 与整个常驻池一起放开（进程收尾，或想立刻把显存还回去）。"""
         self.session = None
         self._spare = None
-        if getattr(self, "_latent_stream", None) is not None:
-            self._latent_stream.release()
+        super().release()
         if self._pool is not None:
             self._pool.purge()
         gc.collect()
@@ -353,7 +384,6 @@ class OnnxInferModel(BaseInferModel):
         if self._pool is None:
             self._pool = SessionPool(self.resident_members, logger=log)
         session, hit = self._pool.acquire(path, lambda: self._make_session(path))
-        self._pool_hit = hit
         if hit:
             log.info("session 命中共驻池（驻留 %d 份，额度 %d）：%s",
                      len(self._pool), self._pool.budget, os.path.basename(path))

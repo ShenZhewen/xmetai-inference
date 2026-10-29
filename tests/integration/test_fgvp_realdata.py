@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """fgvp 真实数据档：真 ONNX 在切片数据上跑一遍，和标准答案对拍。
 
-配方是 configs/fgvp.py 的 deepcopy 派生，只覆盖 fixture 特有项；判 PASS 为最坏一档
+配方是 configs/weather_era_0p25_fgvp.py 的 deepcopy 派生，只覆盖 fixture 特有项；判 PASS 为最坏一档
 ∈ {IDENTICAL, CLOSE}，分档判据冻结在 realdata_common，不要求逐位相同。golden 出处未
 确证，只能防回归，不能证明当前结果正确。
 
@@ -74,7 +74,7 @@ _CONFIG_TEMPLATE = Template('''\
 import copy
 from pathlib import Path
 
-from xmetai_inference.configs.fgvp import cfg as _production
+from xmetai_inference.configs.weather_era_0p25_fgvp import cfg as _production
 
 # deepcopy：import 拿到的是缓存的同一个对象，直接改会把正式配方改成指向 fixture。
 cfg = copy.deepcopy(_production)

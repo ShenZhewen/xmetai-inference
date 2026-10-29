@@ -39,9 +39,9 @@ metadata:
   顺序上它排第一：契约没问清就写代码，多半写完才发现通道顺序或单位错了，这两类错误
   **不抛异常**，表现为「跑通了但输出是垃圾」。
 - `references/model-landing.md` —— **怎么写**：路径选择、权重落位、模型类、`MODEL_REGISTRY`、
-  `configs` 配方、单测、集成档、文档表格、新增 processor（数据侧 `TensorProcessor` / 模型侧 `Processor`）。
+  `configs/<name>.py` 配方、单测、集成档、文档表格、新增 processor（数据侧 `TensorProcessor` / 模型侧 `Processor`）。
 - `references/datasets.md` —— **数据源本身**：两种 store 形态（原始态 vs 归一化态）、
   `denormalize` 数据侧还原、南→北存储配 `GRID_025_S` 且不配 `geometry`、link 到一个新 store 的小问卷。
 
-> 数据侧 `denormalize`、`GRID_025_S`、`tongyun_cra.py` 是本 skill 在 2026-10
+> 数据侧 `denormalize`、`GRID_025_S`、`weather_cra_0p25_tongyun_ens.py` 是本 skill 在 2026-10
 > 接 CRA 归一化态 store 时新增的产物；`references/datasets.md` 是它们对应的心得归档。

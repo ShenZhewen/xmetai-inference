@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""确定性 FGVP + SPW（权重扰动，m1a）的标准档。
+"""确定性 FGVP + SPW（权重扰动，m1a）的标准档，51 成员。
 
-成员集按指纹复用 S2B 那套；配方与 fgvp_spw_prod_s2b.py 一致，只改时段 / 卡数 / 输出目录。
+成员集按指纹复用 S2B；只在该配方上改时段 / 卡数 / 输出目录。
 """
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 MODEL_DIR = "/workspace/tmp/douzsh/models"
 SRC_GRAPH = f"{MODEL_DIR}/iwc_fgvp_gdn2.onnx"
-OPS_LIBRARY = f"{MODEL_DIR}/xmetai_onnx_plugins.so"  # 只读；进成员指纹，与 S2B 一致才能认回已有成员
-MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"  # 成员权重根目录（member_dir 不进指纹）
+OPS_LIBRARY = f"{MODEL_DIR}/xmetai_onnx_plugins.so"  # 进成员指纹；与 S2B 一致才能复用成员
+MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"  # 权重根目录（member_dir 不进指纹）
 
 FGVP_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
@@ -17,29 +17,29 @@ FGVP_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
 ]
 
-# S2B 的配方（= fgvp_spw_ab 的 S2B 臂，drop 为空）。
+# S2B 的配方（drop 为空）。
 MEMBERS = 51
 BASE_EXCLUDE = ("mean", "std", "const", "mask", "attn_mask", "ones", "zeros")
 
 
 cfg = InferConfig(
-    name="fgvp_spw",
+    name="weather_era_0p25_fgvp_spw_ens",
     model_path=SRC_GRAPH,
     ops_library=OPS_LIBRARY,
     gpu_state=False,  # 单步型图，GPU 常驻会绕过滑窗回填
     model_class="iwc_fgvp_gdn2_onnx",
     weight_perturb={
-        "groups": ("latent_mixer",),  # 注入点：携带状态的 recurrent 核
+        "groups": ("latent_mixer",),  # 携带状态的 recurrent 核
         "include": (),
-        "sigma_full": 0.027,  # S2B 压强：短时效 CRPS 代价对 sigma 斜率反推的靶心档
+        "sigma_full": 0.027,  # S2B 反推的靶心档
         "balance": "energy",
         "exclude": BASE_EXCLUDE,
-        "noise_struct": "channel",  # 逐输出通道共享一个 xi（非默认值进指纹）
+        "noise_struct": "channel",  # 逐输出通道共享一个 xi（进指纹）
         "min_elements": 64,
         "member_dir": MODEL_ONNX_DIR,
         "seed": 0,
     },
-    perturb_graphs=0,  # 确定性模型必须为 0（>0 走集合图编舞，会被模型类型挡下）
+    perturb_graphs=0,  # 确定性模型必须为 0（>0 走集合图编舞，会被挡下）
 
     dataset={
         "type": "processed_multi_zarr",
@@ -65,7 +65,7 @@ cfg = InferConfig(
         ],
     },
     dataloader={
-        # batch_size 只是 I/O 装载分组（起报数）；前向批是 model_batch。
+        # batch_size 只是 I/O 装载分组（起报数）；前向批见 model_batch。
         "batch_size": 2,
         "num_workers": 2,
         "pin_memory": True,

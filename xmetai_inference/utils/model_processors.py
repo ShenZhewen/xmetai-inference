@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-"""模型侧（主进程里跑）：自回归回填（recurrent）与输出反变换（output）两个阶段。
+"""模型侧处理（主进程）：自回归回填（recurrent）与输出反变换（output）。
 
-热路径全程 torch tensor，numpy 只用于统计量加载和最终落盘。
 数据侧（store → 模型输入，DataLoader worker）在 ``dataset_processors.py``。
 """
 import logging
@@ -32,13 +31,7 @@ def _as_torch(value, dtype=None, device=None):
 
 
 class Processor:
-    """数组阶段处理基类。
-
-    子类必须声明 stage（"recurrent" / "output"）并实现
-    process_array(value) -> value（copy-in / copy-out）。
-
-    model_cls / model_path / data_source 由 build_pipeline 注入。
-    """
+    """数组阶段处理基类：子类声明 stage 并实现 process_array(value)。"""
 
     def __init__(self, model_cls=None, data_source=None, model_path=None, **kwargs):
         self.model_cls = model_cls
@@ -142,10 +135,9 @@ class Denormalize(_ArrayStatsProcessor):
 
 @register("denormalize_fengqing")
 class DenormalizeFengqing(Processor):
-    """FengQing 归一化空间 → 物理量（与数据层 normalize_fengqing 互逆）。
+    """FengQing 归一化空间 → 物理量（与 normalize_fengqing 互逆）。
 
-    mean 逐像素、std 逐通道，upper/surface 分两套文件；只做 x·std + mean，
-    tp 的非负钳位在模型 forward 里完成。
+    mean 逐像素、std 逐通道；tp 的非负钳位在模型 forward 里完成。
     """
 
     stage = "output"
@@ -166,9 +158,9 @@ class DenormalizeFengqing(Processor):
             raise ValueError(
                 f"统计量合计 {upper_mean.shape[0] + surface_mean.shape[0]} 通道，"
                 f"与模型 output_channels {expected} 不一致")
-        self.mean = np.concatenate([upper_mean, surface_mean], axis=0)   # (70,H,W)
+        self.mean = np.concatenate([upper_mean, surface_mean], axis=0)
         self.std = np.concatenate(
-            [upper_std.reshape(-1), surface_std.reshape(-1)], axis=0)    # (70,)
+            [upper_std.reshape(-1), surface_std.reshape(-1)], axis=0)
 
     def _resolve_dir(self, mean_std_dir):
         if mean_std_dir:
@@ -202,11 +194,7 @@ class DenormalizeFengqing(Processor):
 
 @register("zero_channels")
 class ZeroChannels(Processor):
-    """自回归回填前把指定诊断通道置成**归一化空间的 0**（不是物理量清零）。
-
-    对齐官方预归一化 input.nc（ssr/ssrd/fdir/ttr/tp 在归一化空间精确为 0），
-    必须写字面 0.0，改成「物理清零」会偏离官方行为。
-    """
+    """回填前把诊断通道置成归一化空间的 0（官方 input.nc 就是如此，不是物理清零）。"""
 
     stage = "recurrent"
 
@@ -243,10 +231,9 @@ class ProcessingPipeline:
 
 def build_pipeline(input_specs, model_cls, data_source, model_path=None,
                    recurrent_specs=None, output_specs=None):
-    """config 的 Processor 列表 → ProcessingPipeline（recurrent + output 两阶段）。
+    """config 的 Processor 列表 → ProcessingPipeline。
 
-    input_specs（model_processing.input / 旧 pre_processors）必须为空：输入侧前处理
-    由 dataset.processors 在 DataLoader worker 里完成，该参数只为误配时报错保留。
+    input_specs 必须为空：输入侧前处理走 dataset.processors。
     """
     if input_specs:
         raise ValueError(
@@ -284,10 +271,7 @@ def build_pipeline(input_specs, model_cls, data_source, model_path=None,
 
 
 def build_dataset_batch(batch, verbose=False):
-    """DataLoader batch → (inputs, init_times)。
-
-    只做类型/形状校验和起报时间解析；inputs 保持 [B,T,C,H,W] tensor 不进 numpy。
-    """
+    """DataLoader batch → (inputs[B,T,C,H,W], init_times)。"""
     values = _as_torch(batch["inputs"], dtype=torch.float32)
     if values.ndim != 5:
         raise ValueError(f"Dataset inputs 应为 [B,T,C,H,W]，实际 shape={values.shape}")

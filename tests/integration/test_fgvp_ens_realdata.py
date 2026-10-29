@@ -28,7 +28,7 @@ from realdata_common import (ATOL, EXCEED_FRACTION_CLOSE, RTOL, expected_vars,
 
 # runner 侧「批量化生效 / 被退回」的日志标记。从 runner import 而不抄字符串：措辞
 # 改了这里跟着变，不会退化成一个永远搜不到的旧标记、把判据变成假绿。
-from xmetai_inference.runner import BATCH_ACTIVE_MARK, BATCH_FALLBACK_MARK
+from xmetai_inference.utils.runner import BATCH_ACTIVE_MARK, BATCH_FALLBACK_MARK
 
 #: fixture 根。
 DATA_ROOT = Path("/workspace/data/shenzw/inference_test_data/fgvp_ens_test_data")
@@ -52,7 +52,7 @@ STEPS = 3
 MEMBERS = 51
 
 #: 前向批：一次 forward 堆几条成员轨迹（51 成员 = 9 块：8×6 + 3）。显式写死而非靠配方
-#: 漂过来 —— 模板是 deepcopy 的正式配方（configs/fgvp_ens.py 本身就是 6），不写的话
+#: 漂过来 —— 模板是 deepcopy 的正式配方（configs/weather_era_0p25_fgvp_ens.py 本身就是 6），不写的话
 #: 正式配方一改值这档会跟着变，覆盖面却没人知道。
 MODEL_BATCH = 6
 
@@ -113,7 +113,7 @@ _CONFIG_TEMPLATE = Template('''\
 import copy
 from pathlib import Path
 
-from xmetai_inference.configs.fgvp_ens import cfg as _production
+from xmetai_inference.configs.weather_era_0p25_fgvp_ens import cfg as _production
 
 # deepcopy：import 拿到的是缓存的同一个对象，直接改会把正式配方改成指向 fixture。
 cfg = copy.deepcopy(_production)

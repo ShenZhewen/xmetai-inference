@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-"""FuXi-2.1 确定性推理（era5_foundation_store2 h6 多店；tp/辐射单位换算 + log1p 归一化）。"""
-import os
+"""FuXi-2.1 + SPA（潜空间 AR(1) 强迫），51 成员。
 
+默认臂 F32：注入 layer_stream 第 0/3/6 层；扫描时改 sigma / tau_days。
+"""
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
-ERA5_ROOT = os.environ.get(
-    "ERA5_STORE_ROOT",
-    "/workspace/data/liujunjie/era5_foundation_store2",
-)
+ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 
 FUXI21_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
@@ -18,13 +16,21 @@ FUXI21_DYNAMIC_STORES = [
 ]
 
 cfg = InferConfig(
-    name="fuxi21",
-    # 绝对路径：权重在旧仓库 xmetai-inference（无 2）；FUXI21_MODEL_PATH 可覆盖。
-    model_path=os.environ.get(
-        "FUXI21_MODEL_PATH",
-        "/workspace/szwCode/xmetai-inference/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
-    ),
+    name="weather_era_0p25_fuxi_spa_ens",
+    model_path="/workspace/szwCode/xmetai-inference2/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
     model_class="fuxi21_pt2",
+    latent_forcing={
+        "targets": ("layer_stream:0,3,6",),  # 全 30 层写 ("layer_stream",)
+        "sigma": 0.04,
+        "tau_days": 3.0,
+        "rank": 16,
+        "length_scale": 32.0,
+        "grid": (120, 240),  # fx 推不出来，必须显式
+        "seed": 0,
+        "hour_interval": 6.0,
+        "verify_on_load": True,
+    },
+    model_batch=1,  # pt2 的 ξ 缓冲无 batch 轴
 
     dataset={
         "type": "processed_multi_zarr",
@@ -82,12 +88,13 @@ cfg = InferConfig(
         ],
     ),
 
-    times="2025010200..2025010500:24",
+    # 默认 3 起报是冒烟窗口，正式跑用 --times 覆盖。
+    times="2025070100..2025070300:24",
     steps=60,
     hour_interval=6,
-    members=1,
-    vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,d2m,msl,tp",
-    gpus=2,
-    cuda_devices="0,1",
-    output_dir="/workspace/data/shenzw/fuxi_single_output_new",
+    members=51,
+    vars="z500",
+    gpus=4,
+    cuda_devices="0,1,2,3",
+    output_dir="/workspace/data/shenzw/fuxi_spa",
 )

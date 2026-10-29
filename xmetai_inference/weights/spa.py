@@ -2,14 +2,13 @@
 """潜空间 AR(1) 强迫（SPA）：规格、基、ONNX 图改写、生成与审计。
 
 驱动侧按 ``ξ_{t+1} = ρξ_t + sqrt(1-ρ²)ε_t`` 递推（ρ = exp(-Δt/τ)），图内把
-``n = Σ_r ξ_r·u_r⊗v_r`` 乘到潜变量上：``z' = z ⊙ (1 + σn)``。空间基 v_r 经高斯低通
-并去掉 DC；``length_scale`` 控制注入尺度。
+``n = Σ_r ξ_r·u_r⊗v_r`` 乘到潜变量上：``z' = z ⊙ (1 + σn)``。空间基经高斯低通
+去 DC，``length_scale`` 控制注入尺度。
 
-递推放在驱动侧、图只多一个 ``spw/xi`` 输入：单步 ONNX 图没有可靠的跨步状态。
-同一份图可服务全部成员，且与权重扰动正交、可叠加。图被改写但权重未动。
+递推放在驱动侧、图只多一个 ``spw/xi`` 输入（单步 ONNX 图没有可靠的跨步状态）：
+同一份图可服务全部成员，与权重扰动正交可叠加。图被改写但权重未动。
 
 造产物：改本文件末尾字面量后运行 ``python -m xmetai_inference.weights.spa``。
-推理驱动在 ``backends/spa.py``；PT2 版图改写见 ``weights/spa_pt2.py``。
 """
 from __future__ import annotations
 
@@ -27,9 +26,7 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # 底座：spec 样板 + ONNX 读写/外部数据校验（SPW 也从这里 import）
-# ---------------------------------------------------------------------------
 class SpecBase:
     """spec 类的公共样板。子类至少要提供 `budgets()`。"""
 
@@ -365,9 +362,7 @@ class LatentForcingSpec(SpecBase):
 FORCING_FORMAT = 3
 
 
-# ---------------------------------------------------------------------------
 # 目标解析与布局探测
-# ---------------------------------------------------------------------------
 def _graph_outputs(model) -> dict:
     """节点输出名 -> 产出它的节点。"""
     out = {}
@@ -497,9 +492,7 @@ def detect_layout(model, target_names, spec: LatentForcingSpec) -> dict:
             "grid": (int(grid[0]), int(grid[1])), "observed": observed}
 
 
-# ---------------------------------------------------------------------------
-# 基
-# ---------------------------------------------------------------------------
+# 随机基
 def _lowpass(field: np.ndarray, sigma_tokens: float) -> np.ndarray:
     """循环高斯低通（FFT）。sigma_tokens = 相关长度（格点数）。"""
     if sigma_tokens <= 0.5:
@@ -564,9 +557,7 @@ def build_basis(tokens: int, channels: int, rank: int, length_scale: float,
                        "fallbacks": int(fallbacks)}}
 
 
-# ---------------------------------------------------------------------------
 # 图改写
-# ---------------------------------------------------------------------------
 def _initializer(onnx, name: str, array: np.ndarray):
     return name, onnx.numpy_helper.from_array(np.ascontiguousarray(array), name)
 
@@ -826,9 +817,7 @@ def resolve_stack_path(src_path: str, weight_spec, latent_spec,
     return resolve_forcing_path(path, latent_spec, verbose=verbose)
 
 
-# ---------------------------------------------------------------------------
 # 审计
-# ---------------------------------------------------------------------------
 class Audit(dict):
     """审计结果：dict + 一行摘要。"""
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""data/ 的单元测试。
+"""data/ 与 utils/dataloader_factory.py 的单元测试。
 
 整包 import 依赖 xmetai_core（MultiZarrDataset），本地没装则整模块 skip，
 服务器 Job 里真跑。不测真 zarr 读取，只测纯函数与配置校验。
@@ -10,14 +10,12 @@ import pytest
 pytest.importorskip("xmetai.data")
 pytest.importorskip("torch")
 
-from xmetai_inference.data import (
-    create_dataloader,
-    create_processed_multi_zarr_dataset,
-)
+from xmetai_inference.data.weather import create_processed_multi_zarr_dataset
 from xmetai_inference.data.weather.processed_multi_zarr import (
     _raw_channel_name,
     select_init_positions,
 )
+from xmetai_inference.utils.dataloader_factory import create_dataloader
 
 
 def test_raw_channel_name_prefers_exact_then_underscore():

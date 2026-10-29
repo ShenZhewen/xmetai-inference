@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""``configs/fuxi21.py`` 的单元测试：配置与 FuXi-2.1 契约之间的一致性（变更探测器，
+"""``configs/weather_era_0p25_fuxi21.py`` 的单元测试：配置与 FuXi-2.1 契约之间的一致性（变更探测器，
 思路同 ``test_fgvp_config.py``）。fuxi21 与 fgvp 族最大的不同：归一化**不在图里**，
 由 config 侧的 normalize/denormalize 显式做，配置面因此危险 —— 最要紧的不变量：
 ``log1p`` ↔ ``expm1`` 配对（错一边数值静默全错）、recurrent 清零覆盖全部 5 个
@@ -11,8 +11,9 @@ from datetime import datetime
 
 import pytest
 
-from xmetai_inference.configs.base import InferConfig, load_config, parse_times
-from xmetai_inference.models import FUXI21_CHANNELS, get_model_class
+from xmetai_inference.configs import InferConfig, load_config, parse_times
+from xmetai_inference.configs import FUXI21_CHANNELS
+from xmetai_inference.utils.model_factory import get_model_class
 
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
 
@@ -34,7 +35,7 @@ def _base_names(channels):
 
 @pytest.fixture(scope="module")
 def cfg():
-    return load_config("fuxi21")
+    return load_config("weather_era_0p25_fuxi21")
 
 
 @pytest.fixture(scope="module")
@@ -44,7 +45,7 @@ def model_cls(cfg):
 
 def test_loads_as_inferconfig_named_fuxi21(cfg):
     assert isinstance(cfg, InferConfig)
-    assert cfg.name == "fuxi21"
+    assert cfg.name == "weather_era_0p25_fuxi21"
 
 
 def test_model_class_is_the_pt2_fuxi21(cfg, model_cls):

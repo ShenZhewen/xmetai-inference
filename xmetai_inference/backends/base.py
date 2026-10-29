@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""推理后端共享运行契约：forward 单步 + Rollout 自回归循环；另有常驻 session 池。
-
-引擎在 onnx.py / pt2.py。包根只 re-export BaseInferModel，避免 PT2-only 环境
-被拖上 onnxruntime。
-"""
+"""推理后端共享运行契约：单步 forward + 常驻 session 池；引擎在 onnx.py / pt2.py。"""
 import collections
 import logging
 import os
@@ -11,6 +7,8 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
+
+from .spa import LatentStepStream
 
 log = logging.getLogger(__name__)
 
@@ -47,71 +45,104 @@ def _to_numpy(value):
     return np.asarray(value)
 
 
-def _copy_state(value):
-    """numpy 用 copy()，torch 用 clone()。"""
-    if isinstance(value, torch.Tensor):
-        return value.clone()
-    return value.copy()
-
-
-def _stack_outputs(outputs, axis):
-    """torch 输出用 torch.stack，numpy 输出用 np.stack。"""
-    if outputs and isinstance(outputs[0], torch.Tensor):
-        return torch.stack(outputs, dim=axis)
-    return np.stack(outputs, axis)
-
-
 class BaseInferModel(ABC):
-    """所有推理后端的公共基类。子类实现 load + forward。
+    """所有推理后端的公共基类，子类实现 load + forward。
 
-    forward：x 为 (1, in_frames, C, H, W) 的 float32 数组/tensor，返回同形状完整
-    输出（末帧为本步预报）。张量可在设备上，落盘时再搬到 CPU。
+    forward：x 为 (1, in_frames, C, H, W)，返回同形状完整输出（末帧为本步预报）。
     """
     backend = "base"
-    # 两条正交的「确定性 -> 集合」能力，由后端各自声明
     supports_weight_perturb = False      # 权重扰动（SPW）
     supports_latent_forcing = False      # 潜空间 AR(1) 强迫（SPA）
+    latent_forcing = None                # 由 create_model 构造后赋值，None = 不加
 
-    # ONNX Runtime 旋钮；0 / "" = 后端默认
-    intra_op_threads = 0                 # 0 = 后端自定（cli 会按 worker 数折算）
+    intra_op_threads = 0                 # 0 = 后端自定（cli 按 worker 数折算）
     cudnn_algo_search = ""               # "" = 默认（EXHAUSTIVE）
 
-    # 落盘前做非负钳位的通道。真正的钳位在各自输出阶段完成，这里只是兜底；
-    # 模型漏配反归一化时会把负的归一化值削平，输出看着合理却不报错。
+    # 落盘前兜底的非负钳位；真正的钳位在各自输出阶段。漏配反归一化时这里会把
+    # 负的归一化值削成 0，输出看着合理却不报错。
     nonnegative_channels = ("tp",)
+
+    # 模型契约默认值；落成真属性后 declare 生成的类可直接自省（单测会读）。
+    history_steps = 2
+    hour_interval = 6
+    forecast_type = "deterministic"
+    members = 1
+    windowed_output = True
+    valid_time_step_offset = 0
+
+    @classmethod
+    def declare(cls, class_name, *, model_name, channels, grid,
+                output_channels=None, history_steps=None, hour_interval=None,
+                forecast_type=None, members=None, windowed_output=None,
+                gpu_state=None, valid_time_step_offset=None,
+                time_features=None, **extra):
+        """按参数生成模型类；只写入显式给出的属性，其余沿用基类/后端默认值。
+
+        ``class_name`` 同时作为 ``__name__``。需要重写 load / forward 的模型
+        （FengQing、Pangu）直接写 class。
+        """
+        values = {
+            "model_name": model_name,
+            "input_channels": channels,
+            "output_channels": output_channels or channels,
+            "grid": grid,
+            "history_steps": history_steps,
+            "hour_interval": hour_interval,
+            "forecast_type": forecast_type,
+            "members": members,
+            "windowed_output": windowed_output,
+            "gpu_state": gpu_state,
+            "valid_time_step_offset": valid_time_step_offset,
+            "time_features": time_features,
+        }
+        attrs = {key: value for key, value in values.items() if value is not None}
+        attrs.update(extra)
+        attrs.setdefault("__doc__", f"{model_name}（{cls.backend} 后端）的声明式契约。")
+        return type(class_name, (cls,), attrs)
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
         self.device_id = device_id
         self.gpu_mem_fraction = gpu_mem_fraction
         self.processing = None
         self.data_source = None
-        # config 的 weight_perturb；None = 不加扰动
-        self.weight_perturb = None
-        # 本实例当前代表的集合成员，决定加载哪一份成员模型
-        self.member_index = 0
+        self.weight_perturb = None           # config 的 weight_perturb，None = 不加
+        self.member_index = 0                # 当前成员，决定加载哪份成员模型
+        self._latent_n_targets = 0           # 注入目标数，0 = 未启用
+        self._latent_stream = LatentStepStream()
 
     def configure_processing(self, processing, data_source):
-        """Bind the configured model processing recipe to this model."""
+        """绑定 config 里的 processing 配方。"""
         self.processing = processing
         self.data_source = data_source
         return self
 
     def prepare_dataset_batch(self, batch, verbose=False):
-        """Convert a DataLoader batch into this model's input representation."""
+        """DataLoader batch → (inputs[B,T,C,H,W], init_times)。"""
         if self.processing is None or self.data_source is None:
             raise RuntimeError("模型尚未绑定 processing 和 data_source")
         from xmetai_inference.utils.model_processors import build_dataset_batch
 
         return build_dataset_batch(batch, verbose=verbose)
 
+    def _latent_row(self, step, width=1):
+        """本步本块要喂的 ξ，形状 (width, T, R)；None = 未启用强迫。
 
-    def _processing_transform(self, stage):
-        if self.processing is None:
+        ``width`` = 本次 forward 堆了几条轨迹，块内每条轨迹各吃一行独立 ξ。
+        """
+        if not self.latent_forcing or self._latent_n_targets <= 0:
             return None
-        processors = getattr(self.processing, f"{stage}_processors")
-        if not processors:
-            return None
-        return getattr(self.processing, f"process_{stage}")
+        index = self._latent_stream(
+            self.latent_forcing, step,
+            n_targets=self._latent_n_targets,
+            member_index=self.member_index,
+            hour_interval=getattr(self, "hour_interval", None),
+            width=width)
+        return self._latent_stream.ar1.row(index, width)
+
+    def release(self):
+        """后端资源释放的公共部分（潜空间驱动状态）；子类覆盖时调 super()。"""
+        if self._latent_stream is not None:
+            self._latent_stream.release()
 
     @abstractmethod
     def load(self, path):
@@ -119,7 +150,7 @@ class BaseInferModel(ABC):
 
     @abstractmethod
     def forward(self, x, step, valid_time):
-        """一步前向。x: (1,in_frames,C,H,W) float32 → (1,in_frames,C,H,W) float32（完整输出，末帧=预报）。"""
+        """一步前向，返回完整输出窗；末帧即本步预报。"""
 
     def describe(self):
         """返回后端/设备描述（加载后打印用）。子类可覆盖。"""
@@ -129,11 +160,11 @@ class BaseInferModel(ABC):
         """每批轨迹开始前清空跨步内部状态（缺省无操作）。"""
         return None
 
-    # 子类置 True 并实现 to_gpu / forward_gpu / to_numpy 后，state 全程留在 GPU。
+    # 置 True 并实现 to_gpu / forward_gpu / to_numpy 后，state 全程留在 GPU；
     # GPU state 不支持 numpy recurrent transform，需要回填的模型保持 False。
     gpu_state = False
 
-    # 图的 batch 轴是否为符号维；load 时实测置位。False 时 Rollout 退回逐条。
+    # 图的 batch 轴是否为符号维，load 时实测置位；False 时 Rollout 退回逐条。
     batch_axis_dynamic = False
 
     def to_gpu(self, x):
@@ -149,10 +180,7 @@ class BaseInferModel(ABC):
         raise NotImplementedError
 
     def to_dataset(self, step_state, save_names=None, lat=None, lon=None):
-        """一步 × 一成员的输出（C,H,W）→ xarray Dataset。
-
-        按 self.output_channels 解码变量名并套 lat/lon；save_names 为 None 表示全部。
-        """
+        """一步 × 一成员的输出 (C,H,W) → xarray Dataset；save_names=None 表示全部。"""
         import xarray as xr
 
         channels = list(self.output_channels)
@@ -171,7 +199,7 @@ class BaseInferModel(ABC):
         return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
 
 # 常驻 session 池（config 的 resident_members）：1 = 一换一，N = 最多 N 份，
-# -1 = 全常驻。键是解析后的路径而不是成员号——一个 session 可能服务多个成员。
+# -1 = 全常驻。键是解析后的路径而不是成员号——一个 session 可服务多个成员。
 def normalize_budget(value):
     """resident_members -> 池子额度：0 / None / 非法值都当 1（缺省口径），负数 = 不限。"""
     try:
@@ -199,7 +227,7 @@ class SessionPool:
         key = os.path.abspath(key)
         cached = self._items.pop(key, None)
         if cached is not None:
-            self._items[key] = cached          # 重新入尾 = 这条刚被用过（LRU 更新）
+            self._items[key] = cached          # 重新入尾 = LRU 更新
             self.hits += 1
             return cached, True
         session = build()
@@ -227,15 +255,8 @@ class SessionPool:
         self._items.clear()
         return count
 
-    def __contains__(self, key):
-        return os.path.abspath(key) in self._items
-
     def __len__(self):
         return len(self._items)
-
-    def keys(self):
-        """驻留中的路径，按 LRU 排序（最久没用过的在前）。"""
-        return list(self._items)
 
     def stats(self):
         return {

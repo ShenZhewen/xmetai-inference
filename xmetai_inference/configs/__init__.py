@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""运行配置包：一份 config = 一次推理运行配方（新跑法 = 新增 configs/<name>.py 定义全局 `cfg`）。"""
-from .base import InferConfig, ModelProcessingConfig, ROOT, load_config
+"""配置基座的 re-export。
 
-__all__ = ["InferConfig", "ModelProcessingConfig", "ROOT", "load_config"]
+每个 ``configs/<name>.py`` 既是配方（``cfg``）也是模型类；变体配方（spa/spw/v3）只
+定义 cfg。公共声明在 ``configs/base.py``，这里原样 re-export。
+"""
+from .base import *                      # noqa: F401,F403
+from .base import __all__ as _base_all
+
+__all__ = list(_base_all)

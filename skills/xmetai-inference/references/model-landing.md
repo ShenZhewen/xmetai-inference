@@ -11,10 +11,11 @@
 
 | 路径 | 适用 | 要改的东西 |
 |---|---|---|
-| **A. 加内置模型** | 模型要进本仓库、长期维护 | 注册表 + `models/` + `configs/` + 单测 + 文档表格 |
+| **A. 加内置模型** | 模型要进本仓库、长期维护 | 注册表 + `configs/<name>.py`（declare 声明 + 配方同文件） + 单测 + 文档表格 |
 | **B. 外部扩展** | 模型只在自己项目里用 | 只写一个 `.py`，`model_class` 直接给**类对象**，不碰框架源码 |
 
-路径 B 的关键点：`get_model_class()` 接受类对象（`models/__init__.py:107`），
+路径 B 的关键点：`get_model_class()` 接受类对象（`utils/model_factory.py` 的
+`get_model_class`），
 所以外部 config 可以 `from my_model import MyModel` 后直接 `model_class=MyModel`，
 不必注册。
 
@@ -27,9 +28,26 @@
 
 注意 `.gitignore` 同时忽略 `*.nc`、`*.npy`、`*.zarr/`，所以统计量文件和切片数据都不进 git。
 
-## 2. 模型类 `xmetai_inference/models/<name>.py`
+## 2. 模型类 `xmetai_inference/configs/<name>.py`（与配方同文件）
 
-继承 `OnnxInferModel` / `Pt2InferModel` / `BaseInferModel`。
+**纯声明模型不写 class**：用 `declare` 一行声明契约（只写显式给出的属性，其余沿用
+默认值；PT2 用 `Pt2InferModel.declare`）。类名同时是注册表取的属性名。
+
+```python
+from xmetai_inference.backends.onnx import OnnxInferModel
+from xmetai_inference.configs.base import FUXI_ENS_CHANNELS, GRID_025
+
+IwcFgvpGdn2Model = OnnxInferModel.declare(
+    "IwcFgvpGdn2Model",
+    model_name="iwc_fgvp_gdn2_onnx",
+    channels=FUXI_ENS_CHANNELS,
+    grid=GRID_025,
+    windowed_output=False,
+)
+```
+
+只有需要重写 `load` / `forward` 的模型（FengQing 残差反演、Pangu 双 session）才写
+class 继承 `OnnxInferModel` / `Pt2InferModel` / `BaseInferModel`。
 
 **必须声明**（框架用 `getattr` 读，缺了不报错但下游会出错）：
 
@@ -47,12 +65,12 @@
 | `hour_interval` | 6 | `cli.py:470` |
 | `members` | 1 | `cli.py:474` |
 | `forecast_type` | `"deterministic"` | `cli.py:473` |
-| `windowed_output` | `True` | `runner.py:174` |
-| `valid_time_step_offset` | 0 | `runner.py:173` |
-| `nonnegative_channels` | `("tp",)` | `base.py:74` |
-| `gpu_state` | `False` | `base.py:127` |
+| `windowed_output` | `True` | `utils/runner.py:167` |
+| `valid_time_step_offset` | 0 | `utils/runner.py:166` |
+| `nonnegative_channels` | `("tp",)` | `backends/base.py` |
+| `gpu_state` | `False` | `backends/base.py` |
 
-**必须实现**：`load(path)` 与 `forward(x, step, valid_time)`（`base.py:105/109`）。
+**必须实现**：`load(path)` 与 `forward(x, step, valid_time)`（`backends/base.py`）。
 
 `forward` 的契约：`x` 是 `(1, in_frames, C, H, W)` float32，返回同形完整输出，
 **末帧 = 本步预报**。图只出预报帧（不出完整窗口）时声明 `windowed_output=False`，
@@ -62,22 +80,22 @@
 **跨批有内部状态的模型**（如 Pangu 每 4 步从锚点跳 24h）要覆盖
 `reset_runtime_state()`（`base.py:117`），否则上一个起报的状态会漏到下一个。
 
-**最小模板**：`models/iwc_fgvp_gdn2.py`（34 行）+ `configs/fgvp.py`（80 行）——
+**最小模板**：`configs/weather_era_0p25_fgvp.py`（`declare` + 配方同文件）——
 确定性 ONNX 里唯一的「**纯声明、零方法覆盖**」样板，`model_processing`
-三段全空（恒等）。PT2 模型抄 `models/fuxi21_pt2.py`（18 行，更短）。
-Pangu（115 行双 session）和 FengQing（174 行残差反演）的模型类逻辑重，不要整份照抄。
-CRA 归一化态数据源接的图抄 `models/tongyun_cra_ens.py`（头/尾各带一次归一化、`GRID_025_S`
+三段全空（恒等）。PT2 模型抄 `configs/weather_era_0p25_fuxi21.py`（同样只用 `declare`）。
+Pangu（双 session）和 FengQing（残差反演）仍写 class，逻辑重，不要整份照抄。
+CRA 归一化态数据源接的图抄 `configs/weather_cra_0p25_tongyun_ens.py`（头/尾各带一次归一化、`GRID_025_S`
 南→北、`windowed_output=False`），配套数据侧处理见 `datasets.md`。
 
 ## 3. 注册到 `MODEL_REGISTRY`
 
-`xmetai_inference/models/__init__.py:77`，**普通 dict，不是装饰器**：
+`xmetai_inference/utils/model_factory.py` 的 `MODEL_REGISTRY`，**普通 dict，不是装饰器**：
 
 ```python
 MODEL_REGISTRY = {
     ...
     "my_model_onnx": (
-        "xmetai_inference.models.my_model",
+        "xmetai_inference.configs.my_model",
         "MyModel",
     ),
 }
@@ -85,14 +103,15 @@ MODEL_REGISTRY = {
 
 值是 `(模块路径, 类名字符串)`，按需 `importlib` 导入。config 里用
 `model_class="my_model_onnx"` 引用；未命中会抛
-`ValueError: 未知模型 ...`（`models/__init__.py:116`）。
+`ValueError: 未知模型 ...`（`get_model_class`）。
 
-通道布局若与现有模型不同，在 `models/__init__.py` 里加通道常量
+通道布局若与现有模型不同，在 `configs/base.py` 里加通道常量
 （参考 `FUXI_ENS_CHANNELS` / `PANGU_CHANNELS` / `CRA_CHANNELS` 的 `_expand_channels` 写法）。
 
-## 4. 配方 `xmetai_inference/configs/<name>.py`
+## 4. 配方（与模型类同文件）`xmetai_inference/configs/<name>.py`
 
-必须定义名为 `cfg` 的 `InferConfig` 实例（`configs/base.py:190` 校验）。
+必须定义名为 `cfg` 的 `InferConfig` 实例（由 `xmetai_inference/configs/base.py` 的
+`load_config` 校验）。文件名就是 `--config` / `--model` 的名字。
 
 ```python
 cfg = InferConfig(
@@ -134,7 +153,7 @@ unit_convert  →  geometry  →  normalize  →  fill_missing
 ```
 
 `fill_missing` 放 `normalize` **前**还是**后**，决定填进去的是物理量还是归一化值。
-`configs/fuxi21.py:57-61` 放在 normalize 之后，所以填的是**归一化空间的 0.0**。
+`configs/weather_era_0p25_fuxi21.py` 的 `fill_missing` 放在 normalize 之后，所以填的是**归一化空间的 0.0**。
 **归一化态 store 的处理器链不一样，见 `datasets.md`（CRA）。
 
 可用 processor：
@@ -233,4 +252,4 @@ unit_convert  →  geometry  →  normalize  →  fill_missing
 
 模型侧 processor 要**原地改**时注意：`Rollout` 是先取预报帧副本再
 `recurrent_transform` 回填，所以 `zero_channels` 原地改不会污染已取出的预报
-（`runner.py:204-214`）。自己写 recurrent processor 时保持同样的假设。
+（`utils/runner.py:197-207`）。自己写 recurrent processor 时保持同样的假设。

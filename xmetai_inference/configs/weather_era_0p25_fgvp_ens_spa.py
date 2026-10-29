@@ -14,7 +14,7 @@ OPS_LIBRARY = "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.s
 MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"
 
 cfg = InferConfig(
-    name="fgvp_ens_spa",
+    name="weather_era_0p25_fgvp_ens_spa",
     model_path=SRC_GRAPH,
     ops_library=OPS_LIBRARY,
     gpu_state=False,  # 单帧输出图，不能开 GPU 常驻

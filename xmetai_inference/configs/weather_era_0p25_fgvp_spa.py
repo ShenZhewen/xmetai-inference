@@ -14,7 +14,7 @@ FGVP_DYNAMIC_STORES = [
 ]
 
 cfg = InferConfig(
-    name="fgvp_spa",
+    name="weather_era_0p25_fgvp_spa",
     model_path="/workspace/tmp/douzsh/models/20261013/iwc_fgvp_gdn2_260901.onnx",
     ops_library="/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so",
     gpu_state=False,  # 单帧输出图
@@ -68,7 +68,7 @@ cfg = InferConfig(
 
     model_processing=ModelProcessingConfig(input=[], recurrent=[], output=[]),
 
-    # 默认冬季 16 起报（1216-1231）是扫描窗口；正式跑请用 --times 覆盖。
+    # 默认冬季扫描窗口，正式跑用 --times 覆盖。
     times="2025121600..2025123100:24",
     steps=60,
     hour_interval=6,

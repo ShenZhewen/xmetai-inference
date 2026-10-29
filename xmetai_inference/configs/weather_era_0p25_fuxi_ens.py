@@ -1,8 +1,25 @@
 # -*- coding: utf-8 -*-
-"""FuXi-Ens 51 成员集合推理（era5_foundation_store2 h6，图内已烘焙归一化）。"""
+"""FuXi-Ens 51 成员集合推理（era5_foundation_store2 h6）。
+
+归一化烘焙在图内（物理量进/出）；成员由图内随机算子自带，51 成员 = 51 次独立前向。
+"""
 import os
 
-from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.backends.onnx import OnnxInferModel
+from xmetai_inference.configs.base import (
+    FUXI_ENS_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+
+
+FuxiEnsOnnxModel = OnnxInferModel.declare(
+    "FuxiEnsOnnxModel",
+    model_name="fuxi_ens_onnx",
+    channels=FUXI_ENS_CHANNELS,   # 78 = 5 变量 × 13 层 + 13 地面
+    grid=GRID_025,
+    forecast_type="ensemble",
+    members=51,
+    gpu_state=True,               # 前后处理恒等，GPU 常驻安全
+)
+
 
 ERA5_ROOT = os.environ.get(
     "ERA5_STORE_ROOT",
@@ -16,7 +33,7 @@ FUXI_ENS_DYNAMIC_STORES = [
 ]
 
 cfg = InferConfig(
-    name="fuxi_ens",
+    name="weather_era_0p25_fuxi_ens",
     model_path=os.environ.get(
         "FUXI_ENS_ONNX",
         "/workspace/szwCode/xmetai-inference/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",

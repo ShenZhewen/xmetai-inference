@@ -1,7 +1,7 @@
 # 测试 Job：tests/unit 全量 + tests/integration 的 realdata 档（真起 GPU 推理对拍）。
 #
-# 和 tests/fgvp_realdata_job.yaml 的区别：那个 cd 到评测仓（xmetai-evalation-test），
-# 是评测仓的模板；这份指回本仓。
+# tests/fgvp_realdata_job.yaml 是同一套流程的简化版（set -eu 首错即停，不汇总两档 rc）；
+# 这份单元档挂了也会继续跑集成档，最后按「任一失败」退出。
 #
 # 集成档必须显式 -m realdata（pyproject 的 addopts 默认排除）；fixture 不齐时整模块
 # skip、退出码仍是 0，所以加 -rs 把 skip 原因打出来。
@@ -66,6 +66,8 @@ spec:
             echo "python               = $(python -V 2>&1)"
             echo "CUDA_VISIBLE_DEVICES = ${CUDA_VISIBLE_DEVICES-<未设>}"
             echo "xmetai_inference     = $(python -c 'import xmetai_inference,os;print(os.path.dirname(xmetai_inference.__file__))')"
+            # 重构后的模块落位：先做一次 import 冒烟，别等 pytest 收集时才炸。
+            python -c 'from xmetai_inference.utils.runner import Rollout, Trajectory; from xmetai_inference.utils.dataloader_factory import create_dataloader; from xmetai_inference.data.weather import create_processed_multi_zarr_dataset; print("模块布局             = OK")'
             # 集成档缺 onnxruntime 会整模块 skip（退出码仍是 0），这里显式看一眼。
             python -c 'import onnxruntime as o; print("onnxruntime          =", o.__version__)' \
               || echo "onnxruntime          = <缺失，集成档会 skip>"

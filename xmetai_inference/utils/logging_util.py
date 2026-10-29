@@ -25,7 +25,7 @@ def configure_logging(
     console: bool = True,
     rank: int | str = "-",
 ) -> None:
-    """Configure root logging with optional rotating file output."""
+    """配置根日志：控制台 + 可选滚动文件（文件恒为 DEBUG）。"""
     numeric_level = getattr(logging, level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"无效日志级别 {level!r}，应为 DEBUG/INFO/WARNING/ERROR")

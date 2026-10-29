@@ -1,14 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Pangu-Weather ONNX 模型（方案B：6h 步进 + 24h 跳步）。
-
-双输入 input (5,13,721,1440) / input_surface (4,721,1440)，双输出同形；物理量
-进/出，单位 = ERA5 原生（z=m²/s²、q=kg/kg、msl=Pa），网格 = GRID_025。
-
-每 24h（step+1 能被 4 整除）从锚点用 24h 图直接跳，其余步用 6h 图；锚点按 init_time
-存在 _anchors，Rollout.run 每批前清空。config 的 model_processing 全空。
-"""
-from __future__ import annotations
-
+"""Pangu-Weather 确定性推理（6h 步进 + 24h 跳步，实现在模型类内）。License：BY-NC-SA 4.0 非商用。"""
 import os
 from pathlib import Path
 
@@ -17,8 +8,8 @@ import pandas as pd
 import torch
 
 from xmetai_inference.backends.onnx import OnnxInferModel
-
-from . import GRID_025, PANGU_CHANNELS
+from xmetai_inference.configs.base import (
+    GRID_025, PANGU_CHANNELS, InferConfig, ModelProcessingConfig)
 
 # 上层/地面通道切分点（PANGU_CHANNELS = 5 变量 × 13 层 + 4 地面）。
 _N_UPPER = 5 * 13       # 65
@@ -26,20 +17,20 @@ _N_SFC = 4
 
 
 class PanguOnnxModel(OnnxInferModel):
+    """Pangu-Weather ONNX 模型（6h 步进 + 每 24h 从锚点用 24h 图跳步）。
+
+    双输入 input (5,13,721,1440) / input_surface (4,721,1440)，双输出同形；物理量
+    进/出，单位 = ERA5 原生（z=m²/s²、q=kg/kg、msl=Pa），网格 = GRID_025。
+
+    valid_time_step_offset 必须为 0（默认值，不要覆盖）：forward 用 valid_time 反推
+    init_time 作锚点键，非 0 会键错位。其余契约走 BaseInferModel 默认值。
+    """
     model_name = "pangu_onnx"
     input_channels = PANGU_CHANNELS
     output_channels = PANGU_CHANNELS
     grid = GRID_025
     history_steps = 1        # 只吃当前帧，滑窗归 Rollout
-    hour_interval = 6        # framework step 粒度 = 6h；24h 跳步在 forward 内处理
-    forecast_type = "deterministic"
-    members = 1
-    # 图只出预报那一帧（双输出），不出回显窗。
-    windowed_output = False
-    # 必须为 0：forward 里用 valid_time 反推 init_time（锚点键），否则键错位。
-    valid_time_step_offset = 0
-    # 双会话 + 双输入图，无 forward_gpu，GPU 常驻不可用。
-    gpu_state = False
+    windowed_output = False  # 图只出预报帧，不回显输入窗
 
     def load(self, path):
         # 6h 步进模型：基类单会话加载，self.session 即 6h 会话。
@@ -105,3 +96,45 @@ class PanguOnnxModel(OnnxInferModel):
             [out_upper.reshape(_N_UPPER, h, w), out_surface], axis=0)  # (69, H, W)
         return torch.as_tensor(
             pred[None, None], dtype=state.dtype, device=state.device)   # (1, 1, 69, H, W)
+
+
+PANGU_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/Pangu-Weather-main"
+ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
+
+PANGU_STORES = [
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+]
+
+cfg = InferConfig(
+    name="weather_era_0p25_pangu",
+    # 6h 步进图；24h 图由模型类推导，可用 PANGU_ONNX_24 覆盖。
+    model_path=f"{PANGU_ROOT}/pangu_weather_6.onnx",
+    model_class="pangu_onnx",
+
+    dataset={
+        "type": "processed_multi_zarr",
+        "paths": PANGU_STORES,
+        "processors": [
+            {"name": "geometry"},
+        ],
+    },
+    dataloader={
+        "batch_size": 2,
+        "num_workers": 2,
+        "pin_memory": True,
+        "shuffle": False,
+        "drop_last": False,
+    },
+
+    model_processing=ModelProcessingConfig(input=[], recurrent=[], output=[]),
+
+    times="2025010200..2025122500:24",
+    steps=60,
+    hour_interval=6,
+    members=1,  # 确定性模型必须为 1
+    vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl",
+    gpus=1,
+    cuda_devices="0",
+    output_dir="/workspace/data/shenzw/pangu_output",
+)

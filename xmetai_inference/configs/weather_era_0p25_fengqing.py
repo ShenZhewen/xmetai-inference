@@ -1,16 +1,5 @@
 # -*- coding: utf-8 -*-
-"""FengQing V1.5Beta (precipitation ONNX) 模型契约。
-
-图输入 4 键：upper [1,130,721,1440] / surface [1,10,721,1440]（帧优先）、
-temporal_condition [1,4]、spatial_condition [3,721,1440]；输出是**归一化残差**
-（upper [1,65,...] / surface [1,5,...]）。本类只做一步前向 + 残差反演，全程留在
-归一化空间；归一化/反归一化由 normalize_fengqing / denormalize_fengqing 负责。
-
-surface 通道序 = tp, msl, u10m, v10m, t2m（以 mean_pre.npy 实测为准，与官方
-readme 不同）。
-"""
-from __future__ import annotations
-
+"""FengQing V1.5Beta 确定性推理（tp 走 6h 累积补充 store）。"""
 import os
 from pathlib import Path
 
@@ -18,8 +7,8 @@ import numpy as np
 import torch
 
 from xmetai_inference.backends.onnx import OnnxInferModel
-
-from . import FENGQING_CHANNELS, GRID_025
+from xmetai_inference.configs.base import (
+    FENGQING_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
 
 
 def _temporal_condition(dt):
@@ -51,21 +40,23 @@ def _find_artifact(model_path, relative_paths):
 
 
 class FengqingPreOnnxModel(OnnxInferModel):
+    """FengQing V1.5Beta 降水图契约。
+
+    4 键输入：upper/surface/temporal_condition/spatial_condition；输出归一化残差，
+    本类做一步前向 + 残差反演，全程归一化空间。surface 通道序 =
+    tp,msl,u10m,v10m,t2m（以 mean_pre.npy 实测为准，与官方 readme 不同）。
+
+    只写非默认契约；history_steps=2 / hour_interval=6 / deterministic / 1 成员 /
+    gpu_state=False 用 BaseInferModel 默认值。无 forward_gpu。
+    """
     model_name = "fengqing_pre_onnx"
     input_channels = FENGQING_CHANNELS
     output_channels = FENGQING_CHANNELS
     grid = GRID_025
-    history_steps = 2
-    hour_interval = 6
-    forecast_type = "deterministic"
-    members = 1
-    # 图只出预报那一帧（不带回显帧），滑窗归 runner.Rollout。
-    windowed_output = False
-    # 1 = temporal_condition 取**目标预报时刻**（valid = init + (step+1)*interval），
+    windowed_output = False  # 图只出预报帧，滑窗归 Rollout
+    # 1 = temporal_condition 取目标预报时刻（valid = init + (step+1)*interval）。
     # 与 fuxi 系的「输入窗末帧时刻」不同，两者都有官方脚本背书，不要统一。
     valid_time_step_offset = 1
-    # 图要 4 个键、输入输出不同形，无 forward_gpu，GPU 常驻不可用。
-    gpu_state = False
 
     def load(self, path):
         super().load(path)
@@ -97,11 +88,11 @@ class FengqingPreOnnxModel(OnnxInferModel):
                 f"res_std shape 不符：upper={res_upper_std.shape} "
                 f"surface={res_std_pre.shape}")
 
-        # 归一化空间残差反演系数：next_norm = prev_norm + out·(res_std/std)
+        # 残差反演：next_norm = prev_norm + out·(res_std/std)
         self._upper_res_ratio = (res_upper_std / upper_std).reshape(1, 65, 1, 1)
         self._surface_res_ratio = (res_std_pre / surface_std).reshape(1, 5, 1, 1)
 
-        # tp 非负钳位：物理 0 对应归一化 -mean/std；mean 逐像素，故是 (H,W) 阈值场。
+        # tp 非负钳位：物理 0 = 归一化 -mean/std（mean 逐像素）。
         surface_mean = np.load(mean_std_dir / "mean_pre.npy").astype(np.float32)
         if surface_mean.shape != (5, 721, 1440):
             raise ValueError(f"mean_pre shape 不符：{surface_mean.shape}")
@@ -126,14 +117,10 @@ class FengqingPreOnnxModel(OnnxInferModel):
         return self
 
     def forward(self, x, step, valid_time):
-        """一步前向：归一化量进 / 归一化量出，只出预报那一帧。
-
-        x 形状 (1, 2, 70, H, W)（数据层已归一化）；图要帧优先展平的
-        upper[1,130,H,W] 与 surface[1,10,H,W]。
-        """
+        """一步前向：归一化量进/出，只出预报帧。x = (1,2,70,H,W)。"""
         state = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
-        arr = state.detach().cpu().numpy().astype(np.float32)     # (1,2,70,H,W)
-        frames = arr[0]                                           # (2,70,H,W)
+        arr = state.detach().cpu().numpy().astype(np.float32)
+        frames = arr[0]
         upper = np.concatenate([frames[i, :65] for i in range(frames.shape[0])], axis=0)
         surface = np.concatenate([frames[i, 65:] for i in range(frames.shape[0])], axis=0)
 
@@ -152,8 +139,8 @@ class FengqingPreOnnxModel(OnnxInferModel):
                 f"FengQing 输出通道不符：upper={out_upper.shape} "
                 f"surface={out_surface.shape}")
 
-        prev_upper = frames[-1, :65][None]                        # (1,65,H,W)
-        prev_surface = frames[-1, 65:][None]                      # (1, 5,H,W)
+        prev_upper = frames[-1, :65][None]
+        prev_surface = frames[-1, 65:][None]
         next_upper = prev_upper + out_upper * self._upper_res_ratio
         next_surface = prev_surface + out_surface * self._surface_res_ratio
         # tp ≥ 0（在归一化空间等价钳位，见 load 里的 _tp_floor_norm）
@@ -163,3 +150,55 @@ class FengqingPreOnnxModel(OnnxInferModel):
         pred = np.concatenate([next_upper, next_surface], axis=1)  # (1,70,H,W)
         return torch.as_tensor(
             pred[:, None], dtype=state.dtype, device=state.device)  # (1,1,70,H,W)
+
+
+FENGQING_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/FengQing"
+ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
+TP_ROOT = "/workspace/data/liujunjie/era5_tp_zarr"
+
+FENGQING_STORES = [
+    # 6h 累积 tp store 排最前，顶掉旧 sfc store 里 1h 的 tp。
+    f"{TP_ROOT}/era5.202501-202607.c1.p25.h6.v1.lon180.zarr",
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+]
+
+cfg = InferConfig(
+    name="weather_era_0p25_fengqing",
+    model_path=f"{FENGQING_ROOT}/onnx/fengqing_pre.onnx",
+    model_class="fengqing_pre_onnx",
+
+    dataset={
+        "type": "processed_multi_zarr",
+        "paths": FENGQING_STORES,
+        "processors": [
+            {"name": "unit_convert", "scales": {"tp": 1000.0}},  # 6h 累积 m → mm
+            {"name": "geometry"},
+            {"name": "normalize_fengqing"},
+        ],
+    },
+    dataloader={
+        "batch_size": 2,
+        "num_workers": 2,
+        "pin_memory": True,
+        "shuffle": False,
+        "drop_last": False,
+    },
+
+    # 输入归一化在 dataset.processors，输出反归一化在这里。
+    model_processing=ModelProcessingConfig(
+        input=[],
+        recurrent=[],
+        output=[{"name": "denormalize_fengqing"}],
+    ),
+
+    # 起报数须 = gpus×batch_size；hour_interval 是模型契约（类属性同 6）不可改。
+    times="2025010200..2025122800:24",
+    steps=60,
+    hour_interval=6,
+    members=1,  # 确定性模型必须为 1
+    vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl,tp",
+    gpus=2,
+    cuda_devices="0,1",
+    output_dir="/workspace/data/shenzw/fengqing_output",
+)

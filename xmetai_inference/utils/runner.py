@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-"""自回归 rollout 编排层：把模型的单步 forward 串成多轨迹自回归循环。
+"""自回归 rollout：把单步 forward 串成多轨迹循环。
 
-一条 Trajectory = 一条独立轨迹。集合预报是 N 条轨迹共享同一初始态；
-批量确定性是 N 个起报各一条轨迹，各有自己的初始态与 init_time。
+一条 Trajectory = 一条独立轨迹（集合成员或多起报）。
 """
 import gc
 import logging
@@ -14,18 +13,17 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .backends.base import _fmt_dur
+from ..backends.base import _fmt_dur
 
 log = logging.getLogger(__name__)
 
 _PROGRESS_INTERVAL = 5   # 每隔多少步打一条完整进度行
 
-#: model_batch 生效 / 退回的日志标记，集成档 import 它们判「批量化有没有进图」。
+#: 集成档靠这两个标记判断批量化有没有进图，改措辞会连带改测试。
 BATCH_ACTIVE_MARK = "前向批生效"
 BATCH_FALLBACK_MARK = "模型未声明 batch_axis_dynamic"
 
-#: 已经打过的 model_batch 提示，按 key 在进程内去重（集合路径下每个起报都会新建
-#: 一个 Rollout，不去重会被打「起报数」遍）。
+#: 每个起报都会新建 Rollout，提示按 key 在进程内去重一次。
 _batch_notices = set()
 
 
@@ -60,12 +58,7 @@ def _cat(values, axis=0):
 
 @dataclass
 class Trajectory:
-    """一条独立的自回归轨迹。
-
-    state     初始状态 (1, in_frames, C, H, W)，torch.Tensor 或 numpy
-    init_time 该轨迹的起报时刻；rollout 中 valid_time 由它推出
-    label     仅用于日志（如 "member_007" / "2025010200"）
-    """
+    """一条轨迹：初始状态 (1, in_frames, C, H, W) + 起报时刻 + 日志标签。"""
 
     state: Any
     init_time: pd.Timestamp
@@ -73,10 +66,10 @@ class Trajectory:
 
 
 class Rollout:
-    """把模型的单步 forward 串成多轨迹自回归循环。
+    """多轨迹自回归循环。
 
-    model 需实现 forward(x, step, valid_time)；gpu_state=True 时还需 to_gpu /
-    forward_gpu / to_numpy。processing 提供 recurrent / output 变换；None = 不做。
+    model 需实现 forward(x, step, valid_time)；gpu_state=True 时还需
+    to_gpu / forward_gpu / to_numpy。processing=None 表示不做变换。
     """
 
     def __init__(self, model, processing=None):
@@ -94,20 +87,14 @@ class Rollout:
             progress=True, progress_label="", model_batch=1):
         """跑 steps 步，每步对全部轨迹各前向一次。
 
-        on_step(step_index, step_state) 每步回调一次，step_state 形状
-        (n_trajectories, C, H, W)；传了就走流式（内存不随 steps 增长），否则返回
-        攒下的 (n_traj, steps, C, H, W)，流式时返回 None。
-
-        ``model_batch`` 是一次 forward 最多堆几条轨迹（缺省 1）。要求图输入/输出的
-        batch 轴都是符号维（模型用 ``batch_axis_dynamic`` 声明，否则退回 1）；不能与
-        gpu_state=True 同用；forward 里写死 batch=1 的模型（fengqing / pangu）拿到
-        k>1 会炸形状。显存按 k 倍涨，k 按可用显存给。
+        传 on_step 则流式回调、返回 None；否则返回 (n_traj, steps, C, H, W)。
+        model_batch 是一次 forward 堆的轨迹数：要求图的 batch 轴是符号维，否则退回 1；
+        不能与 gpu_state=True 同用；显存按 k 倍涨。
         """
         if not trajectories:
             raise ValueError("trajectories 为空，没有可跑的轨迹")
 
-        # 跨步有状态模型（Pangu 的 24h 锚点）在每批轨迹开始前清空；
-        # BaseInferModel 缺省 no-op。
+        # 跨步有状态模型（Pangu 的 24h 锚点）每批轨迹前清空；缺省 no-op。
         reset = getattr(self.model, "reset_runtime_state", None)
         if reset is not None:
             reset()
@@ -127,7 +114,7 @@ class Rollout:
                     "（forward_gpu）的 _spare buffer 复用假设固定 shape，"
                     "动态 batch 轴建不出 buffer。")
             if not getattr(self.model, "batch_axis_dynamic", False):
-                # 图是静态 batch 时喂 k>1 会被 ORT 拒，退回 1 至少让这一趟跑完。
+                # 静态 batch 图喂 k>1 会被 ORT 拒，退回 1。
                 _notice_once(
                     ("fallback", type(self.model).__name__),
                     logging.WARNING,
@@ -147,10 +134,8 @@ class Rollout:
         chunks = [list(range(start, min(start + model_batch, len(trajectories))))
                   for start in range(0, len(trajectories), model_batch)]
 
-        # 每块一份独立缓冲（forward 可能原地改）；多条用 _cat 不用 _stack ——
-        # state 已带 batch 维 (1,F,C,H,W)，stack 会多出一维。
+        # 每块一份独立缓冲；state 已带 batch 维，多条用 cat 不用 stack。
         if use_gpu:
-            # 上面已挡掉 model_batch>1，块必是单条，下标与轨迹一一对应
             states = [self.model.to_gpu(t.state) for t in trajectories]
         else:
             states = [
@@ -161,8 +146,7 @@ class Rollout:
         in_frames = trajectories[0].state.shape[1]
         init_times = [pd.to_datetime(t.init_time) for t in trajectories]
 
-        # 时间条件口径按模型声明：0 = fuxi 系（valid = init + step*interval）；
-        # FengQing 用 +1（目标预报时刻）。模型类用 valid_time_step_offset 声明。
+        # 0 = valid = init + step*interval（fuxi 系）；FengQing 用 1。
         offset = getattr(self.model, "valid_time_step_offset", 0)
         windowed = getattr(self.model, "windowed_output", True)
 
@@ -188,14 +172,12 @@ class Rollout:
                     continue
 
                 prev = states[chunk_index]
-                # 单条块喂标量时刻；多条块喂时刻列表，_scalar_feeds 把后者拼成
-                # (k,) 的 step/hour/doy，正是动态 batch 图要的形状。
+                # 多条块喂时刻列表，forward 内部拼成 (k,) 的 step/hour/doy。
                 result = self.model.forward(
                     prev, step,
                     valid_times[0] if len(chunk) == 1 else valid_times)
                 next_state = self._next_state(prev, result, in_frames, windowed)
-                # 先取副本再回填：recurrent Processor（如 zero_channels）是原地改，
-                # 不复制会把已取出的预报也改掉。
+                # 先取副本再回填：recurrent Processor 可能原地改。
                 preds = next_state[:, -1]
                 for row in range(preds.shape[0]):
                     frame = preds[row]
@@ -227,10 +209,9 @@ class Rollout:
 
     @staticmethod
     def _next_state(prev, result, in_frames, windowed):
-        """把 forward 的输出整理成下一拍的完整输入窗。
+        """forward 输出 → 下一拍输入窗。
 
-        windowed_output=True：图自己做滑窗，输出帧数 == 输入帧数，整体回填；
-        False：图只出预报那一帧，这里滑窗成 ``[输入末帧, 预报]``。
+        windowed_output=True 时整体回填；False 时拼成 [输入末帧, 预报]。
         """
         if windowed:
             if result.shape[1] != in_frames:
@@ -239,7 +220,7 @@ class Rollout:
                     f"输入 {in_frames} 帧，不一致，无法做 state=result 回填。"
                     "若该模型只输出预报帧，请在模型类声明 windowed_output=False。")
             return result
-        # 单步型：输出可以是 (1,1,C,H,W) 或 (1,C,H,W)，都归一成前者再滑窗。
+        # (1,C,H,W) 先补成 (1,1,C,H,W)。
         if result.ndim == prev.ndim - 1:
             result = result[:, None]
         if result.shape[1] != 1:
@@ -253,16 +234,15 @@ class Rollout:
         return np.concatenate([np.asarray(last), np.asarray(result)], axis=1)
 
     def _log_progress(self, step, steps, hour_interval, step_times, label):
-        """每隔 _PROGRESS_INTERVAL 步打一条完整行（多卡并发时进度条会互相覆盖）。"""
+        """每隔 _PROGRESS_INTERVAL 步打一行；首步必打。"""
         done = step + 1
-        # 首步必打：cudnn 算法穷举搜索可能在第一个前向耗几分钟。
         first = done == 1
         if done != steps and not first and done % _PROGRESS_INTERVAL:
             return
         elapsed = sum(step_times)
         eta = elapsed / done * (steps - done)
         prefix = f"{label} " if label else ""
-        note = "（首步含 cudnn 算法穷举搜索，偏慢属正常；ETA 按首步外推会偏大）" if first else ""
+        note = "（首步含会话/算法预热，偏慢属正常；ETA 按首步外推会偏大）" if first else ""
         log.info(
             "%s预报 %.1f/%.1f 天，剩 %.1f 天，预计还需 %s%s",
             prefix,

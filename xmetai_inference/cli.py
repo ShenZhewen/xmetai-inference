@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """统一推理入口：配置加载、多卡调度、自回归推理与 NetCDF 输出。
 
-用法：xmetai-infer --model fgvp --times 2025010700..2025020500:24
+用法：xmetai-infer --model weather_era_0p25_fgvp --times 2025010700..2025020500:24
 输出 ``{out}/{起报}/member_{成员3位}/{步号3位}.nc``（确定性省掉 member 层）。
 多卡按成员或起报拆子进程；写盘走单个后台线程（netCDF4/HDF5 非线程安全）。
 """
@@ -37,13 +37,10 @@ from xmetai_inference.utils.logging_util import configure_logging
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 输出（后端无关）
-# ---------------------------------------------------------------------------
 def _output_init_dir(init):
-    """00 UTC 用 YYYYMMDD，其他起报时次保留 YYYYMMDDHH，避免同日多时次互相覆盖。
+    """00 UTC 用 YYYYMMDD，其他时次用 YYYYMMDDHH，避免同日多时次互相覆盖。
 
-    起报间隔混用时两种目录名并存，下游按目录名解析要能同时吃 8 位与 10 位。
+    起报间隔混用时两种目录名并存，下游解析要能同时吃 8 位与 10 位。
     """
     init = pd.Timestamp(init)
     if init.hour == 0 and init.minute == 0:
@@ -148,9 +145,6 @@ class _AsyncWriter:
         return self.errors
 
 
-# ---------------------------------------------------------------------------
-# 入口
-# ---------------------------------------------------------------------------
 def _init_times(args, interval):
     """把 --inits（列表）/ --start/--end/--freq（区间）/ --time（单次）展开成起报时间列表。"""
     if args.inits is not None:
@@ -187,8 +181,7 @@ def _pick(overrides, key, default):
 def _run_scope(cfg, overrides):
     """本次运行的范围（模型 / 起报 / 步数 / 成员 / 变量 / 输出 / 步长）。
 
-    worker 参数与任务表都从这一份取：两处各算一遍最容易「members 算得不一样」，
-    那样任务表与实际产物就对不上了。
+    worker 参数与任务表都从这一份取，避免两处各算一遍导致成员数对不上。
     """
     model_path = _pick(overrides, "model_path", cfg.model_path)
     inits = parse_times(_pick(overrides, "times", cfg.times))
@@ -217,8 +210,7 @@ def _build_infer_argv(cfg, overrides, *, scope=None, intra_op_threads=0):
         "--log-level", str(_pick(overrides, "log_level", cfg.log_level)),
         "--intra-op-threads", str(int(intra_op_threads or 0)),
         "--cudnn-algo-search", str(cfg.cudnn_algo_search or ""),
-        # 常驻 session 池的额度（resident_members）。它和 intra_op_threads 同类：属于
-        # 「这份配方怎么跑」，所以只有 config 能配，命令行不开放覆盖。
+        # resident_members 与 intra_op_threads 同类：属于「这份配方怎么跑」，命令行不开放。
         "--resident-members", str(int(cfg.resident_members or 1)),
     ]
     interval = scope["interval"]
@@ -365,7 +357,7 @@ def _config_main(argv=None):
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--model",
-        help="注册模型配方名，如 fuxi21、fuxi_ens、fgvp、fgvp_spw_ab",
+        help="注册模型配方名，如 weather_era_0p25_fuxi21、weather_era_0p25_fgvp",
     )
     source.add_argument(
         "--config",
@@ -378,7 +370,7 @@ def _config_main(argv=None):
     )
     parser.add_argument(
         "--times", default=None,
-        help="覆盖：起报时间（统一格式，见 configs/base.py::parse_times）")
+        help="覆盖：起报时间（统一格式，见 xmetai_inference/config.py::parse_times）")
     parser.add_argument("--members", type=int, default=None, help="覆盖：成员数")
     parser.add_argument("--steps", type=int, default=None, help="覆盖：预报步数")
     parser.add_argument("--vars", default=None, help="覆盖：输出变量，逗号分隔")
@@ -521,9 +513,8 @@ def _run_member_outer(model, processors, dataloader, writer, args, init_times,
                       world_size):
     """m1a 的集合编排：成员在外层、数据集在内层（每个成员把数据集走一遍）。
 
-    每个成员是另一份冻结权重（另一个 session），同时驻留多份会吃光显存，
-    所以缺省一换一放（resident_members）；调大则按 LRU 常驻，省去重建与 cuDNN 预热。
-    成员内循环与非集合路径相同，输出只落到 member_<NNN>/ 子目录。
+    每个成员是另一份冻结权重，同时驻留多份会吃光显存，所以缺省一换一放；
+    调大 resident_members 则按 LRU 常驻，省去重建与 cuDNN 预热。
     """
     from xmetai_inference.backends.base import _fmt_dur
 
@@ -546,7 +537,7 @@ def _run_member_block(model, processors, dataloader, writer, args, init_times,
                       world_size, model_batch=1):
     """逐成员跑完 member_indices：每人先 load，再逐 batch 走一遍数据集并 flush。"""
     from xmetai_inference.backends.base import _fmt_dur
-    from xmetai_inference.runner import Rollout, Trajectory
+    from xmetai_inference.utils.runner import Rollout, Trajectory
 
     release = getattr(model, "release", None)
     for order, member_id in enumerate(member_indices, 1):
@@ -602,8 +593,7 @@ def _run_member_block(model, processors, dataloader, writer, args, init_times,
                      _fmt_dur(perf_counter() - t_fetch))
             del state
             gc.collect()
-        # 最后一个成员**不放手**：跑完就退出去了，这一放只是让池子里那份 session 提前
-        # 销毁，对显存没有意义（额度 1 时池子里本来就只剩它）。
+        # 最后一个成员不放手：跑完就退出，放了只是让池子里那份 session 提前销毁。
         if release is not None and order < len(member_indices):
             release()
             gc.collect()
@@ -663,7 +653,7 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
     输出 ``{起报}/member_{成员3位}/{步号}.nc``。返回跑完的起报条数。
     """
     from xmetai_inference.backends.base import _fmt_dur
-    from xmetai_inference.runner import Rollout, Trajectory
+    from xmetai_inference.utils.runner import Rollout, Trajectory
 
     completed = 0
     log.info("开始迭代数据集，等待首个 batch 装载（workers=%s，"
@@ -768,12 +758,30 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
     return completed
 
 
+def _check_model_batch(model_batch, *, gpu_state, has_recurrent):
+    """启动期校验 ``model_batch`` 与运行模式的组合，非法当场失败。
+
+    只判静态可知的错；图是不是动态 batch 要 load 读图才知道，那一步由 ``Rollout``
+    负责（静态图则退回 1 并告警）。
+    """
+    model_batch = 1 if model_batch is None else int(model_batch)
+    if model_batch < 1:
+        raise SystemExit(f"model_batch 必须 >= 1，实际 {model_batch}")
+    if gpu_state and has_recurrent:
+        raise SystemExit("GPU 常驻模式（gpu_state=True）暂不支持 recurrent Processor")
+    if model_batch > 1 and gpu_state:
+        raise SystemExit(
+            "model_batch>1 与 gpu_state=True 互斥：GPU 常驻分支（forward_gpu）的 "
+            "_spare buffer 复用假设固定 shape，动态 batch 轴建不出 buffer。")
+    return model_batch
+
+
 def _worker_main(argv=None):
     from xmetai_inference.backends.base import _fmt_dur, normalize_budget
-    from xmetai_inference.data import create_dataloader
-    from xmetai_inference.models import create_model, get_model_class, grid_coords
+    from xmetai_inference.utils.dataloader_factory import create_dataloader
+    from xmetai_inference.configs import grid_coords
+    from xmetai_inference.utils.model_factory import create_model, get_model_class
     from xmetai_inference.utils.model_processors import build_pipeline
-    from xmetai_inference.runner import Rollout, Trajectory
 
     p = argparse.ArgumentParser(description="气象模型自回归推理（后端可插拔）")
     p.add_argument(
@@ -890,9 +898,8 @@ def _worker_main(argv=None):
     init_times = _init_times(args, interval)
 
     # 多卡分工有两种切法：按起报切（每 rank 跑部分起报、全部成员）或按成员切。
-    # Rollout 给每条轨迹持有一份 ~645MB state，按起报切会让每卡挂全部成员
-    # （51 成员 ≈ 33GB/卡，实测 OOM）；集合优先按成员切，成员少于卡数时才退回。
-    # 确定性（members==1）只能按起报切。
+    # 每条轨迹持有一份 ~645MB state，按起报切会让每卡挂全部成员（51 成员 ≈ 33GB，
+    # 实测 OOM）；集合优先按成员切，成员少于卡数时退回按起报切。
     n_init = len(init_times)
     graph_members = None
     if graph_outer:
@@ -939,6 +946,15 @@ def _worker_main(argv=None):
              len(init_times), init_times[0].strftime("%Y%m%d%H"),
              init_times[-1].strftime("%Y%m%d%H"), len(member_indices))
 
+    input_specs, recurrent_specs, output_specs = worker_cfg.processor_specs()
+    # 前向批参数在开 zarr / 加载模型之前校验：配错当场失败，别付几分钟启动成本。
+    model_batch = _check_model_batch(
+        worker_cfg.model_batch,
+        gpu_state=(worker_cfg.gpu_state if worker_cfg.gpu_state is not None
+                   else getattr(cls, "gpu_state", False)),
+        has_recurrent=bool(recurrent_specs),
+    )
+
     if worker_cfg.dataset is None:
         raise SystemExit("配置必须使用 dataset 路径（旧 loader 已移除）")
     dataloader_config = dict(worker_cfg.dataloader or {})
@@ -964,7 +980,6 @@ def _worker_main(argv=None):
              dataloader_config.get("batch_size"),
              _fmt_dur(perf_counter() - t_dataset))
 
-    input_specs, recurrent_specs, output_specs = worker_cfg.processor_specs()
     t_pipeline = perf_counter()
     processors = build_pipeline(
         input_specs,
@@ -1025,7 +1040,6 @@ def _worker_main(argv=None):
         log.info("模型加载完成：%s，耗时 %s",
                  model.describe(), _fmt_dur(perf_counter() - t_load_model))
 
-    # 输出变量选择：--vars 指定则用，否则保存全部。
     requested = [v for v in args.vars.split(",") if v.strip()] if args.vars else None
     channels = list(cls.output_channels)
     save_indices = _resolve_output_indices(channels, requested)
@@ -1041,7 +1055,7 @@ def _worker_main(argv=None):
             model, processors, dataloader, writer, args, init_times,
             graph_members, save_names, lat, lon, interval, local_rank, world_size,
             num_workers=dataloader_config.get("num_workers", 0),
-            model_batch=worker_cfg.model_batch)
+            model_batch=model_batch)
 
     if member_outer:
         return _run_member_outer(
@@ -1054,7 +1068,7 @@ def _worker_main(argv=None):
         save_names, lat, lon, interval, local_rank, world_size, members,
         total_inits=len(init_times),
         num_workers=dataloader_config.get("num_workers", 0),
-        model_batch=worker_cfg.model_batch)
+        model_batch=model_batch)
     errors = writer.close()
     if errors:
         log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))

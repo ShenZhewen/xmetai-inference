@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """fuxi（fuxi21 / FuXi-2.1）真实数据档：真 .pt2 在切片数据上跑一遍，和标准答案对拍。
 
-配方是 configs/fuxi21.py 的 deepcopy 派生，只覆盖 fixture 特有项。fuxi2.1 在 GPU 上
+配方是 configs/weather_era_0p25_fuxi21.py 的 deepcopy 派生，只覆盖 fixture 特有项。fuxi2.1 在 GPU 上
 不可逐位复现：第 1 步按变量判档（地面 CLOSE、高空 DRIFT），第 2 步起噪声经回填扩散到
 全部通道，只挂灾难线；第 1 步全变量就偏 ⇒ 前处理或时间条件的问题。
 
@@ -90,7 +90,7 @@ _CONFIG_TEMPLATE = Template('''\
 import copy
 from pathlib import Path
 
-from xmetai_inference.configs.fuxi21 import cfg as _production
+from xmetai_inference.configs.weather_era_0p25_fuxi21 import cfg as _production
 
 # deepcopy：import 拿到的是缓存的同一个对象，直接改会把正式配方改成指向 fixture。
 cfg = copy.deepcopy(_production)

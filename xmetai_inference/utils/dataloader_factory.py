@@ -1,10 +1,6 @@
-"""配置 → ``DataLoader``：按 ``dataset.type`` 选实现并装配。
+"""配置 → DataLoader：按 ``dataset.type`` 分发到 ``data/<category>/`` 下的实现。
 
-    config["dataset"] → create_dataloader() → DataLoader
-
-一种 Dataset 类型 = 分类目录下的一个实现模块（如 ``weather/processed_multi_zarr``）。
-加类型 = 新建 ``data/<category>/<type>.py``（暴露 ``create_<type>_dataset()``
-返回 torch Dataset）+ 在下面加一条分支。type 名全局唯一，不按目录区分。
+加一种类型 = 新建 ``data/<category>/<type>.py`` 并在下面加一条分支。
 """
 from __future__ import annotations
 
@@ -12,7 +8,7 @@ from collections.abc import Mapping
 
 from torch.utils.data import DataLoader
 
-from .weather import create_processed_multi_zarr_dataset
+from ..data.weather import create_processed_multi_zarr_dataset
 
 
 def create_dataloader(
@@ -25,7 +21,7 @@ def create_dataloader(
     model_path=None,
     dataloader_options=None,
 ):
-    """Build the inference DataLoader declared by ``config["dataset"]``."""
+    """按 ``config["dataset"]`` 声明的类型构建推理 DataLoader。"""
     if not isinstance(spec, Mapping):
         raise TypeError("dataset 必须是包含 type 和参数的配置字典")
     name = spec.get("type")

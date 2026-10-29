@@ -36,6 +36,8 @@ NOISE_BLOCK_FROZEN = 8
 # 成员集落盘格式版本：凡改变成员图写法（location 口径、布局、噪声派生）就 +1，
 # 使新版本落到新目录，旧产物不会被静默复用。
 MEMBER_FORMAT = 3
+
+
 @dataclass
 class WeightPerturbSpec(SpecBase):
     """一次 SPW 运行的注入规格。
@@ -124,9 +126,7 @@ class WeightPerturbSpec(SpecBase):
                 f"{extra}{struct}")
 
 
-# ---------------------------------------------------------------------------
 # 选张量底座
-# ---------------------------------------------------------------------------
 _CHUNK = 1 << 22
 _FLOAT_DTYPES = ("FLOAT", "FLOAT16", "DOUBLE", "BFLOAT16")
 
@@ -214,9 +214,7 @@ def external_tensors(model):
 
 
 
-# ---------------------------------------------------------------------------
 # 名字与拓扑
-# ---------------------------------------------------------------------------
 def key_parts(name) -> tuple[str, ...]:
     """把名字切成路径分量（"." 与 "/" 等价），用于前缀匹配。"""
     cleaned = str(name).strip("/")
@@ -304,9 +302,7 @@ def weight_like(value, consumers, memo: dict | None = None) -> bool:
     return result
 
 
-# ---------------------------------------------------------------------------
 # 权重能量（配平的依据）
-# ---------------------------------------------------------------------------
 def tensor_array(tensor, src_dir: str):
     """取张量数值：外部数据用 memmap 只读映射，不把 2.8 GB 拉进内存。"""
     onnx = _onnx()
@@ -334,9 +330,7 @@ def tensor_energy(tensor, src_dir: str) -> float:
     return total
 
 
-# ---------------------------------------------------------------------------
 # 选张量
-# ---------------------------------------------------------------------------
 @dataclass
 class Candidate:
     name: str
@@ -567,9 +561,7 @@ def resolve_effective_path(src_path: str, spec: WeightPerturbSpec | None,
     return resolve_member_path(src_path, spec, member_index)
 
 
-# ---------------------------------------------------------------------------
 # 成员集落盘
-# ---------------------------------------------------------------------------
 BASE_DATA = "base.data"                      # 成员集里共享的源 .data（硬链接，或复制一次）
 PERTURBED_DATA_FMT = "perturbed.{tag}.data"  # 逐成员的扰动权重
 MEMBER_MODEL_FMT = "{stem}.{tag}.onnx"       # 逐成员的图
@@ -591,9 +583,7 @@ def _base_spec(spec: WeightPerturbSpec) -> WeightPerturbSpec:
     return replace(spec, seed=seed)
 
 
-# ---------------------------------------------------------------------------
 # 路径
-# ---------------------------------------------------------------------------
 def set_dir_for(src_path: str, spec: WeightPerturbSpec, *, out_dir: str | None = None) -> str:
     """成员集目录：<目录>/<模型名>.spw-members-<指纹>/。
 
@@ -674,9 +664,7 @@ def resolve_member_path(src_path: str, spec: WeightPerturbSpec, index: int, *,
         "  直接跑推理也行：cli 会在建 session 之前按 rank 分片自动生成。")
 
 
-# ---------------------------------------------------------------------------
 # 源布局与字节序
-# ---------------------------------------------------------------------------
 def _external_location(tensor):
     for entry in tensor.external_data:
         if entry.key == "location" and entry.value:
@@ -746,9 +734,7 @@ def _assert_c_order(tensor, src_dir: str, array, name: str):
             "按现有实现改写会把权重转置，已中止。请先用 tensor_array 的口径核对这份导出。")
 
 
-# ---------------------------------------------------------------------------
 # 生成
-# ---------------------------------------------------------------------------
 def _noise_shape(shape, struct: str):
     """按结构给出独立抽样的形状；三种结构每元素方差都是 1，因此预算不变。
 
@@ -1032,9 +1018,7 @@ def build_member_set(src_path: str, spec: WeightPerturbSpec, count: int, *,
     return report
 
 
-# ---------------------------------------------------------------------------
 # 校验
-# ---------------------------------------------------------------------------
 def verify_member_set(src_path: str, spec: WeightPerturbSpec, count: int, *,
                       out_dir: str | None = None, sample: int = 8) -> dict:
     """复核成员集：文件齐全、引用可达，且成员之间权重确实不同。

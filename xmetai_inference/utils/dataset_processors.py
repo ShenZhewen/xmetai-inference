@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
-"""数据侧（DataLoader worker 里跑）：原始 store → 模型输入的 tensor 前处理链。
-
-Each processor is torch.Tensor -> torch.Tensor of shape [T, C, H, W] and is
-selected by name from a dataset ``processors`` list; ``build_tensor_processors``
-is the only entry point configuration uses.
-
-模型侧（自回归回填 / 输出反变换）在 ``model_processors.py``，跑在主进程。
+"""数据侧处理（DataLoader worker）：store → 模型输入，处理器按名字挂到
+``dataset.processors``，形状 [T, C, H, W]。模型侧在 ``model_processors.py``。
 """
 from __future__ import annotations
 
@@ -28,7 +23,7 @@ def _base_name(name):
 
 @dataclass
 class TensorProcessorContext:
-    """Metadata shared by all configured tensor processors."""
+    """处理器共享的元信息。"""
 
     channel_names: list[str]
     latitudes: np.ndarray
@@ -38,11 +33,7 @@ class TensorProcessorContext:
 
 
 class TensorProcessor:
-    """Base class for config-driven tensor preprocessors.
-
-    Subclasses receive ``context`` plus processor-specific config keys and must
-    implement ``process(value)``; input/output shape is [T, C, H, W].
-    """
+    """tensor 前处理器基类：子类实现 ``process(value)``，输入输出 [T, C, H, W]。"""
 
     def __init__(self, context: TensorProcessorContext, **kwargs):
         self.context = context
@@ -62,7 +53,7 @@ _TENSOR_PROCESSOR_REGISTRY = {}
 
 
 def register_tensor_processor(name):
-    """Register a tensor processor under a configuration name."""
+    """把处理器按配置名注册。"""
 
     def decorator(cls):
         if name in _TENSOR_PROCESSOR_REGISTRY:
@@ -74,7 +65,7 @@ def register_tensor_processor(name):
 
 
 def _latlon_alignment(latitudes, longitudes, expected_shape):
-    """Return (flip, roll) needed for north->south lat and 0:360 lon."""
+    """返回对齐到「北→南、0:360」所需的 (flip, roll)。"""
     lat = np.asarray(latitudes, dtype=np.float64).ravel()
     lon = np.asarray(longitudes, dtype=np.float64).ravel()
     nlat, nlon = expected_shape
@@ -94,7 +85,7 @@ def _latlon_alignment(latitudes, longitudes, expected_shape):
 
 
 def aligned_coordinates(latitudes, longitudes, expected_shape):
-    """Coordinates after geometry has been applied."""
+    """几何对齐后的经纬度。"""
     flip, roll = _latlon_alignment(latitudes, longitudes, expected_shape)
     lat = np.asarray(latitudes, dtype=np.float64).ravel().copy()
     lon = np.asarray(longitudes, dtype=np.float64).ravel().copy()
@@ -105,19 +96,13 @@ def aligned_coordinates(latitudes, longitudes, expected_shape):
     return lat, lon
 
 
-# ERA5 store 原生单位：z/t/u/v/w 无需换算；q=kg/kg（FuXi 系要 g/kg ×1000）；
-# ssr/ssrd/fdir/ttr = J/m² 1h 累积（→ Wh/m² ÷3600）；tp = m 1h 累积（→ mm ×1000）。
-# 累积场在 store 里是 1h 而 step 是 6h，故 config 系数 = 单位换算 × 6：
-# tp → 1000×6 = 6000.0，辐射 → 6/3600。
+# store 原生单位：q=kg/kg（FuXi 要 ×1000）；辐射 J/m² 1h 累积（÷3600 得 Wh/m²）；
+# tp=m 1h 累积（×1000 得 mm）。step 是 6h，所以 config 系数 = 单位换算 × 6。
 
 
 @register_tensor_processor("unit_convert")
 class TensorUnitConvert(TensorProcessor):
-    """Channel-wise multiplicative unit conversion.
-
-    ``scales`` 按通道基名匹配（``_base_name``：z500→z、t2m→t2m），未列出的通道
-    系数为 1.0；系数推导见上方 ERA5 单位约定参考。
-    """
+    """按通道基名乘系数（z500→z、t2m→t2m），未列出的为 1.0。"""
 
     def __init__(self, context: TensorProcessorContext, scales=None, **kwargs):
         super().__init__(context=context, **kwargs)
@@ -141,7 +126,7 @@ class TensorUnitConvert(TensorProcessor):
 
 @register_tensor_processor("geometry")
 class TensorGeometry(TensorProcessor):
-    """Lat north->south and lon 0:360 alignment（在 ``process`` 里惰性计算）。"""
+    """纬度北→南、经度 0:360 对齐（惰性计算）。"""
 
     def __init__(self, context: TensorProcessorContext, expected_shape=None, **kwargs):
         super().__init__(context=context, **kwargs)
@@ -170,10 +155,7 @@ class TensorGeometry(TensorProcessor):
 
 @register_tensor_processor("normalize")
 class TensorNormalize(TensorProcessor):
-    """Normalize model inputs with model-adjacent mean.nc/std.nc.
-
-    ``log1p_channels`` are transformed with log1p before normalization.
-    """
+    """用模型同目录的 mean.nc/std.nc 做归一化（log1p 通道先变换）。"""
 
     def __init__(
         self,
@@ -245,12 +227,7 @@ def _channel_key(name):
 
 
 def _open_stats_zarr(path):
-    """打开统计量 store：优先 consolidated，缺元数据合并的盘退回普通模式。
-
-    zarr v2 的合并元数据在 ``.zmetadata``、v3 在根 ``zarr.json`` 里，缺了不一定是
-    坏盘（zarr_refresh_v3 的盘就没有），所以读不到就退回逐节点模式再试一次；
-    真坏盘在第二次打开时照样报错。
-    """
+    """打开统计量 store：先 consolidated，缺合并元数据再退回逐节点模式。"""
     try:
         return xr.open_zarr(path, consolidated=True)
     except Exception:  # noqa: BLE001 —— 退回非 consolidated 后仍有错会原样抛出
@@ -259,22 +236,11 @@ def _open_stats_zarr(path):
 
 @register_tensor_processor("denormalize")
 class TensorDenormalize(TensorProcessor):
-    """Recover model input space from an already-normalized store: ``x*std + mean``.
+    """归一化态 store → 模型输入空间：``x*std + mean``，与 ``normalize`` 对称。
 
-    与 ``normalize`` 对称。用于「store 里存的就是归一化值、而图自己会归一化」的数据
-    源（CRA c71 store、zarr_refresh_v3 的 ERA5 盘）：图头是 ``Div(Sub(x, mean), std)``，
-    所以喂进去的必须是反归一化后的值。
-
-    统计量从 ``stats_path`` 指向的 zarr store 的 ``mean``/``std`` 数组读取（与数据
-    同一个 store 时，正是训练用的那一套；图中烘焙的常量须与它一致）。
-
-    通道按**名字**对齐（``z_50`` 与 ``z50`` 视为同一个），不要求 store 的通道数与
-    顺序等于模型：zarr_refresh_v3 的 ERA5 盘是 116/78 通道的超集，模型只取自己
-    要的那几十个，按名字挑统计量。
-
-    注意经 log1p 再归一化的通道：反归一化得到的是 ``log1p(物理值)``。CRA 的 tp
-    正是图期望的输入表示，**不要** expm1；zarr_refresh_v3 的 tp 则要用
-    ``expm1_channels=["tp"]`` 还原成物理量（与 CRA 相反）。
+    统计量从 ``stats_path`` 的 mean/std 数组读，通道按名字对齐（z_50 == z50）。
+    经 log1p 归一化的通道反变换后是 ``log1p(物理值)``：CRA 的 tp 就保持这样，
+    zarr_refresh_v3 的 tp 则要 ``expm1_channels=["tp"]`` 还原（两边相反）。
     """
 
     def __init__(
@@ -313,7 +279,6 @@ class TensorDenormalize(TensorProcessor):
             raise ValueError(
                 f"mean/std shape 不一致：{mean.shape} vs {std.shape}")
         if names is None:
-            # 没有 channel 坐标只能按下标对齐（旧行为）。
             if mean.size != len(self.channel_names):
                 raise ValueError(
                     f"统计量通道数 {mean.size} 与模型输入通道数 "
@@ -370,11 +335,7 @@ class TensorDenormalize(TensorProcessor):
 
 
 def _resolve_fengqing_mean_std_dir(model_path, mean_std_dir=None):
-    """解析 FengQing mean/std 目录。
-
-    优先级：显式 ``mean_std_dir`` > 环境变量 ``FENGQING_MEAN_STD_DIR`` >
-    模型文件上两级的 ``mean_std/``。
-    """
+    """解析 mean_std 目录：显式参数 > FENGQING_MEAN_STD_DIR > 模型文件上两级。"""
     if mean_std_dir:
         return os.fspath(mean_std_dir)
     env = os.environ.get("FENGQING_MEAN_STD_DIR")
@@ -395,11 +356,7 @@ def _resolve_fengqing_mean_std_dir(model_path, mean_std_dir=None):
 
 @lru_cache(maxsize=4)
 def _load_fengqing_stats(model_path, mean_std_dir=None):
-    """Load FengQing per-pixel normalization stats -> (mean, std)。
-
-    mean shape (70, H, W)、std shape (70, 1)：前 65 通道(upper air) 来自
-    upper_mean/upper_std，后 5 通道(surface) 来自 mean_pre/std_pre。
-    """
+    """读 FengQing 统计量：mean (70,H,W)、std (70,1)，前 65 upper、后 5 surface。"""
     directory = Path(_resolve_fengqing_mean_std_dir(model_path, mean_std_dir))
     upper_mean = np.load(directory / "upper_mean.npy").astype(np.float32)
     upper_std = np.load(directory / "upper_std.npy").astype(np.float32)
@@ -418,8 +375,8 @@ def _load_fengqing_stats(model_path, mean_std_dir=None):
         raise ValueError(
             f"FengQing std 应为 (C, 1)：upper={upper_std.shape}, "
             f"surface={surface_std.shape}")
-    mean = np.concatenate([upper_mean, surface_mean], axis=0)  # (70, H, W)
-    std = np.concatenate([upper_std, surface_std], axis=0)     # (70, 1)
+    mean = np.concatenate([upper_mean, surface_mean], axis=0)
+    std = np.concatenate([upper_std, surface_std], axis=0)
     if not np.all(np.isfinite(mean)) or not np.all(np.isfinite(std)) \
             or np.any(std <= 0):
         raise ValueError("FengQing mean/std 包含非有限值或非正标准差")
@@ -428,12 +385,7 @@ def _load_fengqing_stats(model_path, mean_std_dir=None):
 
 @register_tensor_processor("normalize_fengqing")
 class TensorNormalizeFengqing(TensorProcessor):
-    """FengQing per-pixel normalization: ``(x - mean) / std`` over ``[T,70,H,W]``.
-
-    前 65 通道(upper air) 用 upper_mean(65,H,W)/upper_std(65,1)，后 5 通道
-    (surface) 用 mean_pre(5,H,W)/std_pre(5,1)；mean 逐像素、std 逐通道。
-    非有限结果置 0。
-    """
+    """FengQing 逐像素归一化 ``(x - mean) / std``：mean 逐像素、std 逐通道。"""
 
     def __init__(self, context, mean_std_dir=None, **kwargs):
         super().__init__(context=context, **kwargs)
@@ -469,7 +421,7 @@ class TensorNormalizeFengqing(TensorProcessor):
 
 @register_tensor_processor("fill_missing")
 class TensorFillMissing(TensorProcessor):
-    """Per-channel constant fill for non-finite values."""
+    """按通道把非有限值填成常量。"""
 
     def __init__(self, context: TensorProcessorContext, rules=None, unconfigured="keep", **kwargs):
         super().__init__(context=context, **kwargs)
@@ -513,7 +465,7 @@ class TensorFillMissing(TensorProcessor):
 
 
 def build_tensor_processors(specs, context: TensorProcessorContext):
-    """Build the configured processor chain."""
+    """按配置建处理器链。"""
     processors = []
     for item in specs:
         if isinstance(item, str):
@@ -533,7 +485,7 @@ def build_tensor_processors(specs, context: TensorProcessorContext):
 
 
 def unit_scales_from_specs(specs):
-    """Extract unit_convert scales from a processor specification list."""
+    """从处理器配置里取 unit_convert 的 scales。"""
     for item in specs:
         if not isinstance(item, str) and item.get("name") == "unit_convert":
             return dict(item.get("scales", {}))

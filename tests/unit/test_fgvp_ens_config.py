@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""``configs/fgvp_ens.py`` 的单元测试：配置与集合模型契约之间的一致性（变更探测器，
+"""``configs/weather_era_0p25_fgvp_ens.py`` 的单元测试：配置与集合模型契约之间的一致性（变更探测器，
 思路同 ``test_fgvp_config.py``）。本档最要紧的两条不变量：``members=51`` 与集合
 模型类绑定（扰动是图内随机算子 + 51 次独立前向，改数字就是换语义）；
 ``model_processing`` 必须全空（归一化烘焙在图里，挂任何 Processor 都会叠加）。
@@ -9,8 +9,8 @@ from datetime import datetime
 
 import pytest
 
-from xmetai_inference.configs.base import InferConfig, load_config, parse_times
-from xmetai_inference.models import get_model_class
+from xmetai_inference.configs import InferConfig, load_config, parse_times
+from xmetai_inference.utils.model_factory import get_model_class
 
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
 
@@ -27,7 +27,7 @@ def _base_names(channels):
 
 @pytest.fixture(scope="module")
 def cfg():
-    return load_config("fgvp_ens")
+    return load_config("weather_era_0p25_fgvp_ens")
 
 
 @pytest.fixture(scope="module")
@@ -37,7 +37,7 @@ def model_cls(cfg):
 
 def test_loads_as_inferconfig_named_fgvp_ens(cfg):
     assert isinstance(cfg, InferConfig)
-    assert cfg.name == "fgvp_ens"
+    assert cfg.name == "weather_era_0p25_fgvp_ens"
 
 
 def test_model_class_is_the_ensemble_mamba_backbone(cfg, model_cls):

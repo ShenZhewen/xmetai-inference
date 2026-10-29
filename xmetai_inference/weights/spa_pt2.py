@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """潜空间 AR(1) 强迫 —— pt2（torch.export）后端的注入实现。
 
-与 ONNX 版语义同构：同一份 spec / 基，公式同为 ``z' = z ⊙ (1 + σ·U diag(ξ) Vᵀ)``。
-差别在接线方式：改写发生在加载后的内存图上（不落盘）；注入目标从 mlp_w2 权重占位符
-回溯到层末残差流；ξ 走 GraphModule 属性 ``spw_xi``（图签名固定，塞不进新输入），
-属性名必须用下划线，否则 fx codegen 会写出非法 Python。
+与 ONNX 版语义同构，差别在接线：改写发生在加载后的内存图上（不落盘），注入目标从
+mlp_w2 权重占位符回溯到层末残差流。ξ 走 GraphModule 属性 ``spw_xi``（图签名固定，
+塞不进新输入）；属性名必须用下划线，否则 fx codegen 会写出非法 Python。
 """
 from __future__ import annotations
 

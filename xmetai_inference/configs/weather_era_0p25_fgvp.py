@@ -1,8 +1,25 @@
 # -*- coding: utf-8 -*-
-"""iwc_fgvp_gdn2（FuXi-Ens 的 Gated DeltaNet 骨干变体）确定性推理。"""
+"""iwc_fgvp_gdn2（FuXi-Ens 的 Gated DeltaNet 骨干）确定性推理。
+
+契约同 FuXi-Ens（78 通道、2 帧历史、物理量进/出、归一化烘焙在图内）；自定义算子
+GatedDeltaNet2Fn 需 ops_library 注册，ORT 版本不符会在 ABI 报错。图只出预报帧，
+gpu_state 必须 False（2 帧进 1 帧出），load() 会断言拦下。
+"""
 import os
 
-from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.backends.onnx import OnnxInferModel
+from xmetai_inference.configs.base import (
+    FUXI_ENS_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+
+
+IwcFgvpGdn2Model = OnnxInferModel.declare(
+    "IwcFgvpGdn2Model",
+    model_name="iwc_fgvp_gdn2_onnx",
+    channels=FUXI_ENS_CHANNELS,      # 契约同 FuXi-Ens：78 通道 + GRID_025
+    grid=GRID_025,
+    windowed_output=False,           # 图只出预报帧，滑窗归 Rollout
+)
+
 
 ERA5_ROOT = os.environ.get(
     "ERA5_STORE_ROOT",
@@ -16,7 +33,7 @@ FGVP_DYNAMIC_STORES = [
 ]
 
 cfg = InferConfig(
-    name="fgvp",
+    name="weather_era_0p25_fgvp",
     model_path=os.environ.get(
         "FGVP_ONNX", "/workspace/tmp/douzsh/models/iwc_fgvp_gdn2_260901.onnx"),
     ops_library=os.environ.get(

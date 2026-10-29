@@ -33,7 +33,7 @@ def _rank_entropy(spec, member_index, slot):
 
 
 def _world_size() -> int:
-    """卡数（读 cli 设置的 WORLD_SIZE）；只在 ``demean_members`` 打开时用到。
+    """卡数（读 cli 设置的 WORLD_SIZE），只在 ``demean_members`` 打开时用到。
 
     slot 取 rank（cli 按 ``range(rank, members, world_size)`` 切成员），卡数不对
     就重放不出真实成员的 ξ 流。
@@ -64,8 +64,8 @@ class Ar1Driver:
         self.steps = 0
         # 时变幅度 a(t)，由 LatentStepStream 按 step 设置；1.0 = 不缩放。
         self.amp = 1.0
-        # 跨成员去均值：用真实成员的种子重放其他成员的 ξ 流来算均值。
-        # `_build_cohort=False` 供 cohort 内部使用，防无限递归。
+        # 跨成员去均值：用真实成员的种子重放其他人的 ξ 流来算均值；
+        # `_build_cohort=False` 防 cohort 无限递归。
         self.demean_members = int(getattr(spec, "demean_members", 0) or 0)
         self.cohort: list = []
         if _build_cohort and self.demean_members > 1:
@@ -84,8 +84,7 @@ class Ar1Driver:
     def _scaled(self, block: np.ndarray) -> np.ndarray:
         """给出口 ξ 乘 a(t)；amp == 1 时原样返回。
 
-        只作用于出口，绝不写回 ``self.state``：递推必须保持平稳单位方差，否则 τ
-        不再是相关时间。
+        只作用于出口，绝不写回 self.state：递推必须保持平稳单位方差，否则 τ 不再是相关时间。
         """
         if self.amp == 1.0:
             return block
@@ -157,12 +156,8 @@ class LatentStepStream:
     """潜空间 AR(1) 的驱动状态机；ONNX / PT2 后端各持一份。
 
     step 变化时整批推进一次并归零槽位；step == 0 表示新轨迹批，全部行重抽。
-    同一步内按调用次序发号，一次可消费 ``width`` 行（``model_batch > 1`` 时一次
-    forward 堆 k 条轨迹，块起点 = 前几块宽度之和），行数不够自动加宽。
-    返回起始行号，None = 未启用强迫。
-
-    ``width=1`` 与逐轨迹调用逐位相同。一次只吃 1 行却喂 k 条轨迹会让块内成员
-    几乎重复、集合静默欠散。
+    同一步内按调用次序发号，一次可消费 ``width`` 行。``width=1`` 与逐轨迹调用
+    逐位相同；一次只吃 1 行却喂 k 条轨迹会让块内成员几乎重复、集合静默欠散。
     """
 
     def __init__(self):
@@ -208,8 +203,7 @@ class LatentStepStream:
             amp_at = getattr(forcing, "amp_at", None)
             self.ar1.amp = float(amp_at(self.step)) if amp_at else 1.0
         index = self.slot
-        # 本块吃掉 width 行；下一块从 index + width 起
-        self.slot += width
+        self.slot += width    # 本块吃掉 width 行，下一块从 index + width 起
         return index
 
     def release(self):

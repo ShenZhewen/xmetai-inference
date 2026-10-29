@@ -20,7 +20,7 @@
 
 SPA 的**推理驱动**（ξ 递推 `Ar1Driver`、发号 `LatentStepStream`、诊断
 `lag1_autocorr`）不在本目录：在 `backends/spa.py`，由 ONNX 与 PT2
-后端共用。模型侧直接复用 `models/iwc_fgvp_mamba_ens.py` 的契约，不再有单独的
+后端共用。模型侧直接复用 `configs/weather_era_0p25_fgvp_ens.py` 的契约，不再有单独的
 SPA 选择器类。
 
 造产物没有命令行。改 `spw.py` / `spa.py` 末尾 `if __name__ == "__main__"` 里的字面量

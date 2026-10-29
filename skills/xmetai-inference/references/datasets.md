@@ -81,26 +81,34 @@ cfg = InferConfig(
 | `tp` | log1p(6h 累积 mm) | mm/6h ⇒ `denormalize` 的 `expm1_channels` |
 | 其余 | 物理量 | 直接用 |
 
-各模型的完整链已封装在 `configs/era5_stores.py` 的 `*_dataset()`（`fgvp_dataset`、
-`fuxi_ens_dataset`、`fuxi21_dataset`、`fengqing_dataset`、`pangu_dataset`），
-与各自 store2 版本的 processor 顺序、`fill_missing` 规则一一对应；`configs/fgvp_v3.py`
-是直接可跑的 A/B 示例。现用盘的 config **没有改**，切新盘只在显式调用这些函数时发生。
+切新盘的链就**直接写在配方的 `dataset.processors` 里**，没有共享的封装层。
+`configs/weather_era_0p25_fgvp_v3.py` 是直接可跑的 A/B 示例（与 `weather_era_0p25_fgvp.py` 只差 `dataset` / `output_dir`）；
+其余四家照上表 + 下表各写各的：
+
+| 模型 | 与 FGVP 的差别 |
+|---|---|
+| FuXi-Ens | 链同 FGVP（sst 的 `fill_missing` 同样要补） |
+| FuXi-2.1 | 再挂 `normalize`（`mean.nc`/`std.nc`，`log1p_channels=["tp"]`），`fill_missing` 填归一化 `0.0` |
+| 风清 | `q` ×1e-3、不吃辐射；新盘 tp 本身就是 6h 累积，不用再拼 tp store |
+| Pangu | 只 `q` ×1e-3，不碰辐射 / tp |
+
+现用盘（store2）的 config **一个都没改**，新盘只在 `weather_era_0p25_fgvp_v3.py` 里启用。
 
 ## 4. 三种数据源↔处理器链总表
 
 | store 形态 | 归一化落在哪 | `dataset.processors` 链 | `model_processing` | 配方 |
 |---|---|---|---|---|
-| 原始态 | 图内烘焙 | `unit_convert` → `geometry` →（可选）`fill_missing` | 三阶段恒等 | `fgvp.py` / `fengqing.py` |
-| 原始态 | 框架 mean.nc/std.nc | `unit_convert` → `geometry` → `normalize` → `fill_missing` | `recurrent`=`zero_channels`；`output`=`denormalize` | `fuxi21.py` |
-| **归一化态** | store（图头再收一遍） | `denormalize`（`stats_path`=store），**不配 geometry** | 三阶段恒等 | `tongyun_cra.py` |
-| **归一化态（超集）** | store | `denormalize`（`stats_path`=store，`expm1_channels` 视模型）→ `unit_convert` → `geometry` →（可选）`normalize`/`fill_missing` | 三阶段恒等 | `fgvp_v3.py`；其余见 `configs/era5_stores.py` |
+| 原始态 | 图内烘焙 | `unit_convert` → `geometry` →（可选）`fill_missing` | 三阶段恒等 | `weather_era_0p25_fgvp.py` / `weather_era_0p25_fengqing.py` |
+| 原始态 | 框架 mean.nc/std.nc | `unit_convert` → `geometry` → `normalize` → `fill_missing` | `recurrent`=`zero_channels`；`output`=`denormalize` | `weather_era_0p25_fuxi21.py` |
+| **归一化态** | store（图头再收一遍） | `denormalize`（`stats_path`=store），**不配 geometry** | 三阶段恒等 | `weather_cra_0p25_tongyun_ens.py` |
+| **归一化态（超集）** | store | `denormalize`（`stats_path`=store，`expm1_channels` 视模型）→ `unit_convert` → `geometry` →（可选）`normalize`/`fill_missing` | 三阶段恒等 | `weather_era_0p25_fgvp_v3.py` |
 
 ## 5. `fill_missing` 位置语义（原始态常见坑）
 
 `fill_missing` 放 `normalize` **前**还是**后**，决定填的是物理量还是归一化值：
 
 - normalize 之前填 → 填物理值
-- normalize 之后填 → 填归一化值（如 fuxi21 填 `0.0`，见 `configs/fuxi21.py:57-61`）
+- normalize 之后填 → 填归一化值（如 fuxi21 填 `0.0`，见 `configs/weather_era_0p25_fuxi21.py` 的 `fill_missing`）
 
 归一化态 store 一般不需要 `fill_missing`（值已标准化，mean/std 兜住）。
 

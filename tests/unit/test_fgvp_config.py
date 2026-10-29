@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""``configs/fgvp.py`` 的单元测试：配置与模型契约之间的一致性。
+"""``configs/weather_era_0p25_fgvp.py`` 的单元测试：配置与模型契约之间的一致性。
 
 config 是一串声明，写错大多不报错、只是静默不生效（单位换算键名拼错 = 悄悄不换算；
 ``vars`` 拼错 = 落盘少一个变量）。这里测的是**声明之间的一致性**，作用是变更探测器；
@@ -10,8 +10,9 @@ from datetime import datetime
 
 import pytest
 
-from xmetai_inference.configs.base import InferConfig, load_config, parse_times
-from xmetai_inference.models import FUXI_ENS_CHANNELS, get_model_class
+from xmetai_inference.configs import InferConfig, load_config, parse_times
+from xmetai_inference.configs import FUXI_ENS_CHANNELS
+from xmetai_inference.utils.model_factory import get_model_class
 
 #: 通道名去层号（z50 → z），带尾字母（t2m/u10m）和纯字母（ssr/msl/tp）原样。
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
@@ -32,7 +33,7 @@ def _base_names(channels):
 
 @pytest.fixture(scope="module")
 def cfg():
-    return load_config("fgvp")
+    return load_config("weather_era_0p25_fgvp")
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +43,7 @@ def model_cls(cfg):
 
 def test_loads_as_inferconfig_named_fgvp(cfg):
     assert isinstance(cfg, InferConfig)
-    assert cfg.name == "fgvp"
+    assert cfg.name == "weather_era_0p25_fgvp"
 
 
 def test_model_class_is_the_gdn2_backbone(cfg, model_cls):
