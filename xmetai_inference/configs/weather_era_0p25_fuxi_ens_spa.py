@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""FuXi-2.1 + SPA（潜空间 AR(1) 强迫），51 成员。
-
-默认臂 F32：注入 layer_stream 第 0/3/6 层；扫描时改 sigma / tau_days。
-"""
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
@@ -16,21 +12,21 @@ FUXI21_DYNAMIC_STORES = [
 ]
 
 cfg = InferConfig(
-    name="weather_era_0p25_fuxi_spa_ens",
+    name="weather_era_0p25_fuxi_ens_spa",
     model_path="/workspace/szwCode/xmetai-inference2/model_artifacts/fuxi2.1/fuxi-2.1.pt2",
     model_class="fuxi21_pt2",
     latent_forcing={
-        "targets": ("layer_stream:0,3,6",),  # 全 30 层写 ("layer_stream",)
+        "targets": ("layer_stream:0,3,6",),
         "sigma": 0.04,
         "tau_days": 3.0,
         "rank": 16,
         "length_scale": 32.0,
-        "grid": (120, 240),  # fx 推不出来，必须显式
+        "grid": (120, 240),
         "seed": 0,
         "hour_interval": 6.0,
         "verify_on_load": True,
     },
-    model_batch=1,  # pt2 的 ξ 缓冲无 batch 轴
+    model_batch=1,
 
     dataset={
         "type": "processed_multi_zarr",
@@ -88,7 +84,6 @@ cfg = InferConfig(
         ],
     ),
 
-    # 默认 3 起报是冒烟窗口，正式跑用 --times 覆盖。
     times="2025070100..2025070300:24",
     steps=60,
     hour_interval=6,

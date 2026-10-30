@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""FuXi-2.1 确定性推理（era5_foundation_store2 h6）。85 通道、2 帧进 1 帧出。
-
-前处理（unit_convert / normalize / fill_missing）在 dataset.processors；诊断通道
-zero_channels 与输出 denormalize 在 model_processing。
-"""
 import os
 
 from xmetai_inference.backends.pt2 import Pt2InferModel
@@ -14,7 +9,6 @@ from xmetai_inference.configs.base import (
 Fuxi21Pt2Model = Pt2InferModel.declare(
     "Fuxi21Pt2Model",
     model_name="fuxi21_pt2",
-    # 输入/输出 85 通道（C5 变量 × 13 层 + 20 地面）
     channels=FUXI21_CHANNELS,
     grid=GRID_025,
 )
@@ -35,7 +29,6 @@ FUXI21_DYNAMIC_STORES = [
 
 cfg = InferConfig(
     name="weather_era_0p25_fuxi21",
-    # 绝对路径：权重在旧仓库 xmetai-inference（无 2）；FUXI21_MODEL_PATH 可覆盖。
     model_path=os.environ.get(
         "FUXI21_MODEL_PATH",
         "/workspace/szwCode/xmetai-inference/model_artifacts/fuxi2.1/fuxi-2.1.pt2",

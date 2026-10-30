@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""FengQing V1.5Beta 确定性推理（tp 走 6h 累积补充 store）。"""
 import os
 from pathlib import Path
 
@@ -53,9 +52,7 @@ class FengqingPreOnnxModel(OnnxInferModel):
     input_channels = FENGQING_CHANNELS
     output_channels = FENGQING_CHANNELS
     grid = GRID_025
-    windowed_output = False  # 图只出预报帧，滑窗归 Rollout
-    # 1 = temporal_condition 取目标预报时刻（valid = init + (step+1)*interval）。
-    # 与 fuxi 系的「输入窗末帧时刻」不同，两者都有官方脚本背书，不要统一。
+    windowed_output = False
     valid_time_step_offset = 1
 
     def load(self, path):
@@ -88,11 +85,9 @@ class FengqingPreOnnxModel(OnnxInferModel):
                 f"res_std shape 不符：upper={res_upper_std.shape} "
                 f"surface={res_std_pre.shape}")
 
-        # 残差反演：next_norm = prev_norm + out·(res_std/std)
         self._upper_res_ratio = (res_upper_std / upper_std).reshape(1, 65, 1, 1)
         self._surface_res_ratio = (res_std_pre / surface_std).reshape(1, 5, 1, 1)
 
-        # tp 非负钳位：物理 0 = 归一化 -mean/std（mean 逐像素）。
         surface_mean = np.load(mean_std_dir / "mean_pre.npy").astype(np.float32)
         if surface_mean.shape != (5, 721, 1440):
             raise ValueError(f"mean_pre shape 不符：{surface_mean.shape}")
@@ -102,10 +97,9 @@ class FengqingPreOnnxModel(OnnxInferModel):
             -surface_mean[tp_index] / surface_std[tp_index, 0]
         ).astype(np.float32)
 
-        masks = np.load(masks_path).astype(np.float64)            # (3, 721, 1440)
+        masks = np.load(masks_path).astype(np.float64)
         if masks.shape != (3, 721, 1440):
             raise ValueError(f"constant_masks shape 不符：{masks.shape}")
-        # 逐掩膜标准化，同官方 utils/constant_masks.py（var 用 ddof=0 + 1e-5）
         standardized = []
         for arr in masks:
             flat = arr.reshape(-1)
@@ -131,7 +125,6 @@ class FengqingPreOnnxModel(OnnxInferModel):
             "spatial_condition": self._spatial_condition,
         })
         out_upper, out_surface = outputs
-        # 输出顺序保险：两个输出名是 21993/21994（tracing 未命名），反了要能自愈。
         if out_upper.shape[1] != 65 and out_surface.shape[1] == 65:
             out_upper, out_surface = out_surface, out_upper
         if out_upper.shape[1] != 65 or out_surface.shape[1] != 5:
@@ -143,13 +136,12 @@ class FengqingPreOnnxModel(OnnxInferModel):
         prev_surface = frames[-1, 65:][None]
         next_upper = prev_upper + out_upper * self._upper_res_ratio
         next_surface = prev_surface + out_surface * self._surface_res_ratio
-        # tp ≥ 0（在归一化空间等价钳位，见 load 里的 _tp_floor_norm）
         next_surface[:, self._tp_index] = np.maximum(
             next_surface[:, self._tp_index], self._tp_floor_norm)
 
-        pred = np.concatenate([next_upper, next_surface], axis=1)  # (1,70,H,W)
+        pred = np.concatenate([next_upper, next_surface], axis=1)
         return torch.as_tensor(
-            pred[:, None], dtype=state.dtype, device=state.device)  # (1,1,70,H,W)
+            pred[:, None], dtype=state.dtype, device=state.device)
 
 
 FENGQING_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/FengQing"
@@ -157,7 +149,6 @@ ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
 TP_ROOT = "/workspace/data/liujunjie/era5_tp_zarr"
 
 FENGQING_STORES = [
-    # 6h 累积 tp store 排最前，顶掉旧 sfc store 里 1h 的 tp。
     f"{TP_ROOT}/era5.202501-202607.c1.p25.h6.v1.lon180.zarr",
     f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
     f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
@@ -172,7 +163,7 @@ cfg = InferConfig(
         "type": "processed_multi_zarr",
         "paths": FENGQING_STORES,
         "processors": [
-            {"name": "unit_convert", "scales": {"tp": 1000.0}},  # 6h 累积 m → mm
+            {"name": "unit_convert", "scales": {"tp": 1000.0}},
             {"name": "geometry"},
             {"name": "normalize_fengqing"},
         ],
@@ -185,18 +176,16 @@ cfg = InferConfig(
         "drop_last": False,
     },
 
-    # 输入归一化在 dataset.processors，输出反归一化在这里。
     model_processing=ModelProcessingConfig(
         input=[],
         recurrent=[],
         output=[{"name": "denormalize_fengqing"}],
     ),
 
-    # 起报数须 = gpus×batch_size；hour_interval 是模型契约（类属性同 6）不可改。
     times="2025010200..2025122800:24",
     steps=60,
     hour_interval=6,
-    members=1,  # 确定性模型必须为 1
+    members=1,
     vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl,tp",
     gpus=2,
     cuda_devices="0,1",

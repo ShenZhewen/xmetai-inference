@@ -89,9 +89,9 @@ applicable to any model (as long as that model's backend implements support).
 
 The two are **orthogonal and composable**: SPA rewrites the graph, SPW rewrites the weights, and both can be enabled on
 the same model (currently only ONNX supports them together).
-Recipe examples: `weather_era_0p25_fgvp_spa.py`, `weather_era_0p25_fgvp_ens_spa.py` (SPA);
-`weather_era_0p25_fgvp_spw_ens.py`, `weather_era_0p25_fgvp_ens_spw.py` (SPW);
-`weather_era_0p25_fuxi_spa_ens.py` (SPA on PT2).
+Recipe examples: `weather_era_0p25_fgvp_ens_spa.py` (SPA);
+`weather_era_0p25_fgvp_ens_spw.py` (SPW);
+`weather_era_0p25_fuxi_ens_spa.py` (SPA on PT2).
 
 ## Supported Datasets
 
@@ -337,7 +337,7 @@ xmetai-infer --model s2s_cra_0p25_fengshun20_ens
 ```
 
 SPA/SPW variants are selected the same way, e.g. `--model weather_era_0p25_fgvp_ens_spa` or
-`--model weather_era_0p25_fgvp_spw_ens`; they differ from the base recipe only in the perturbation block,
+`--model weather_era_0p25_fgvp_ens_spw`; they differ from the base recipe only in the perturbation block,
 `model_path` (the rewritten graph / copied weights), and usually `resident_members`.
 
 Both `--model` and `--config` select a built-in run recipe (`configs/<name>.py`); the recipe declares the weight path,

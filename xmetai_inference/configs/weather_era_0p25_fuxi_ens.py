@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""FuXi-Ens 51 成员集合推理（era5_foundation_store2 h6）。
-
-归一化烘焙在图内（物理量进/出）；成员由图内随机算子自带，51 成员 = 51 次独立前向。
-"""
 import os
 
 from xmetai_inference.backends.onnx import OnnxInferModel
@@ -13,11 +9,11 @@ from xmetai_inference.configs.base import (
 FuxiEnsOnnxModel = OnnxInferModel.declare(
     "FuxiEnsOnnxModel",
     model_name="fuxi_ens_onnx",
-    channels=FUXI_ENS_CHANNELS,   # 78 = 5 变量 × 13 层 + 13 地面
+    channels=FUXI_ENS_CHANNELS,
     grid=GRID_025,
     forecast_type="ensemble",
     members=51,
-    gpu_state=True,               # 前后处理恒等，GPU 常驻安全
+    gpu_state=True,
 )
 
 
@@ -38,7 +34,6 @@ cfg = InferConfig(
         "FUXI_ENS_ONNX",
         "/workspace/szwCode/xmetai-inference/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
     ),
-    # 统一开关 XMETAI_GPU_STATE="1"/"0" 覆盖，未设时用本 config 默认（开）。
     gpu_state=os.environ.get("XMETAI_GPU_STATE", "1") == "1",
     model_class="fuxi_ens_onnx",
 

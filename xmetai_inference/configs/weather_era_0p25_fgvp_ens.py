@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""fgvp_ens：FGVP 集合预报（51 成员，图内随机算子出成员）。
-
-权重 iwc_gssp_im 带 .data 外部文件，需与 .onnx 同目录。契约同 FuXi-Ens（78 通道、
-2 帧、物理量进/出）；图只出预报帧，gpu_state 必须 False，load() 会断言拦下。
-"""
 from xmetai_inference.backends.onnx import OnnxInferModel
 from xmetai_inference.configs.base import (
     FUXI_ENS_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
@@ -12,11 +7,11 @@ from xmetai_inference.configs.base import (
 IwcFgvpMambaEnsModel = OnnxInferModel.declare(
     "IwcFgvpMambaEnsModel",
     model_name="iwc_fgvp_mamba_ens_onnx",
-    channels=FUXI_ENS_CHANNELS,      # 契约同 FuXi-Ens：78 通道 + GRID_025
+    channels=FUXI_ENS_CHANNELS,
     grid=GRID_025,
     forecast_type="ensemble",
     members=51,
-    windowed_output=False,           # 图只出预报帧，与 gpu_state=False 绑定
+    windowed_output=False,
 )
 
 
@@ -32,9 +27,9 @@ cfg = InferConfig(
     name="weather_era_0p25_fgvp_ens",
     model_path="/workspace/tmp/douzsh/models/20261008/iwc_gssp_im.onnx",
     ops_library="/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so",
-    gpu_state=False,  # 单步型图，GPU 常驻会跳过滑窗回填
+    gpu_state=False,
     model_class="iwc_fgvp_mamba_ens_onnx",
-    model_batch=6,   # 一次 forward 堆几条成员轨迹；图 batch 轴非符号维则退回 1
+    model_batch=6,
     gpu_mem=0.9,
 
     dataset={
@@ -61,7 +56,6 @@ cfg = InferConfig(
         ],
     },
     dataloader={
-        # batch_size 只影响数据装载分组；前向批见上面的 model_batch。
         "batch_size": 4,
         "num_workers": 4,
         "pin_memory": True,

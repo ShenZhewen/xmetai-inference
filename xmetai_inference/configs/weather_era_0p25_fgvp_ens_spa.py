@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Tongyun 集合图（ERA5 版）+ SPA（潜空间 AR(1) 强迫）。78 通道 / 2 帧进 / 1 帧出。"""
 from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
 
 ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
@@ -9,7 +8,7 @@ FGVP_DYNAMIC_STORES = [
     f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
     f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
 ]
-SRC_GRAPH = "/workspace/tmp/douzsh/models/20261013/tongyun_ens_era5_fp16.onnx"  # 20261013 导出
+SRC_GRAPH = "/workspace/tmp/douzsh/models/20261013/tongyun_ens_era5_fp16.onnx"
 OPS_LIBRARY = "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so"
 MODEL_ONNX_DIR = "/workspace/data/shenzw/model_onnx"
 
@@ -17,10 +16,10 @@ cfg = InferConfig(
     name="weather_era_0p25_fgvp_ens_spa",
     model_path=SRC_GRAPH,
     ops_library=OPS_LIBRARY,
-    gpu_state=False,  # 单帧输出图，不能开 GPU 常驻
+    gpu_state=False,
     model_class="iwc_fgvp_mamba_ens_onnx",
     latent_forcing={
-        "targets": ("add_35722", "add_35727", "add_35732"),  # 三组 decoder 入口
+        "targets": ("add_35722", "add_35727", "add_35732"),
         "sigma": 0.04,
         "tau_days": 3.0,
         "rank": 16,
@@ -84,7 +83,7 @@ cfg = InferConfig(
     gpus=4,
     cuda_devices="0,1,2,3",
     intra_op_threads=0,
-    cudnn_algo_search="EXHAUSTIVE",  # Tongyun stem 卷积在 HEURISTIC 下建不起来
+    cudnn_algo_search="EXHAUSTIVE",
     resident_members=2,
     output_dir="/workspace/data/shenzw/fgvp_spa_tongyun_spa",
 )

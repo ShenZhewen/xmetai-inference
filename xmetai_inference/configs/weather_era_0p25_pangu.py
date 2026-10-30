@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Pangu-Weather 确定性推理（6h 步进 + 24h 跳步，实现在模型类内）。License：BY-NC-SA 4.0 非商用。"""
 import os
 from pathlib import Path
 
@@ -11,8 +10,7 @@ from xmetai_inference.backends.onnx import OnnxInferModel
 from xmetai_inference.configs.base import (
     GRID_025, PANGU_CHANNELS, InferConfig, ModelProcessingConfig)
 
-# 上层/地面通道切分点（PANGU_CHANNELS = 5 变量 × 13 层 + 4 地面）。
-_N_UPPER = 5 * 13       # 65
+_N_UPPER = 5 * 13
 _N_SFC = 4
 
 
@@ -29,14 +27,12 @@ class PanguOnnxModel(OnnxInferModel):
     input_channels = PANGU_CHANNELS
     output_channels = PANGU_CHANNELS
     grid = GRID_025
-    history_steps = 1        # 只吃当前帧，滑窗归 Rollout
-    windowed_output = False  # 图只出预报帧，不回显输入窗
+    history_steps = 1
+    windowed_output = False
 
     def load(self, path):
-        # 6h 步进模型：基类单会话加载，self.session 即 6h 会话。
         super().load(path)
         self._sess_6 = self.session
-        # 24h 跳步模型：与 6h 同目录的 pangu_weather_24.onnx，环境变量可覆盖。
         env_24 = os.environ.get("PANGU_ONNX_24")
         path_24 = env_24 or str(Path(path).resolve().parent / "pangu_weather_24.onnx")
         self._sess_24 = self._make_session(path_24)
@@ -74,16 +70,14 @@ class PanguOnnxModel(OnnxInferModel):
         返回 (1, 1, 69, H, W)。
         """
         state = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
-        flat = state.detach().cpu().numpy().astype(np.float32)[0, 0]   # (69, H, W)
+        flat = state.detach().cpu().numpy().astype(np.float32)[0, 0]
         upper, surface = self._split(flat)
 
-        # 锚点键 = init_time = valid_time - step*interval（offset=0 时成立）。
         key = pd.to_datetime(valid_time) - pd.Timedelta(hours=step * self.hour_interval)
         if key not in self._anchors:
-            self._anchors[key] = (upper, surface)   # step 0：存起报态
+            self._anchors[key] = (upper, surface)
 
         if (step + 1) % 4 == 0:
-            # 24h 跳步：从锚点直接跳，并更新锚点。
             anchor_upper, anchor_surface = self._anchors[key]
             out_upper, out_surface = self._run(
                 self._sess_24, anchor_upper, anchor_surface)
@@ -93,9 +87,9 @@ class PanguOnnxModel(OnnxInferModel):
 
         h, w = flat.shape[-2], flat.shape[-1]
         pred = np.concatenate(
-            [out_upper.reshape(_N_UPPER, h, w), out_surface], axis=0)  # (69, H, W)
+            [out_upper.reshape(_N_UPPER, h, w), out_surface], axis=0)
         return torch.as_tensor(
-            pred[None, None], dtype=state.dtype, device=state.device)   # (1, 1, 69, H, W)
+            pred[None, None], dtype=state.dtype, device=state.device)
 
 
 PANGU_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/Pangu-Weather-main"
@@ -108,7 +102,6 @@ PANGU_STORES = [
 
 cfg = InferConfig(
     name="weather_era_0p25_pangu",
-    # 6h 步进图；24h 图由模型类推导，可用 PANGU_ONNX_24 覆盖。
     model_path=f"{PANGU_ROOT}/pangu_weather_6.onnx",
     model_class="pangu_onnx",
 
@@ -132,7 +125,7 @@ cfg = InferConfig(
     times="2025010200..2025122500:24",
     steps=60,
     hour_interval=6,
-    members=1,  # 确定性模型必须为 1
+    members=1,
     vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl",
     gpus=1,
     cuda_devices="0",
