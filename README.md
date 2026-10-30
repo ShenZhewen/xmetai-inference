@@ -244,7 +244,6 @@ and output representation.
 │   ├── backends/            # BaseInferModel + onnx / pt2 execution engines
 │   └── configs/             # Run recipes (`--config <name>`) + declared model contracts;
 │                            #   base.py = shared GRID/channels + InferConfig/load_config
-├── docs/                    # Model artifact layout & export conventions
 ├── tests/                   # Unit + integration tests (integration runs only with `-m realdata`)
 └── model_artifacts/         # Local model artifacts; the whole directory is excluded from Git
 ```
