@@ -26,7 +26,6 @@ zarr = [
 ]
 onnx = [
     "onnxruntime",
-    "onnx",          # 权重扰动（图内注入）需要改写 ONNX 图
 ]
 # 跑测试：pytest 本体，加上集成测试要用的读数据后端（realdata 档只在这些都在时才跑）。
 # 安装：pip install -e ".[dev]"
@@ -45,12 +44,6 @@ xmetai-infer = "xmetai_inference.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["xmetai_inference*"]
-
-[tool.setuptools.package-data]
-# weights/ 现在是 Python 包（SPA/SPW 图手术代码），README 挂在包目录下。
-"xmetai_inference.weights" = [
-    "README.md",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

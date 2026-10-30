@@ -62,7 +62,6 @@ def test_fengshun20_feeds_raw_hour_and_unclipped_doy():
 def test_fengshun20_no_longer_overrides_forward():
     cls = get_model_class("fengshun20_onnx")
     assert "forward" not in vars(cls)
-    assert cls.supports_latent_forcing is True
 
 
 @pytest.mark.parametrize("features", [

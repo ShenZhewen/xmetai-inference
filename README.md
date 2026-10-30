@@ -66,37 +66,19 @@ Normalization files/certain processors align names with underscores stripped (ca
 a superset of the model channels — but every requested channel must exist, or construction fails loudly.
 
 > There are two model-naming schemes — don't mix them: **config names** (for `--model` / `--config`) follow
-> `<domain>_<source>_<resolution>_<model>[_spa|_spw][_ens]`: `domain` = `weather` (15-day, 6-hourly) or `s2s`
+> `<domain>_<source>_<resolution>_<model>[_ens]`: `domain` = `weather` (15-day, 6-hourly) or `s2s`
 > (subseasonal, daily steps); `source` = `era` (ERA5) or `cra` (CRA-40); `resolution` = `0p25` (0.25°) or `1p5`.
 > The trailing `_ens` marks an ensemble output when the model name doesn't already contain `ens`
 > (deterministic configs carry no suffix).
 > Examples: `weather_era_0p25_fuxi_ens`, `weather_cra_0p25_tongyun_ens`, `s2s_cra_0p25_fengshun20_ens`,
-> `weather_era_0p25_fgvp_ens_spa`. Each maps to the eponymous recipe file under `configs/`;
+> `weather_era_0p25_fgvp_ens`. Each maps to the eponymous recipe file under `configs/`;
 > **model-class registry names** (the `model_class=` in recipes, e.g. `fuxi_ens_onnx`, `fuxi21_pt2`,
 > `iwc_fgvp_gdn2_onnx`, `iwc_fgvp_mamba_ens_onnx`, `fengqing_pre_onnx`, `pangu_onnx`,
 > `tongyun_cra_ens_onnx`, `fengshun20_onnx`) map to `MODEL_REGISTRY` in `utils/model_factory.py`.
 
-### Perturbation Schemes SPA / SPW (composable on any model)
-
-SPA and SPW are two **perturbation schemes**, not standalone base models — they act on a base model to turn a
-deterministic model into an ensemble (or to perturb an existing ensemble), and are **decoupled from the base model**,
-applicable to any model (as long as that model's backend implements support).
-
-| Scheme | What it does | Declared by | Key parameters | Supported backends |
-|---|---|---|---|---|
-| **SPA** | Latent-space AR(1) noise forcing: injects time-evolving AR(1) random noise into the model's **latent state**; members = different noise samples | `latent_forcing` | `targets` (injection points), `sigma`, `tau_days`, `rank`, `length_scale`, `seed` | ONNX (graph rewrite), PT2 (fx graph rewrite) |
-| **SPW** | Weight perturbation: perturbs specified weight tensors under **energy balance** to produce a set of member weight copies; members = different weight copies | `weight_perturb` | `groups`, `sigma_full`, `balance`, `noise_struct`, `seed` | ONNX |
-
-The two are **orthogonal and composable**: SPA rewrites the graph, SPW rewrites the weights, and both can be enabled on
-the same model (currently only ONNX supports them together).
-Recipe examples: `weather_era_0p25_fgvp_ens_spa.py` (SPA);
-`weather_era_0p25_fgvp_ens_spw.py` (SPW);
-`weather_era_0p25_fuxi_ens_spa.py` (SPA on PT2).
-
 ## Supported Datasets
 
-All datasources are ingested via `processed_multi_zarr`, backed by `xmetai-core`'s `MultiZarrDataset`
-(see `skills/xmetai-inference/references/datasets.md` for the full intake checklist).
+All datasources are ingested via `processed_multi_zarr`, backed by `xmetai-core`'s `MultiZarrDataset`.
 
 ### Dataset Spec
 
@@ -125,7 +107,7 @@ File names encode channel count, resolution, and step (`c84.p25.h6` = 84 channel
 
 | Store | Channels | Coverage / step | Layout | Orientation | What it holds | Used by |
 |---|---|---|---|---|---|---|
-| `era5_foundation_store2/era5_pl_...c84.p25.h6.zarr` | 84 | 2025-01 … 2026-07, 6h | **Raw** | north→south | Upper-air pressure-level fields | fuxi_ens, fuxi21, fgvp, fgvp_ens, fengqing, pangu (and SPA/SPW variants) |
+| `era5_foundation_store2/era5_pl_...c84.p25.h6.zarr` | 84 | 2025-01 … 2026-07, 6h | **Raw** | north→south | Upper-air pressure-level fields | fuxi_ens, fuxi21, fgvp, fgvp_ens, fengqing, pangu |
 | `.../era5_sfc_...c15.p25.h6.zarr` | 15 | same | **Raw** | north→south | Surface fields; `tp`/radiation are 1h accumulations | same as above |
 | `.../era5_cldrad_...c8.p25.h6.zarr` | 8 | same | **Raw** | north→south | Radiation and cloud-cover channels | fuxi_ens, fuxi21, fgvp, fgvp_ens |
 | `.../era5_soil_...c4.p25.h6.zarr` | 4 | same | **Raw** | north→south | Soil channels | listed by fuxi21, but no soil channel is in its 85-channel set (selected channels come from pl/sfc/cldrad) |
@@ -216,8 +198,7 @@ Model-side processors run in the main process (`utils/model_processors.py`):
 | fgvp_v3 | `denormalize` (expm1 tp) → `unit_convert` (rad×6) → `geometry` → `fill_missing` (sst) | — | — |
 
 Configs still default to the raw store2 root; `configs/weather_era_0p25_fgvp_v3.py` is an opt-in A/B recipe for the
-v3 stores, and `skills/xmetai-inference/references/datasets.md` lists the per-model differences for porting the
-other four ERA5 models to v3.
+v3 stores.
 
 ### Adding a New Model / Dataset
 
@@ -227,11 +208,11 @@ other four ERA5 models to v3.
 2. Pick the store from the inventory, decide raw vs normalized, then write the `dataset.processors` chain from the
    tables above.
 3. Write the recipe under `configs/<name>.py` with a module-level `cfg = InferConfig(...)`, following the naming
-   convention `<domain>_<source>_<resolution>_<model>[_spa|_spw][_ens]`.
+   convention `<domain>_<source>_<resolution>_<model>[_ens]`.
 4. Run one init time with `--steps 1` first to confirm shapes, units, and orientation, then scale up.
 
-The questionnaire in `skills/xmetai-inference/references/model-contracts.md` lists every contract point that is easy
-to get silently wrong (channel order, units, diagnostic channels, NaN channels, output representation).
+The contract points that are easy to get silently wrong are channel order, units, diagnostic channels, NaN channels,
+and output representation.
 
 ## Key Features
 
@@ -261,10 +242,9 @@ to get silently wrong (channel order, units, diagnostic channels, NaN channels, 
 │   │                        #   model_factory (MODEL_REGISTRY / get_model_class / create_model),
 │   │                        #   model-side pipeline (recurrent/output), data-side tensor processors, logging
 │   ├── backends/            # BaseInferModel + onnx / pt2 execution engines
-│   ├── weights/             # SPA (latent forcing) / SPW (weight perturbation) implementations
 │   └── configs/             # Run recipes (`--config <name>`) + declared model contracts;
 │                            #   base.py = shared GRID/channels + InferConfig/load_config
-├── skills/                  # Integration guide: this skill (SKILL.md routing hub + references/ details)
+├── docs/                    # Model artifact layout & export conventions
 ├── tests/                   # Unit + integration tests (integration runs only with `-m realdata`)
 └── model_artifacts/         # Local model artifacts; the whole directory is excluded from Git
 ```
@@ -336,10 +316,6 @@ xmetai-infer --model weather_cra_0p25_tongyun_ens
 xmetai-infer --model s2s_cra_0p25_fengshun20_ens
 ```
 
-SPA/SPW variants are selected the same way, e.g. `--model weather_era_0p25_fgvp_ens_spa` or
-`--model weather_era_0p25_fgvp_ens_spw`; they differ from the base recipe only in the perturbation block,
-`model_path` (the rewritten graph / copied weights), and usually `resident_members`.
-
 Both `--model` and `--config` select a built-in run recipe (`configs/<name>.py`); the recipe declares the weight path,
 dataset, preprocessing chain, initialization times, step count, card count, and output directory. Initialization times,
 steps, member count, GPU count, and output directory can be overridden on the command line
@@ -366,8 +342,7 @@ xmetai-infer --model weather_era_0p25_fuxi_ens \
 - `--model-path` replaces the recipe's weight file; `--model` selects the recipe.
 - `--times` syntax is documented in [configs/base.py `parse_times`](xmetai_inference/configs/base.py): a single
   `2025010600`, a comma-separated list, a closed interval `A..B` (24h step by default), and `:N` to override the step.
-- An external `.py` recipe loads via `xmetai-infer /path/to/config.py` (or `--config`); how to add a new model /
-  dataset / processor is covered in [skills/xmetai-inference](skills/xmetai-inference/).
+- An external `.py` recipe loads via `xmetai-infer /path/to/config.py` (or `--config`); see `configs/` for examples.
 
 ## Configuration Reference
 

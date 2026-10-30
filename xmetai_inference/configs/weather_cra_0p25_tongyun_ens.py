@@ -25,7 +25,6 @@ cfg = InferConfig(
     ops_library=OPS_LIBRARY,
     gpu_state=False,
     model_class="tongyun_cra_ens_onnx",
-    perturb_graphs=0,
     model_batch=6,
     gpu_mem=0.9,
 
@@ -55,6 +54,5 @@ cfg = InferConfig(
     cuda_devices="0",
     intra_op_threads=0,
     cudnn_algo_search="EXHAUSTIVE",
-    resident_members=2,
     output_dir="/workspace/data/shenzw/tongyun_cra",
 )

@@ -173,20 +173,11 @@ class InferConfig:
     output_processors: Any = None
     ops_library: str = ""                    # 自定义算子库 .so（空 = 标准模型）
     gpu_state: Any = None                    # None = 用模型类默认；True/False 可覆盖
-    weight_perturb: Any = None               # 权重扰动（SPW），dict 见 weights.spw
-    # 潜空间 AR(1) 强迫（SPA）：只给图加一个 spw/xi 输入、不改权重，与上者正交。
-    latent_forcing: Any = None
-    # 集合模型 + 权重扰动：把 members 个成员摊到 G 份扰动图上，按图切多卡。
-    #   0 = 不启用（走 m1a）；G>=1 要求模型类 forecast_type="ensemble"。
-    perturb_graphs: int = 0
     intra_op_threads: int = 0                # 0 = ORT 默认
     cudnn_algo_search: str = ""              # "" = EXHAUSTIVE
     # 一次 forward 堆几条轨迹（前向批，不是 dataset 的 batch_size）。要求图的 batch
     # 轴是符号维且不与 gpu_state=True 同用；显存按此倍数涨。
     model_batch: int = 1
-    # 常驻 session 池额度：1 = 一换一，N = 最多 N 份，-1 = 全常驻。
-    # 只在配了 weight_perturb 时有意义（latent_forcing 共享同一份 session）。
-    resident_members: int = 1
     dataset: Any = None
     dataloader: Any = field(default_factory=dict)
     data_root: str = ""                      # 可选覆盖数据源根目录（保留字段；当前 Dataset 使用绝对路径）

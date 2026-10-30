@@ -16,7 +16,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 
 # Allow `python xmetai_inference/cli.py --config ...` without installing the package.
 if __package__ in (None, ""):
@@ -210,8 +209,6 @@ def _build_infer_argv(cfg, overrides, *, scope=None, intra_op_threads=0):
         "--log-level", str(_pick(overrides, "log_level", cfg.log_level)),
         "--intra-op-threads", str(int(intra_op_threads or 0)),
         "--cudnn-algo-search", str(cfg.cudnn_algo_search or ""),
-        # resident_members 与 intra_op_threads 同类：属于「这份配方怎么跑」，命令行不开放。
-        "--resident-members", str(int(cfg.resident_members or 1)),
     ]
     interval = scope["interval"]
     if interval:
@@ -420,230 +417,6 @@ def _config_main(argv=None):
     return _run_infer(cfg, overrides)
 
 
-def _fmt_index_ranges(indices):
-    """[0, 4, 5, 6, 7] -> "0,4-7"；日志里 13 个成员号不必逐个列。"""
-    if not indices:
-        return "-"
-    parts, start, previous = [], indices[0], indices[0]
-    for value in list(indices[1:]) + [None]:
-        if value is not None and value == previous + 1:
-            previous = value
-            continue
-        parts.append(str(start) if start == previous else f"{start}-{previous}")
-        if value is not None:
-            start = previous = value
-    return ",".join(parts)
-
-
-def _graph_member_split(members, graphs):
-    """把 members 个成员均分到 graphs 份扰动图上（余数给前面的图），每份非空。
-
-    成员 m = 第 g 份冻结权重 × 该图 session 内的第 j 次前向。返回 [(graph_id, [成员号])]。
-    """
-    if graphs < 1:
-        raise ValueError(f"graphs 必须 >= 1，拿到 {graphs}")
-    if members < graphs:
-        raise ValueError(f"members({members}) < graphs({graphs})：会有图分不到成员")
-    base, rem = divmod(members, graphs)
-    out, start = [], 0
-    for graph_id in range(graphs):
-        size = base + (1 if graph_id < rem else 0)
-        out.append((graph_id, list(range(start, start + size))))
-        start += size
-    return out
-
-
-def _prepare_member_set(src, spec, count, member_indices, local_rank, world_size):
-    """m1a：生成本 rank 那一份成员，然后等齐本 rank 要跑的那些成员。
-
-    分片 ``range(rank, count, world_size)`` 必须互不相交：成员文件是直接 "wb" 打开的，
-    两个 rank 同时造同一个成员会写出交错字节且不报错。
-    """
-    # 惰性导入：backends.base 顶层 import torch，而 --help / 配置清单这条路不该被拖上 torch。
-    from xmetai_inference.backends.base import _fmt_dur
-    from xmetai_inference.weights.spw import build_member_set, member_exists
-
-    shard = list(range(local_rank, count, world_size))
-    # 只造本 rank 分片里还不在盘上的：build_member_set 不查存在性就直接覆盖，
-    # 不过滤会把已有的成员重算一遍（每组几十 GB 的读写）。
-    todo = [i for i in shard if not member_exists(src, spec, i)]
-    if todo:
-        t0 = perf_counter()
-        report = build_member_set(src, spec, count, indices=todo)
-        log.info("M1a 成员集：本 rank 生成 %d/%d 个成员（分片 %s，用时 %s），目录 %s",
-                 len(todo), count, _fmt_index_ranges(todo),
-                 _fmt_dur(perf_counter() - t0), report["set_dir"])
-        log.info("  被扰动元素 %.2fM/成员，sigma: %s",
-                 report["perturbed_elements"] / 1e6,
-                 ", ".join(f"{k}={v:.6g}" for k, v in report["sigmas"].items()))
-        for warning in report["warnings"]:
-            log.warning("[SPW] %s", warning)
-    else:
-        log.info("M1a 成员集：本 rank 要用的 %d 个成员都已在盘上，跳过生成",
-                 len(member_indices))
-
-    missing = [i for i in member_indices if not member_exists(src, spec, i)]
-    if missing:
-        deadline = time.monotonic() + 3600
-        log.info("等待其它 rank 生成剩余成员（%s）...", missing[:8])
-        while missing and time.monotonic() < deadline:
-            time.sleep(5)
-            missing = [i for i in member_indices if not member_exists(src, spec, i)]
-        if missing:
-            raise RuntimeError(
-                f"等了 1 小时，成员 {missing[:8]} 仍未生成。请检查是否有 rank 提前退出"
-                "（某个 rank 挂了，它负责的那片成员就永远造不出来）。")
-
-
-def _pool_summary(model):
-    """常驻 session 池的计数摘要（收尾日志用）；没有新建过 session 时返回空串。"""
-    stats = getattr(model, "pool_stats", None)
-    if stats is None:
-        return ""
-    info = stats()
-    if not info.get("builds"):
-        return ""
-    return "；session 池：新建 %d 份、命中 %d 次、换出 %d 份（额度 %s）" % (
-        info["builds"], info["hits"], info["evictions"],
-        "不限" if info["budget"] < 0 else info["budget"])
-
-
-def _run_member_outer(model, processors, dataloader, writer, args, init_times,
-                      member_indices, save_names, lat, lon, interval, local_rank,
-                      world_size):
-    """m1a 的集合编排：成员在外层、数据集在内层（每个成员把数据集走一遍）。
-
-    每个成员是另一份冻结权重，同时驻留多份会吃光显存，所以缺省一换一放；
-    调大 resident_members 则按 LRU 常驻，省去重建与 cuDNN 预热。
-    """
-    from xmetai_inference.backends.base import _fmt_dur
-
-    total_t0 = perf_counter()
-    _run_member_block(
-        model, processors, dataloader, writer, args, init_times, member_indices,
-        save_names, lat, lon, interval, local_rank, world_size)
-    errors = writer.close()
-    if errors:
-        log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))
-        return 1
-    log.info("全部完成：成员=%d steps=%d output=%s 总耗时=%.1fs%s",
-             len(member_indices), args.steps, args.out,
-             perf_counter() - total_t0, _pool_summary(model))
-    return 0
-
-
-def _run_member_block(model, processors, dataloader, writer, args, init_times,
-                      member_indices, save_names, lat, lon, interval, local_rank,
-                      world_size, model_batch=1):
-    """逐成员跑完 member_indices：每人先 load，再逐 batch 走一遍数据集并 flush。"""
-    from xmetai_inference.backends.base import _fmt_dur
-    from xmetai_inference.utils.runner import Rollout, Trajectory
-
-    release = getattr(model, "release", None)
-    for order, member_id in enumerate(member_indices, 1):
-        model.member_index = member_id
-        t_member = perf_counter()
-        model.load(args.model)
-        log.info("[%d/%d] member_%03d 权重就绪，加载耗时 %s",
-                 order, len(member_indices), member_id,
-                 _fmt_dur(perf_counter() - t_member))
-        completed = 0
-        for data_batch_index, batch in enumerate(dataloader):
-            t_fetch = perf_counter()
-            state, batch_inits = model.prepare_dataset_batch(batch)
-            if data_batch_index == 0:
-                log.info("  member_%03d 首个 batch 就绪：state 形状 %s，装载+前处理耗时 %s",
-                         member_id, tuple(state.shape), _fmt_dur(perf_counter() - t_fetch))
-
-            def on_step(step, step_state, batch_inits=batch_inits, member_id=member_id):
-                step_idx = step + 1
-                for batch_index, init in enumerate(batch_inits):
-                    member_ds = model.to_dataset(
-                        step_state[batch_index],
-                        save_names=save_names,
-                        lat=lat,
-                        lon=lon,
-                    )
-                    writer.put(
-                        f"{_output_init_dir(init)}/member_{member_id:03d}/{step_idx:03d}.nc",
-                        member_ds,
-                        raw=(step_state[batch_index], step, init),
-                    )
-
-            Rollout(model, processors).run(
-                [
-                    Trajectory(
-                        state=state[b:b + 1],
-                        init_time=init,
-                        label=f"member_{member_id:03d}",
-                    )
-                    for b, init in enumerate(batch_inits)
-                ],
-                steps=args.steps,
-                hour_interval=interval,
-                on_step=on_step,
-                progress=False,
-                progress_label=f"[rank {local_rank}/{world_size}] m{member_id:03d}",
-                model_batch=model_batch,
-            )
-            writer.flush()
-            completed += len(batch_inits)
-            log.info("  member_%03d 起报进度：%d/%d，本批耗时 %s",
-                     member_id, completed, len(init_times),
-                     _fmt_dur(perf_counter() - t_fetch))
-            del state
-            gc.collect()
-        # 最后一个成员不放手：跑完就退出，放了只是让池子里那份 session 提前销毁。
-        if release is not None and order < len(member_indices):
-            release()
-            gc.collect()
-        log.info("member_%03d 完成，总耗时 %s",
-                 member_id, _fmt_dur(perf_counter() - t_member))
-
-
-def _run_graph_outer(model, processors, dataloader, writer, args, init_times,
-                     graph_members, save_names, lat, lon, interval, local_rank,
-                     world_size, num_workers=0, model_batch=1):
-    """集合模型 + 权重扰动的编舞：扰动图在外层，图内成员在内层。
-
-    每份扰动图 load 后复用 _run_plain_block 的 members>1 分支；多卡按图切。
-    model.member_index 在此路径下是图号，全局成员号只决定输出目录。
-    """
-    from xmetai_inference.backends.base import _fmt_dur
-
-    total_t0 = perf_counter()
-    release = getattr(model, "release", None)
-    for order, (graph_id, member_ids) in enumerate(graph_members, 1):
-        model.member_index = graph_id
-        t_graph = perf_counter()
-        model.load(args.model)
-        log.info("[%d/%d] 扰动图 m%03d 权重就绪（服务成员 %03d..%03d 共 %d 个），"
-                 "加载耗时 %s",
-                 order, len(graph_members), graph_id,
-                 member_ids[0], member_ids[-1], len(member_ids),
-                 _fmt_dur(perf_counter() - t_graph))
-        _run_plain_block(
-            model, processors, dataloader, writer, args, member_ids,
-            save_names, lat, lon, interval, local_rank, world_size,
-            members=len(member_ids), total_inits=len(init_times),
-            num_workers=num_workers, model_batch=model_batch)
-        # 最后一份图不放手：跑完就退出，放了只会让池子提前销毁（与 m1a 同款理由）。
-        if release is not None and order < len(graph_members):
-            release()
-            gc.collect()
-        log.info("扰动图 m%03d 完成（%d 个成员），总耗时 %s",
-                 graph_id, len(member_ids), _fmt_dur(perf_counter() - t_graph))
-    errors = writer.close()
-    if errors:
-        log.error("写盘阶段发生 %d 个错误，任务失败", len(errors))
-        return 1
-    total_members = sum(len(ids) for _, ids in graph_members)
-    log.info("全部完成：扰动图=%d 成员=%d steps=%d output=%s 总耗时=%.1fs%s",
-             len(graph_members), total_members, args.steps, args.out,
-             perf_counter() - total_t0, _pool_summary(model))
-    return 0
-
-
 def _run_plain_block(model, processors, dataloader, writer, args, member_indices,
                      save_names, lat, lon, interval, local_rank, world_size, members,
                      total_inits, num_workers=0, model_batch=1):
@@ -777,7 +550,7 @@ def _check_model_batch(model_batch, *, gpu_state, has_recurrent):
 
 
 def _worker_main(argv=None):
-    from xmetai_inference.backends.base import _fmt_dur, normalize_budget
+    from xmetai_inference.backends.base import _fmt_dur
     from xmetai_inference.utils.dataloader_factory import create_dataloader
     from xmetai_inference.configs import grid_coords
     from xmetai_inference.utils.model_factory import create_model, get_model_class
@@ -818,9 +591,6 @@ def _worker_main(argv=None):
                    help="ORT intra_op 线程数（0 = 不设置，用 ORT 默认）")
     p.add_argument("--cudnn-algo-search", default="",
                    help="cuDNN 卷积算法搜索（HEURISTIC 可缩短每卡多进程的启动预热）")
-    p.add_argument("--resident-members", type=int, default=None,
-                   help="常驻 session 池额度（1=一换一放 / N=驻留 N 份 / -1=全常驻）；"
-                        "缺省时以 config 的 resident_members 为准")
     args = p.parse_args(argv)
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -838,10 +608,6 @@ def _worker_main(argv=None):
 
     # 每个 worker 重新加载同一 config，确保外部 Model/Dataset 在多进程中可用。
     worker_cfg = load_config(args.config_source)
-    # 常驻池额度优先级：worker 参数 > config > 1；负数 = 不限。
-    resident_members = normalize_budget(
-        args.resident_members if args.resident_members is not None
-        else getattr(worker_cfg, "resident_members", 1))
     model_spec = worker_cfg.model_class
     try:
         cls = get_model_class(model_spec)
@@ -856,39 +622,7 @@ def _worker_main(argv=None):
     history = args.history or getattr(cls, "history_steps", 2)
     # 集合/确定性显式化：members 缺省从模型类读；类型与成员数不一致时告警（不报错）
     forecast_type = getattr(cls, "forecast_type", "deterministic")
-    perturb_spec = None
-    if worker_cfg.weight_perturb:
-        from xmetai_inference.weights.spw import WeightPerturbSpec
-
-        perturb_spec = WeightPerturbSpec.from_config(worker_cfg.weight_perturb)
-    if perturb_spec is not None:
-        # 权重扰动把确定性模型变成集合。m3 的成员是同一 session 里的 N 条轨迹；
-        # m1a 的成员是 N 份冻结权重。
-        forecast_type = "ensemble"
-    if worker_cfg.latent_forcing:
-        # 潜空间强迫同样出集合：成员差异来自每步喂入的 xi，同一份图服务全部成员。
-        forecast_type = "ensemble"
     members = args.members if args.members is not None else getattr(cls, "members", 1)
-    # 集合 + perturb_graphs：成员 = 扰动图 × 图内随机，走图外层编舞。
-    n_graphs = int(getattr(worker_cfg, "perturb_graphs", 0) or 0)
-    graph_outer = perturb_spec is not None and n_graphs > 0
-    if graph_outer:
-        if getattr(cls, "forecast_type", "deterministic") != "ensemble":
-            raise SystemExit(
-                f"perturb_graphs={n_graphs} 只适用于集合模型类（图内随机算子出成员），"
-                f"但 {cls.__name__} 声明 forecast_type="
-                f"{getattr(cls, 'forecast_type', 'deterministic')!r}。"
-                "确定性模型的权重扰动走 m1a（去掉 perturb_graphs 即可）。")
-        if n_graphs > members:
-            raise SystemExit(
-                f"perturb_graphs({n_graphs}) > members({members})：会有图分不到成员。"
-                "要么调小 perturb_graphs，要么调大 members。")
-        if members // n_graphs < 2:
-            raise SystemExit(
-                f"perturb_graphs={n_graphs} / members={members}：每图分不到 2 个成员。"
-                "图外层模式复用 _run_plain_block 的 members>1 分支（成员 = 一次 Rollout "
-                "的多条轨迹），单成员图会落进确定性分支、丢掉 member_NNN/ 子目录"
-                "——要单成员就别用这个模式（走 m1a）。")
     if forecast_type == "deterministic" and members > 1:
         log.warning("模型类 %s 声明确定性，但 members=%d；确定性模型应跑 1 个成员",
                     cls.__name__, members)
@@ -901,40 +635,22 @@ def _worker_main(argv=None):
     # 每条轨迹持有一份 ~645MB state，按起报切会让每卡挂全部成员（51 成员 ≈ 33GB，
     # 实测 OOM）；集合优先按成员切，成员少于卡数时退回按起报切。
     n_init = len(init_times)
-    graph_members = None
-    if graph_outer:
-        # 图外层按图切：一份图的 J 个成员必须在同一 session 里连续前向，
-        # 拆到不同进程会把图内成员身份打散。
-        graph_members = [entry for entry in _graph_member_split(members, n_graphs)
-                         if entry[0] % world_size == local_rank]
-        if not graph_members:
-            log.info("本 rank 没有分到扰动图（图数 %d、卡数 %d），退出",
-                     n_graphs, world_size)
-            return 0
-        member_indices = list(range(members))
-        member_start, member_stride = 0, 1
+    per_rank_init = (n_init + world_size - 1) // world_size
+    per_rank_member = (members + world_size - 1) // world_size
+    cost_by_init = per_rank_init * members
+    cost_by_member = n_init * per_rank_member
+    if members > 1 and members >= world_size:
+        split_by_member = True
     else:
-        per_rank_init = (n_init + world_size - 1) // world_size
-        per_rank_member = (members + world_size - 1) // world_size
-        cost_by_init = per_rank_init * members
-        cost_by_member = n_init * per_rank_member
-        if members > 1 and members >= world_size:
-            split_by_member = True
-        else:
-            split_by_member = cost_by_init > cost_by_member
-        if not split_by_member:
-            base, rem = divmod(n_init, world_size)
-            start_i = local_rank * base + min(local_rank, rem)
-            span = base + (1 if local_rank < rem else 0)
-            init_times = init_times[start_i:start_i + span]
-            member_indices = list(range(members))
-            member_start, member_stride = 0, 1
-        else:
-            member_indices = list(range(local_rank, members, world_size))
-            member_start, member_stride = local_rank, world_size
-
-    # m1a：成员是各自一份冻结权重，必须成员外层、数据集内层，保证同时只驻留少量 session。
-    member_outer = perturb_spec is not None and not graph_outer
+        split_by_member = cost_by_init > cost_by_member
+    if not split_by_member:
+        base, rem = divmod(n_init, world_size)
+        start_i = local_rank * base + min(local_rank, rem)
+        span = base + (1 if local_rank < rem else 0)
+        init_times = init_times[start_i:start_i + span]
+        member_indices = list(range(members))
+    else:
+        member_indices = list(range(local_rank, members, world_size))
 
     if not init_times:
         log.info("没有分配到起报时间，退出")
@@ -998,11 +714,8 @@ def _worker_main(argv=None):
         gpu_mem_fraction=args.gpu_mem,
         ops_library=worker_cfg.ops_library_abs(),
         gpu_state=worker_cfg.gpu_state,
-        weight_perturb=worker_cfg.weight_perturb,
-        latent_forcing=worker_cfg.latent_forcing,
         intra_op_threads=args.intra_op_threads,
         cudnn_algo_search=args.cudnn_algo_search,
-        resident_members=resident_members,
     )
     model.configure_processing(processors, dataloader)
 
@@ -1012,33 +725,13 @@ def _worker_main(argv=None):
         return 0
 
     os.makedirs(args.out, exist_ok=True)
-    if member_outer:
-        _prepare_member_set(args.model, perturb_spec, members, member_indices,
-                            local_rank, world_size)
-    elif graph_outer:
-        # 图外层：成员集只有 n_graphs 份（每图一份权重），成员号 = 图号。
-        _prepare_member_set(args.model, perturb_spec, n_graphs,
-                            [g for g, _ in graph_members], local_rank, world_size)
     log.info("加载模型：class=%s backend=%s device=%d CUDA_VISIBLE_DEVICES=%s path=%s",
              model_name, model.backend, device_id,
              os.environ.get("CUDA_VISIBLE_DEVICES"), args.model)
-    if member_outer:
-        # m1a：每个成员一套权重，真正的 load 在成员循环里逐个做。
-        pool_desc = ("1 份（一换一放）" if resident_members == 1
-                     else ("不限（全常驻）" if resident_members < 0
-                           else "%d 份" % resident_members))
-        log.info("M1a：本 rank 负责 %d 个成员，逐成员加载；常驻 session 池 = %s",
-                 len(member_indices), pool_desc)
-    elif graph_outer:
-        log.info("图外层（集合+SPW）：本 rank 负责 %d 份扰动图（%s），逐图加载；"
-                 "每图 %s 个成员由图内随机算子出",
-                 len(graph_members), [g for g, _ in graph_members],
-                 "/".join(str(len(ids)) for _, ids in graph_members))
-    else:
-        t_load_model = perf_counter()
-        model.load(args.model)
-        log.info("模型加载完成：%s，耗时 %s",
-                 model.describe(), _fmt_dur(perf_counter() - t_load_model))
+    t_load_model = perf_counter()
+    model.load(args.model)
+    log.info("模型加载完成：%s，耗时 %s",
+             model.describe(), _fmt_dur(perf_counter() - t_load_model))
 
     requested = [v for v in args.vars.split(",") if v.strip()] if args.vars else None
     channels = list(cls.output_channels)
@@ -1049,18 +742,6 @@ def _worker_main(argv=None):
 
     lat, lon = grid_coords(cls.grid)
     writer = _AsyncWriter(args.out, atomic=True)
-
-    if graph_outer:
-        return _run_graph_outer(
-            model, processors, dataloader, writer, args, init_times,
-            graph_members, save_names, lat, lon, interval, local_rank, world_size,
-            num_workers=dataloader_config.get("num_workers", 0),
-            model_batch=model_batch)
-
-    if member_outer:
-        return _run_member_outer(
-            model, processors, dataloader, writer, args, init_times,
-            member_indices, save_names, lat, lon, interval, local_rank, world_size)
 
     total_t0 = perf_counter()
     _run_plain_block(

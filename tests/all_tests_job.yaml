@@ -1,7 +1,8 @@
 # 测试 Job：tests/unit 全量 + tests/integration 的 realdata 档（真起 GPU 推理对拍）。
 #
-# tests/fgvp_realdata_job.yaml 是同一套流程的简化版（set -eu 首错即停，不汇总两档 rc）；
-# 这份单元档挂了也会继续跑集成档，最后按「任一失败」退出。
+# 1.0（main 分支）已删除 SPA/SPW 实现与配方、skills/。服务器副本如果是 rsync 增量同步
+# 过来的（不带 --delete），旧文件会残留；下面有一段「剥离自检」把它们列出来，但只提示、
+# 不拦测试（残留文件不参与 import，不影响用例结果）。
 #
 # 集成档必须显式 -m realdata（pyproject 的 addopts 默认排除）；fixture 不齐时整模块
 # skip、退出码仍是 0，所以加 -rs 把 skip 原因打出来。
@@ -80,6 +81,26 @@ spec:
               echo "--- $d ---"
               ls -la "/workspace/data/shenzw/inference_test_data/$d" 2>/dev/null || echo "<缺失>"
             done
+
+            echo "=================== 1.0 剥离自检 ==================="
+            # 只提示不退出：残留文件不参与 import，不影响用例结果。
+            for p in \
+              xmetai_inference/weights \
+              xmetai_inference/backends/spa.py \
+              skills \
+              xmetai_inference/configs/s2s_era_1p5_fengshun_ens_spa.py \
+              xmetai_inference/configs/weather_cra_0p25_tongyun_ens_spa.py \
+              xmetai_inference/configs/weather_era_0p25_fgvp_ens_spa.py \
+              xmetai_inference/configs/weather_era_0p25_fuxi_ens_spa.py \
+              xmetai_inference/configs/weather_era_0p25_fgvp_ens_spw.py \
+              ; do
+              if [ -e "$p" ]; then
+                echo "  ⚠ 残留：$p（1.0 已删除，服务器副本需手工清理）"
+              fi
+            done
+            echo -n "内置配方："
+            ls xmetai_inference/configs/*.py | sed 's#.*/##' | sort | tr '\n' ' '
+            echo
 
             # 两档都跑：单元档挂了不拦集成档，最后按「任一失败」退出。
             rc=0

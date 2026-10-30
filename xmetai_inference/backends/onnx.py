@@ -3,15 +3,13 @@
 
 时间标量的编码差异用类属性 ``time_features`` 声明，不必重写 forward。
 """
-import gc
 import logging
 import os
 
 import numpy as np
 import onnxruntime as ort
 
-from .base import (BaseInferModel, SessionPool, _default_gpu_mem_limit,
-                   normalize_budget)
+from .base import BaseInferModel, _default_gpu_mem_limit
 
 log = logging.getLogger(__name__)
 
@@ -101,13 +99,9 @@ def _scalar_feeds(valid_time, step, features=None):
 class OnnxInferModel(BaseInferModel):
     """ONNX Runtime 后端（CUDAExecutionProvider）。"""
     backend = "onnx"
-    supports_weight_perturb = True
-    supports_latent_forcing = True
     # 时间标量编码的覆盖，只写要改的键（图接口契约）
     time_features = {}
     use_cpu_initializers = True
-    resident_members = 1                 # 常驻 session 额度：1 = 一换一，-1 = 全常驻
-    _pool = None
     ops_library = None                   # 自定义算子库 .so，None = 不需要
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
@@ -192,28 +186,8 @@ class OnnxInferModel(BaseInferModel):
         return ort.InferenceSession(path, sess_options=options, providers=providers)
 
     def load(self, path):
-        """加载 ONNX 会话；按 weight_perturb / latent_forcing 解析实际路径并自检。
-
-        自检只读 metadata、不跑前向，抓「看着注入了、其实没生效」的静默失败。
-        """
-        # 重新 load = 新的一批轨迹，丢掉旧的驱动状态（与旧版每次新建等价）
-        self._latent_stream.release()
-        spec = getattr(self, "weight_perturb", None)
-        forcing = getattr(self, "latent_forcing", None)
-        if spec or forcing:
-            from xmetai_inference.weights.spa import resolve_stack_path
-
-            # 先解析权重（SPW 成员图），再在其上叠加强迫（只改图结构）
-            path = resolve_stack_path(
-                path, spec, forcing, getattr(self, "member_index", 0))
-            if spec:
-                log.info("权重扰动已启用：%s member=%d -> %s",
-                         spec.describe(), getattr(self, "member_index", 0), path)
-            if forcing:
-                log.info("潜空间 AR(1) 强迫已启用：%s member=%d -> %s",
-                         forcing.describe(), getattr(self, "member_index", 0), path)
-        self.session = self._acquire_session(path)
-        self._verify_perturbation(spec)
+        """加载 ONNX 会话。"""
+        self.session = self._make_session(path)
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())
@@ -226,70 +200,7 @@ class OnnxInferModel(BaseInferModel):
             bool(_in_shape) and bool(_out_dim)
             and isinstance(_in_shape[0], str) and isinstance(_out_dim[0], str))
         self._check_gpu_state_frames()
-        self._verify_forcing(forcing)
         self._spare = None    # 输出 buffer 复用，避免每步重新分配显存
-
-    def _verify_perturbation(self, spec):
-        """加载后的扰动自检：确认图就是 self.member_index 那个成员。"""
-        if not spec:
-            return
-        self._verify_member_identity()
-
-    def _verify_member_identity(self):
-        """只读 metadata，抓「成员号没接上」的静默失败（多成员加载同一文件）。"""
-        want = int(getattr(self, "member_index", 0))
-        meta = dict(self.session.get_modelmeta().custom_metadata_map)
-        got = meta.get("spw.member")
-        if meta.get("spw.mechanism") != "m1a" or got is None:
-            raise RuntimeError(
-                f"启用了 m1a，但加载进来的图没有 m1a 的成员元数据"
-                f"（spw.mechanism={meta.get('spw.mechanism')!r}, spw.member={got!r}）。"
-                "多半是路径指向了源模型或 m3 的扰动图，而不是成员模型。"
-                "成员模型路径应由 weights.spw.member_model_path 给出。")
-        if got != str(want):
-            raise RuntimeError(
-                f"加载到的成员图编号是 {got}，但本实例要跑的是 member "
-                f"{want}。同一份成员被加载多次会产出逐位相同的成员——"
-                "请检查 cli 是否在每次 load 前给 model.member_index 赋了当前成员号。")
-        log.info("权重扰动自检：member %d，被扰动张量 %s 个，sigma_per_group=%s",
-                 want, meta.get("spw.tensors"), meta.get("spw.sigma_per_group"))
-
-    def _verify_forcing(self, forcing):
-        """加载期自检：图里真的有 spw/xi 且 metadata 对得上。
-
-        ORT 会静默忽略多余输入，图没改写成集合时没有任何报错。
-        """
-        self._latent_n_targets = 0
-        if not forcing:
-            return
-        meta = dict(self.session.get_modelmeta().custom_metadata_map)
-        targets = [name for name in meta.get("spw.ar1.targets", "").split(" | ") if name]
-        if not getattr(forcing, "verify_on_load", True):
-            self._latent_n_targets = len(targets)
-            return
-        if meta.get("spw.ar1.method") != "latent-ar1-multiplicative":
-            raise RuntimeError(
-                f"启用了 latent_forcing，但加载进来的图没有潜空间强迫的元数据"
-                f"（spw.ar1.method={meta.get('spw.ar1.method')!r}）。"
-                "多半是路径指向了源模型 / m3 的扰动图 / m1a 的成员图，而不是叠加了 "
-                "spw/xi 输入的那份。路径应由 weights.spa.resolve_stack_path 给出。")
-        if meta.get("spw.ar1.input") != forcing.input_name:
-            raise RuntimeError(
-                f"图里的强迫输入名是 {meta.get('spw.ar1.input')!r}，但本例要喂的是 "
-                f"{forcing.input_name!r}；两边对不上，喂进去只会被静默忽略。")
-        if forcing.input_name not in self._input_names:
-            raise RuntimeError(
-                f"latent_forcing 要喂 {forcing.input_name!r}，但它不在图的输入里"
-                f"（{sorted(self._input_names)}）—— 图没被真正改写，集合会退化成逐位相同的"
-                "确定性预报。请删掉那份缓存的 .onnx 让它重建。")
-        if not targets:
-            raise RuntimeError(
-                "潜空间强迫的 metadata 里没有任何目标张量（spw.ar1.targets 为空），"
-                "说明图是在注入之前就被写出来的，请删掉重新构建。")
-        self._latent_n_targets = len(targets)
-        log.info("潜空间强迫自检：输入 %s，目标 %d 个，sigma=%s tau=%s 天 rank=%s",
-                 forcing.input_name, len(targets), meta.get("spw.ar1.sigma"),
-                 meta.get("spw.ar1.tau_days"), meta.get("spw.ar1.rank"))
 
     def _check_gpu_state_frames(self):
         """gpu_state=True 时要求「图输出帧数 == 输入帧数」。
@@ -322,11 +233,6 @@ class OnnxInferModel(BaseInferModel):
                     valid_time, step, self._time_features).items():
                 if k in self._input_names:
                     feeds[k] = v
-        # batch 维 = 本次堆了几条轨迹；块内 k 条各吃一行独立 ξ
-        width = int(x.shape[0])
-        xi = self._latent_row(step, width=width)
-        if xi is not None:
-            feeds[self.latent_forcing.input_name] = xi
         # 返回完整滑动窗口，末帧是本步预报；回填由 Rollout 负责
         result = self.session.run([self._pred_name], feeds)[0]
         return result
@@ -356,38 +262,10 @@ class OnnxInferModel(BaseInferModel):
         return out
 
     def release(self):
-        """丢掉当前 session；额度为 1 时连常驻池一起清空（全清用 release_all）。"""
+        """丢掉当前 session。"""
         self.session = None
         self._spare = None
         super().release()
-        if self._pool is not None and self._pool.budget == 1:
-            self._pool.purge()
-
-    def release_all(self):
-        """把当前 session 与整个常驻池一起放开（进程收尾，或想立刻把显存还回去）。"""
-        self.session = None
-        self._spare = None
-        super().release()
-        if self._pool is not None:
-            self._pool.purge()
-        gc.collect()
-
-    def pool_stats(self):
-        """常驻池计数（budget / size / builds / hits / evictions）；日志与自检用。"""
-        if self._pool is None:
-            return {"budget": normalize_budget(self.resident_members), "size": 0,
-                    "builds": 0, "hits": 0, "evictions": 0}
-        return self._pool.stats()
-
-    def _acquire_session(self, path):
-        """按解析后的路径取 session：命中复用，否则新建并入池。"""
-        if self._pool is None:
-            self._pool = SessionPool(self.resident_members, logger=log)
-        session, hit = self._pool.acquire(path, lambda: self._make_session(path))
-        if hit:
-            log.info("session 命中共驻池（驻留 %d 份，额度 %d）：%s",
-                     len(self._pool), self._pool.budget, os.path.basename(path))
-        return session
 
     def to_numpy(self, state):
         return state.numpy()

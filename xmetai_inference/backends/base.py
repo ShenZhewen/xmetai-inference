@@ -1,14 +1,10 @@
 # -*- coding: utf-8 -*-
-"""推理后端共享运行契约：单步 forward + 常驻 session 池；引擎在 onnx.py / pt2.py。"""
-import collections
+"""推理后端共享运行契约：单步 forward；引擎在 onnx.py / pt2.py。"""
 import logging
-import os
 from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
-
-from .spa import LatentStepStream
 
 log = logging.getLogger(__name__)
 
@@ -51,9 +47,6 @@ class BaseInferModel(ABC):
     forward：x 为 (1, in_frames, C, H, W)，返回同形状完整输出（末帧为本步预报）。
     """
     backend = "base"
-    supports_weight_perturb = False      # 权重扰动（SPW）
-    supports_latent_forcing = False      # 潜空间 AR(1) 强迫（SPA）
-    latent_forcing = None                # 由 create_model 构造后赋值，None = 不加
 
     intra_op_threads = 0                 # 0 = 后端自定（cli 按 worker 数折算）
     cudnn_algo_search = ""               # "" = 默认（EXHAUSTIVE）
@@ -105,10 +98,6 @@ class BaseInferModel(ABC):
         self.gpu_mem_fraction = gpu_mem_fraction
         self.processing = None
         self.data_source = None
-        self.weight_perturb = None           # config 的 weight_perturb，None = 不加
-        self.member_index = 0                # 当前成员，决定加载哪份成员模型
-        self._latent_n_targets = 0           # 注入目标数，0 = 未启用
-        self._latent_stream = LatentStepStream()
 
     def configure_processing(self, processing, data_source):
         """绑定 config 里的 processing 配方。"""
@@ -124,25 +113,8 @@ class BaseInferModel(ABC):
 
         return build_dataset_batch(batch, verbose=verbose)
 
-    def _latent_row(self, step, width=1):
-        """本步本块要喂的 ξ，形状 (width, T, R)；None = 未启用强迫。
-
-        ``width`` = 本次 forward 堆了几条轨迹，块内每条轨迹各吃一行独立 ξ。
-        """
-        if not self.latent_forcing or self._latent_n_targets <= 0:
-            return None
-        index = self._latent_stream(
-            self.latent_forcing, step,
-            n_targets=self._latent_n_targets,
-            member_index=self.member_index,
-            hour_interval=getattr(self, "hour_interval", None),
-            width=width)
-        return self._latent_stream.ar1.row(index, width)
-
     def release(self):
-        """后端资源释放的公共部分（潜空间驱动状态）；子类覆盖时调 super()。"""
-        if self._latent_stream is not None:
-            self._latent_stream.release()
+        """后端资源释放的公共部分；子类覆盖时调 super()。"""
 
     @abstractmethod
     def load(self, path):
@@ -197,72 +169,3 @@ class BaseInferModel(ABC):
                 arr = np.maximum(arr, 0.0)
             data_vars[channel.upper()] = (("lat", "lon"), arr)
         return xr.Dataset(data_vars, coords={"lat": lat, "lon": lon})
-
-# 常驻 session 池（config 的 resident_members）：1 = 一换一，N = 最多 N 份，
-# -1 = 全常驻。键是解析后的路径而不是成员号——一个 session 可服务多个成员。
-def normalize_budget(value):
-    """resident_members -> 池子额度：0 / None / 非法值都当 1（缺省口径），负数 = 不限。"""
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return 1
-    if value < 0:
-        return -1
-    return max(1, value)
-
-
-class SessionPool:
-    """路径 -> session 的 LRU 池。额度 1 时退化成「用一个换一个」，与改造前等价。"""
-
-    def __init__(self, budget=1, logger=None):
-        self.budget = normalize_budget(budget)
-        self.log = logger or log
-        self.builds = 0
-        self.hits = 0
-        self.evictions = 0
-        self._items = collections.OrderedDict()
-
-    def acquire(self, key, build):
-        """取 session：命中则复用（hit=True），否则调用 ``build()`` 新建并入池。"""
-        key = os.path.abspath(key)
-        cached = self._items.pop(key, None)
-        if cached is not None:
-            self._items[key] = cached          # 重新入尾 = LRU 更新
-            self.hits += 1
-            return cached, True
-        session = build()
-        self.builds += 1
-        self._items[key] = session
-        self._evict()
-        return session, False
-
-    def _evict(self):
-        """按额度从 LRU 一端换出；额度 -1 = 不换。"""
-        if self.budget < 0:
-            return
-        dropped = []
-        while len(self._items) > self.budget:
-            dropped.append(self._items.popitem(last=False)[0])
-        if dropped:
-            self.evictions += len(dropped)
-            self.log.info("常驻 session 池已满（额度 %d），换出 %d 份：%s",
-                          self.budget, len(dropped),
-                          "、".join(os.path.basename(item) for item in dropped))
-
-    def purge(self):
-        """清空池子（驻留的 session 全部放开，显存随之归还）。返回清掉的份数。"""
-        count = len(self._items)
-        self._items.clear()
-        return count
-
-    def __len__(self):
-        return len(self._items)
-
-    def stats(self):
-        return {
-            "budget": self.budget,
-            "size": len(self._items),
-            "builds": self.builds,
-            "hits": self.hits,
-            "evictions": self.evictions,
-        }
