@@ -9,7 +9,7 @@ description = "Configuration-driven weather model inference and evaluation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "xmetai-core>=0.1.0",
+    "xmetai-core==0.1.0",
     "numpy",
     "pandas",
     "torch",

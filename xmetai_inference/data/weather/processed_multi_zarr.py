@@ -48,6 +48,7 @@ def select_init_positions(dataset, init_times: Sequence[object]) -> list[int]:
         raise ValueError(
             "以下起报时间在 Dataset 中不存在或缺少历史帧："
             f"{formatted}"
+            "（若取的是 store 最末时刻，还需要它之后至少有一帧）"
         )
     return [available[value] for value in requested]
 

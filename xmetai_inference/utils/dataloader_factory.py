@@ -49,5 +49,8 @@ def create_dataloader(
     options.update(dict(dataloader_options or {}))
     if options["shuffle"]:
         raise ValueError("推理 DataLoader 不允许 shuffle=True")
+    if options.get("drop_last"):
+        raise ValueError(
+            "推理 DataLoader 不允许 drop_last=True（会静默丢弃尾部起报）")
 
     return DataLoader(dataset, **options)

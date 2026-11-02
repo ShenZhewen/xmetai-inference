@@ -4,9 +4,9 @@ Inference framework for autoregressive weather forecasting models. It reads ERA5
 reanalysis from Zarr stores, feeds each model the channel set and history window its contract
 declares, runs the rollout, and writes the forecast as NetCDF.
 
-- Runs ONNX and TorchScript (`pt2`) graphs behind one interface
+- Runs ONNX and `torch.export` (`.pt2`) graphs behind one interface
 - Supports deterministic and 51-member ensemble models on a 0.25° global grid
-- Ships a run recipe per model: `xmetai-infer --config <name>` needs no extra arguments
+- Ships a run recipe per model, selected with `--config <name>`
 - Multi-GPU by sharding initialization times × members across cards
 
 ## Table of Contents
@@ -44,13 +44,17 @@ pip install -e .
 Add the extras for what you run:
 
 ```bash
-pip install -e ".[netcdf,zarr,onnx]"   # ONNX models: FuXi-Ens / FGVP / FengQing
+pip install -e ".[netcdf,zarr,onnx]"   # every model except FuXi-2.1 (ONNX)
 pip install -e ".[netcdf,zarr]"        # NetCDF I/O only: FuXi-2.1 / evaluation
 ```
 
 `torch` comes in with the base install. The `netcdf` extra brings `netCDF4` / `h5netcdf`
 (reading `mean.nc`/`std.nc`, writing output), `zarr` powers store reads in `xmetai-core`, and
 `onnx` pulls in `onnxruntime`.
+
+> PyPI's `onnxruntime` is the **CPU** build. For GPU inference install `onnxruntime-gpu`
+> instead (the `onnx` extra and `onnxruntime-gpu` conflict; use one or the other). The loader
+> logs a warning when it has to fall back to the CPU provider.
 
 ### Run
 
@@ -67,8 +71,10 @@ xmetai-infer --config weather_cra_0p25_tongyun_ens
 xmetai-infer --config s2s_cra_0p25_fengshun20_ens
 ```
 
-The recipe fixes the weight path, dataset and preprocessing chain, initialization times, step
-count, GPU count, and output directory. From a source checkout without installing:
+Each recipe declares the weight path, dataset and preprocessing chain, initialization times, step
+count, GPU count, and output directory. The shipped recipes use `/path/to/...` placeholders —
+point those at your own weights and stores (or set the matching environment variables) before the
+first run. From a source checkout without installing:
 
 ```bash
 python -m xmetai_inference --config weather_era_0p25_fuxi21
@@ -76,8 +82,8 @@ python -m xmetai_inference --config weather_era_0p25_fuxi21
 
 Output goes to `{out}/{YYYYMMDD|YYYYMMDDHH}/[member_XXX/]{step:03d}.nc`, one NetCDF per step.
 
-`xmetai-infer --worker ...` is the internal multi-GPU subprocess entry point and should not be
-called manually.
+`xmetai-infer --worker ...` is the internal worker subprocess entry point used for every run
+(single- or multi-GPU) and should not be called manually.
 
 ### Override Parameters
 
@@ -149,9 +155,10 @@ Tongyun   (71): PL z,t,u,v,q × [50 … 1000] (ascending pressure)
 ```
 
 Channel names are matched against store names by `_raw_channel_name`: exact match first, then
-`z50` → `z_50`. Normalization files and some processors align names with underscores stripped
-(case-insensitive), so a store may be a superset of the model channels — but every requested
-channel must exist, or construction fails loudly.
+`z50` → `z_50`. A store may be a superset of the model channels — every requested channel must
+exist, or construction fails loudly. Two processors read names differently: `denormalize`
+aligns store stats by underscore-insensitive, lower-cased name and tolerates a superset;
+`normalize` requires stats that match `input_channels` in count **and order** exactly.
 
 > **Model naming.** Config names follow `<domain>_<source>_<resolution>_<model>[_ens]`:
 > `domain` = `weather` (15-day, 6-hourly) or `s2s` (subseasonal, daily steps); `source` = `era`
@@ -205,8 +212,8 @@ The store root names below are relative to the data roots declared at the top of
 | `era5_tp_zarr/era5.202501-202607.c1.p25.h6.v1.lon180.zarr` | 1 | 2025-01 … 2026-07, 6h | **Raw** | global (`lon180` naming) | True 6h-accumulated `tp` (metres) | fengqing (listed first to override the sfc store's 1h tp) |
 | `zarr_refresh_v3/cra.19790101_20260714.c71.p25.h6.v1` | 71 | 1979-01-01 … 2026-07-14, 6h | **Normalized** | south→north | mean/std arrays inside the store; `tp` stays log1p | tongyun_cra_ens |
 | `zarr_refresh_v3/cra.1979_2024.c87.p25.h24.v1` | 87 | 1979-01-01 … 2024-12-31, daily 00Z, fp16 | **Normalized** | north→south | fengshun2.0 channel order; `tp` = log1p(mm per day) | fengshun20_ens |
-| `zarr_refresh_v3/era5.202501_202607.c116.p25.h6.v3` | 116 | 2025-01 … 2026-07, 6h | **Normalized** (superset) | north→south | q in g/kg, radiation in W/m², `tp` = log1p(6h mm) | fgvp_v3 (template for the other four ERA5 models) |
-| `zarr_refresh_v3/era5.1979_2024.c78.p25.h6.v1` | 78 | 1979 … 2024 backfill | **Normalized** (superset) | north→south | Same conventions as c116 | fgvp_v3 with `paths` and `times` swapped |
+| `zarr_refresh_v3/era5.202501_202607.c116.p25.h6.v3` | 116 | 2025-01 … 2026-07, 6h | **Normalized** (superset) | north→south | q in g/kg, radiation in W/m², `tp` = log1p(6h mm) | — (no shipped recipe; opt-in A/B store) |
+| `zarr_refresh_v3/era5.1979_2024.c78.p25.h6.v1` | 78 | 1979 … 2024 backfill | **Normalized** (superset) | north→south | Same conventions as c116 | — (no shipped recipe; backfill store) |
 
 The counts in file names are store channel counts; the authoritative list is the `channel`
 coordinate inside each store. Inspect it before wiring a new model (read-only):
@@ -240,8 +247,8 @@ How to tell them apart:
    always flips south→north to north→south, which feeds the field reversed (measured: +6 h z500
    RMSE 90 → 486).
 4. For a log1p channel (`tp`), `denormalize` yields `log1p(physical value)`, not the value itself.
-   Whether to `expm1` depends on the graph: CRA's graph expects the log1p value (**no** `expm1`);
-   the v3 ERA5 stores and fengshun expect physical mm (**yes**, `expm1_channels=["tp"]`).
+   Whether to `expm1` depends on the graph: c71/Tongyun expects the log1p value (**no** `expm1`);
+   the v3 ERA5 stores and c87/fengshun expect physical mm (**yes**, `expm1_channels=["tp"]`).
 
 ### Units
 
@@ -251,7 +258,8 @@ How to tell them apart:
 | `tp` | 1 h accumulation, metres (the sfc store); the separate tp store is true 6 h accumulation | **log1p(6h mm)** | FuXi / FGVP: 6 h mm ⇒ store2 `×6000`; v3 `expm1_channels=["tp"]`. FengQing overrides with the 6 h tp store and multiplies by 1000 |
 | radiation (`ssr`/`ssrd`/`fdir`/`ttr`) | 1 h accumulation, J/m² | **W/m²** (step mean) | 6 h Wh/m² ⇒ store2 `×6/3600`; v3 `×6` |
 | `z`, `t`, `u`, `v`, `msl`, surface fields | physical | physical | 1:1 |
-| CRA c71 / c87 | — | — | normalized store: no unit conversion; `tp` intentionally stays log1p |
+| CRA c71 (Tongyun) | — | — | normalized store: no unit conversion; `tp` stays log1p (the graph expects it) |
+| CRA c87 (fengshun) | — | — | normalized store: no unit conversion; `tp` is log1p at input, `expm1` applied by `denormalize` |
 
 ### Per-Model Preprocessing Chains
 
@@ -264,10 +272,10 @@ How to tell them apart:
 | pangu | `geometry` | — | — |
 | tongyun_cra | `denormalize` (stats_path=CRA), **no geometry** | — | — |
 | fengshun20 | `denormalize` (stats_path=c87, expm1 tp) → `fill_missing` (sst=287.222, error) | — | — |
-| fgvp_v3 | `denormalize` (expm1 tp) → `unit_convert` (rad×6) → `geometry` → `fill_missing` (sst) | — | — |
 
-Configs still default to the raw store2 root; `configs/weather_era_0p25_fgvp_v3.py` is an opt-in
-A/B recipe for the v3 stores.
+ERA5 recipes default to the raw store2 root; the two CRA recipes read `zarr_refresh_v3` stores.
+The v3 ERA5 stores (c116 / c78) have no shipped recipe — copy an existing ERA5 recipe and swap
+`paths` (and `times`) to run them.
 
 ## Project Structure
 
@@ -285,7 +293,7 @@ A/B recipe for the v3 stores.
 │   └── configs/             # Run recipes (`--config <name>`) + declared model contracts;
 │                            #   base.py = shared GRID/channels + InferConfig/load_config
 ├── tests/                   # Unit + integration tests (integration runs only with `-m realdata`)
-└── model_artifacts/         # Local model artifacts; the whole directory is excluded from Git
+└── model_artifacts/         # Local model artifacts; absent in a fresh clone and excluded from Git
 ```
 
 ## How It Works

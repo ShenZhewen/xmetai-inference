@@ -192,6 +192,14 @@ class OnnxInferModel(BaseInferModel):
     def load(self, path):
         """Load the ONNX session."""
         self.session = self._make_session(path)
+        active_providers = self.session.get_providers()
+        if "CUDAExecutionProvider" not in active_providers:
+            log.warning(
+                "onnxruntime 未启用 CUDAExecutionProvider（当前 %s），推理将退回 CPU；"
+                "GPU 环境请安装 onnxruntime-gpu", active_providers)
+        elif active_providers[0] != "CUDAExecutionProvider":
+            log.warning(
+                "CUDAExecutionProvider 不是首选 provider（当前顺序 %s）", active_providers)
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())

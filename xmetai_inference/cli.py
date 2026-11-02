@@ -7,6 +7,7 @@ Outputs ``{out}/{init}/member_{member:03d}/{step:03d}.nc`` (deterministic runs o
 Multi-GPU runs split members or init times across subprocesses; writes go through a single background thread (netCDF4/HDF5 are not thread-safe).
 """
 import argparse
+import difflib
 import gc
 import importlib
 import logging
@@ -50,20 +51,28 @@ def _output_init_dir(init):
 def _resolve_output_indices(channels, requested):
     """Map output variable names (z500/u200/v200/msl/tp) to channel indices.
 
-    requested=None saves all channels; names are case-insensitive, and unknown names are skipped with a warning.
+    requested=None saves all channels; names are case-insensitive. Unknown names raise instead of being
+    skipped: silently dropping one variable produces an output that looks complete but is missing a field.
     """
     if requested is None:
         return list(range(len(channels)))
     name2idx = {str(c).lower(): i for i, c in enumerate(channels)}
     idxs = []
+    unknown = []
     for name in requested:
         key = str(name).strip().lower()
         if key in name2idx:
             idxs.append(name2idx[key])
         else:
-            log.warning("输出变量 %r 不在模型通道里，已跳过", name)
-    if not idxs:
-        raise SystemExit("没有有效的输出变量可保存（检查 --vars 是否写对）")
+            unknown.append(key)
+    if unknown:
+        details = []
+        for key in unknown:
+            suggestion = difflib.get_close_matches(key, name2idx, n=1)
+            details.append(
+                f"{key!r}（是否想写 {suggestion[0]!r}？）" if suggestion else repr(key))
+        raise SystemExit(
+            "未知输出变量：" + "，".join(details) + "；不传 --vars 可保存全部通道")
     return idxs
 
 
@@ -77,6 +86,24 @@ def _select_netcdf_engine():
             continue
     log.warning("netcdf4/h5netcdf 未安装，退回 scipy 写 NETCDF3_64BIT（大数组会很慢）")
     return "scipy", "NETCDF3_64BIT"
+
+
+def _fallback_buffer(step_buf, save_indices):
+    """CPU copy of the channels that are written to NetCDF, kept for the .npy fallback.
+
+    The queue keeps this buffer alive until the background thread writes it. Copying the selected
+    channels to host memory (and dropping the GPU tensor) avoids pinning a full (C,H,W) CUDA
+    allocation per queued step: 85 channels at 721x1440 float32 is ~350 MB per step.
+    """
+    if hasattr(step_buf, "detach"):  # torch tensor (pt2 backend)
+        buf = step_buf.detach()
+        if len(save_indices) != buf.shape[0]:
+            buf = buf[save_indices]
+        return buf.cpu()
+    arr = np.asarray(step_buf)
+    if len(save_indices) != arr.shape[0]:
+        arr = arr[save_indices]
+    return arr
 
 
 class _AsyncWriter:
@@ -116,8 +143,13 @@ class _AsyncWriter:
                 self.errors.append(e)
                 log.exception("写入 NetCDF 失败：%s", path)
                 if raw is not None:
-                    step_buf, s, init = raw
-                    npy = os.path.join(self.save_dir, f"{init:%Y%m%d%H}_raw_step_{s:03d}.npy")
+                    step_buf, s, init, member_id = raw
+                    # Keep the member id and the 1-based step convention of the .nc paths, so an
+                    # ensemble fallback cannot overwrite one member's array with another's.
+                    prefix = "" if member_id is None else f"member_{member_id:03d}_"
+                    npy = os.path.join(
+                        self.save_dir,
+                        f"{init:%Y%m%d%H}_{prefix}raw_step_{s + 1:03d}.npy")
                     try:
                         step_buf_np = (step_buf.detach().cpu().numpy()
                                        if hasattr(step_buf, "detach") else np.asarray(step_buf))
@@ -188,11 +220,14 @@ def _run_scope(cfg, overrides):
     if not inits:
         raise SystemExit(
             f"配置 {cfg.name}：推理必须指定 times（如 \"2025010600..2025020500:24\"）")
+    steps = _pick(overrides, "steps", cfg.steps)
+    if int(steps) < 1:
+        raise SystemExit(f"配置 {cfg.name}：steps 必须 >= 1，实际 {steps}")
     return {
         "model_path": model_path,
         "model_abs": cfg.model_path_abs(model_path),
         "inits": inits,
-        "steps": _pick(overrides, "steps", cfg.steps),
+        "steps": steps,
         "members": _pick(overrides, "members", cfg.members),
         "vars": _pick(overrides, "vars", cfg.vars),
         "output_dir": _pick(overrides, "out", cfg.output_dir),
@@ -222,7 +257,7 @@ def _build_infer_argv(cfg, overrides, *, scope=None, intra_op_threads=0):
         argv += ["--inits", ",".join(value.strftime("%Y%m%d%H") for value in inits)]
 
     steps = scope["steps"]
-    if steps:
+    if steps is not None:
         argv += ["--steps", str(steps)]
     members = scope["members"]
     if members:
@@ -245,8 +280,16 @@ def _run_infer(cfg, overrides):
     """Launch one or more isolated workers from the same package module."""
     scope = _run_scope(cfg, overrides)
     gpus = _pick(overrides, "gpus", cfg.gpus)
-    cuda_devices = _pick(
-        overrides, "cuda_devices", cfg.cuda_devices).split(",")
+    explicit_devices = overrides.get("cuda_devices") is not None
+    cuda_devices = [
+        value.strip()
+        for value in _pick(overrides, "cuda_devices", cfg.cuda_devices).split(",")
+        if value.strip()
+    ]
+    if explicit_devices and len(cuda_devices) < gpus:
+        raise SystemExit(
+            f"配置 {cfg.name}：--cuda-devices 给了 {len(cuda_devices)} 个卡号，"
+            f"少于 --gpus={gpus}；补全卡号或减少卡数")
     output_dir = scope["output_dir"]
     argv = _build_infer_argv(
         cfg, overrides, scope=scope,
@@ -262,6 +305,14 @@ def _run_infer(cfg, overrides):
         "--worker",
     ] + argv
     if gpus <= 1:
+        # An explicit --cuda-devices selects the physical card here; without it the inherited
+        # CUDA_VISIBLE_DEVICES decides (e.g. picked by the scheduler).
+        if explicit_devices and cuda_devices:
+            env["CUDA_VISIBLE_DEVICES"] = cuda_devices[0]
+        # Never inherit a stale torchrun/scheduler world size: this is a single local worker,
+        # and an inherited LOCAL_RANK would make it silently shard (or skip) init times.
+        env["LOCAL_RANK"] = "0"
+        env["WORLD_SIZE"] = "1"
         if output_dir:
             command += ["--log-file", os.path.join(output_dir, "rank_0.log")]
         return subprocess.call(command, env=env)
@@ -381,6 +432,17 @@ def _config_main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # Reject values that would otherwise be dropped or run a different workload than requested.
+    for flag, value, minimum in (
+        ("--steps", args.steps, 1),
+        ("--members", args.members, 1),
+        ("--gpus", args.gpus, 1),
+        ("--batch-size", args.batch_size, 1),
+        ("--num-workers", args.num_workers, 0),
+    ):
+        if value is not None and value < minimum:
+            parser.error(f"{flag} 必须 >= {minimum}（实际 {value}）")
+
     selected = [
         value for value in (args.config_path, args.config)
         if value is not None
@@ -413,8 +475,8 @@ def _config_main(argv=None):
 
 
 def _run_plain_block(model, processors, dataloader, writer, args, member_indices,
-                     save_names, lat, lon, interval, local_rank, world_size, members,
-                     total_inits, num_workers=0, model_batch=1):
+                     save_names, save_indices, lat, lon, interval, local_rank,
+                     world_size, members, total_inits, num_workers=0, model_batch=1):
     """Driver for a deterministic / same-session ensemble block: iterate the dataset in the inner loop, writing each batch to disk and flushing.
 
     members==1: one trajectory per init time, output ``{init}/{step:03d}.nc``; members>1: one trajectory per member,
@@ -451,7 +513,8 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
                     writer.put(
                         f"{init_dir}/{step_idx:03d}.nc",
                         ds,
-                        raw=(step_state[batch_index], step, init),
+                        raw=(_fallback_buffer(
+                            step_state[batch_index], save_indices), step, init, None),
                     )
 
             Rollout(model, processors).run(
@@ -486,7 +549,9 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
                         writer.put(
                             f"{init_dir}/member_{member_id:03d}/{step_idx:03d}.nc",
                             member_ds,
-                            raw=(step_state[local_index], step, init),
+                            raw=(_fallback_buffer(
+                                step_state[local_index], save_indices),
+                                step, init, member_id),
                         )
 
                 # Members are trajectories sharing the same initial state (perturbations come from
@@ -742,7 +807,7 @@ def _worker_main(argv=None):
     total_t0 = perf_counter()
     _run_plain_block(
         model, processors, dataloader, writer, args, member_indices,
-        save_names, lat, lon, interval, local_rank, world_size, members,
+        save_names, save_indices, lat, lon, interval, local_rank, world_size, members,
         total_inits=len(init_times),
         num_workers=dataloader_config.get("num_workers", 0),
         model_batch=model_batch)
