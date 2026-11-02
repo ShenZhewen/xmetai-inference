@@ -9,6 +9,24 @@ declares, runs the rollout, and writes the forecast as NetCDF.
 - Ships a run recipe per model: `xmetai-infer --config <name>` needs no extra arguments
 - Multi-GPU by sharding initialization times × members across cards
 
+## Table of Contents
+
+- [Quick Start](#quick-start)
+  - [Requirements](#requirements)
+  - [Install](#install)
+  - [Run](#run)
+  - [Override Parameters](#override-parameters)
+- [Supported Models](#supported-models)
+  - [Channel Sets and Order](#channel-sets-and-order)
+- [Supported Datasets](#supported-datasets)
+  - [Dataset Spec](#dataset-spec)
+  - [Store Inventory](#store-inventory)
+  - [Two Store Layouts](#two-store-layouts)
+  - [Units](#units)
+  - [Per-Model Preprocessing Chains](#per-model-preprocessing-chains)
+- [Project Structure](#project-structure)
+- [How It Works](#how-it-works)
+
 ## Quick Start
 
 ### Requirements
