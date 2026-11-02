@@ -4,6 +4,19 @@ from xmetai_inference.configs.base import (
     FUXI_ENS_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
 
 
+# Placeholder paths; replace before deployment.
+ERA5_ROOT = "/path/to/data/era5_foundation_store2"
+FGVP_ENS_ONNX = "/path/to/models/20261008/iwc_gssp_im.onnx"
+OPS_LIBRARY = "/path/to/models/xmetai_onnx_plugins.ort1_24.cuda12.so"
+OUTPUT_DIR = "/path/to/output/fgvp_ens_output"
+
+FGVP_ENS_DYNAMIC_STORES = [
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
+]
+
+
 IwcFgvpMambaEnsModel = OnnxInferModel.declare(
     "IwcFgvpMambaEnsModel",
     model_name="iwc_fgvp_mamba_ens_onnx",
@@ -15,18 +28,10 @@ IwcFgvpMambaEnsModel = OnnxInferModel.declare(
 )
 
 
-ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
-
-FGVP_ENS_DYNAMIC_STORES = [
-    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
-    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
-    f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
-]
-
 cfg = InferConfig(
     name="weather_era_0p25_fgvp_ens",
-    model_path="/workspace/tmp/douzsh/models/20261008/iwc_gssp_im.onnx",
-    ops_library="/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so",
+    model_path=FGVP_ENS_ONNX,
+    ops_library=OPS_LIBRARY,
     gpu_state=False,
     model_class="iwc_fgvp_mamba_ens_onnx",
     model_batch=6,
@@ -71,5 +76,5 @@ cfg = InferConfig(
     vars="z500,u200,v200,msl,tp",
     gpus=4,
     cuda_devices="0,1,2,3",
-    output_dir="/workspace/data/shenzw/fgvp_ens_output",
+    output_dir=OUTPUT_DIR,
 )

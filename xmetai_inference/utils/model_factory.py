@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""模型注册表与构造入口：注册名 → 模型类 → 实例（按需导入）。"""
+"""Model registry and construction entry point: registered name → model class → instance (lazy imports)."""
 from importlib import import_module
 
 
-# 模型层：名字 → (模块, 类)。
+# Model layer: name → (module, class).
 MODEL_REGISTRY = {
     "fuxi_ens_onnx": (
         "xmetai_inference.configs.weather_era_0p25_fuxi_ens",
@@ -41,7 +41,7 @@ MODEL_REGISTRY = {
 
 
 def get_model_class(model_name):
-    """按注册名解析内置模型，或验证外部 config 直接提供的模型类。"""
+    """Resolve a built-in model by registered name, or validate a model class supplied directly by an external config."""
     if not isinstance(model_name, str):
         from xmetai_inference.backends import BaseInferModel
 
@@ -59,7 +59,7 @@ def get_model_class(model_name):
 def create_model(model_name, device_id=0, gpu_mem_fraction=0.7,
                  ops_library=None, gpu_state=None, intra_op_threads=0,
                  cudnn_algo_search=""):
-    """按模型名构造推理模型。"""
+    """Construct an inference model by name."""
     cls = get_model_class(model_name)
     model = cls(device_id=device_id, gpu_mem_fraction=gpu_mem_fraction)
     if ops_library and hasattr(model, "ops_library"):

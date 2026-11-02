@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""torch.export (.pt2) 后端：加载、dtype/输入名推断、一步前向（torch in / torch out）。"""
+"""torch.export (.pt2) backend: loading, dtype/input-name inference, single-step forward (torch in / torch out)."""
 import logging
 import os
 
@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 
 
 class Pt2InferModel(BaseInferModel):
-    """torch.export (.pt2) 后端。"""
+    """torch.export (.pt2) backend."""
     backend = "pt2"
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
@@ -32,14 +32,14 @@ class Pt2InferModel(BaseInferModel):
         self._device = torch.device(
             f"cuda:{self.device_id}" if torch.cuda.is_available() else "cpu")
 
-        # 模型 device 已烘焙进导出图，必须在目标卡上加载
+        # The model device is baked into the exported graph, so it must be loaded on the target GPU
         ctx = torch.cuda.device(self._device) if self._device.type == "cuda" else nullcontext()
         with ctx:
             ep = torch.export.load(path)
             self._module = ep.module()
             del ep
 
-        # torch.export 把参数名变成 args_0/args_1，按规范顺序回填
+        # torch.export renames parameters to args_0/args_1; restore the canonical order
         sig_names = list(inspect.signature(self._module.forward).parameters.keys())
         if sig_names and sig_names[0].startswith("args_"):
             self._input_names = ["input", "step", "hour", "doy"][:len(sig_names)]
@@ -67,7 +67,7 @@ class Pt2InferModel(BaseInferModel):
             state = torch.as_tensor(x)
         state = state.to(device=self._device, dtype=self._dtype)
 
-        # 分钟精度归一化（与官方 prepare_features 的 tod 一致）
+        # Minute-precision normalization (matches the official prepare_features tod)
         times = [valid_time] if np.ndim(valid_time) == 0 else list(valid_time)
         tod = [(value.hour * 60 + value.minute) / 1440.0 for value in times]
         feats = {
@@ -87,10 +87,10 @@ class Pt2InferModel(BaseInferModel):
         with torch.no_grad():
             result = self._module(*args)
 
-        return result.float()    # 保持 device 上的 torch tensor，落盘时才 D2H
+        return result.float()    # Keep the torch tensor on device; only move D2H when writing output
 
     def release(self):
-        """丢掉 module（换模型/进程收尾时调）。"""
+        """Drop the module (called when switching models or shutting down)."""
         self._module = None
         super().release()
 

@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
-"""fgvp_ens 真实数据档：真 51 成员集合 ONNX 在切片数据上跑一遍，和标准答案统计对拍。
+"""fgvp_ens realdata suite: run the real 51-member ensemble ONNX on sliced data and compare
+ensemble statistics against golden.
 
-逐成员对拍不成立（图内随机无 seed），故对集合均值：阈值按两次独立 51 成员采样的噪声
-√(2/51)·σ 自标定，超 4σ 记违规点。**tp 例外**：零膨胀重尾让实测越线率达 0.6~0.7%，
-占比线放宽到 0.05（真实回归会让降水区整片越线，仍隔一个量级）。批量化层另有用例盯
-rank 日志，防止 model_batch>1 静默退回 1。
+Per-member comparison is not viable (the randomness inside the graph has no seed), so the
+ensemble mean is compared: thresholds are self-calibrated from the noise of two independent
+51-member samples, sqrt(2/51)*sigma, and points beyond 4 sigma are violations. **tp is an
+exception**: zero inflation and heavy tails push the observed exceedance rate to 0.6-0.7%, so
+its fraction limit is relaxed to 0.05 (a genuine regression exceeds it across entire
+precipitation areas, still leaving an order of magnitude of margin). A separate test watches
+the rank log of the batching layer to catch model_batch>1 silently falling back to 1.
 
-跑法：pytest -m realdata tests/integration/test_fgvp_ens_realdata.py
+Usage: pytest -m realdata tests/integration/test_fgvp_ens_realdata.py
 """
 import re
 import sys
@@ -23,60 +27,67 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from realdata_common import (ATOL, EXCEED_FRACTION_CLOSE, RTOL, expected_vars,
-                             load_fields, steps_in, variables_in)
+from realdata_common import (ATOL, EXCEED_FRACTION_CLOSE, RTOL,
+                             FGVP_ENS_FIXTURE_ROOT, data_root_hint,
+                             expected_vars, load_fields, steps_in, variables_in)
 
-# runner 侧「批量化生效 / 被退回」的日志标记。从 runner import 而不抄字符串：措辞
-# 改了这里跟着变，不会退化成一个永远搜不到的旧标记、把判据变成假绿。
+# Runner-side log markers for "batching active / fell back". Imported from the runner rather than
+# copied as strings, so reworded markers follow automatically instead of degrading into a stale
+# marker that is never found and turns the check into a false pass.
 from xmetai_inference.utils.runner import BATCH_ACTIVE_MARK, BATCH_FALLBACK_MARK
 
-#: fixture 根。
-DATA_ROOT = Path("/workspace/data/shenzw/inference_test_data/fgvp_ens_test_data")
+#: Fixture root. The absolute path is configured at the top of realdata_common.py.
+DATA_ROOT = FGVP_ENS_FIXTURE_ROOT
 
-#: 本档自己的切片 store（fgvp 档的切片只覆盖 20250102，golden 归档没有那天）。
+#: This suite's own sliced stores (the fgvp slices cover only 20250102, which is absent from the golden archive).
 DATASET_ROOT = DATA_ROOT / "dataset"
 
-#: 被检 ONNX：iwc_gssp_im = fgvp_ens 现役图（与仓库配方同源）。
+#: ONNX under test: iwc_gssp_im, the current fgvp_ens graph (same source as the repository recipe).
 ONNX_NAME = "iwc_gssp_im.onnx"
 
-#: ONNX 外部权重（ORT 从 .onnx 同目录读，缺了加载即崩，必须一起自检）。
+#: ONNX external weights (ORT reads them from the .onnx directory; loading fails if missing, so this is checked too).
 ONNX_DATA_NAME = "iwc_gssp_im.data"
 
-#: 起报时间。必须是 fgvp_ens_merged 新 .so 批次（20250721 起）的完整日期。
+#: Initialization time. Must be a complete date from the fgvp_ens_merged new-.so batch (starting 20250721).
 TIMES = "2025072100"
 
-#: 参与对拍的步序号（1-based，与落盘的 ``001.nc`` 对齐）。
+#: Step indices compared (1-based, aligned with the written ``001.nc`` files).
 STEPS = 3
 
-#: 全员 51：集合统计的采样噪声按 √51 缩，测的就是正式配方语义。
+#: Full 51 members: ensemble sampling noise scales with sqrt(51); this tests the production recipe semantics.
 MEMBERS = 51
 
-#: 前向批：一次 forward 堆几条成员轨迹（51 成员 = 9 块：8×6 + 3）。显式写死而非靠配方
-#: 漂过来 —— 模板是 deepcopy 的正式配方（configs/weather_era_0p25_fgvp_ens.py 本身就是 6），不写的话
-#: 正式配方一改值这档会跟着变，覆盖面却没人知道。
+#: Forward batch: number of member trajectories stacked per forward pass (51 members = 9 chunks: 8x6 + 3).
+#: Pinned explicitly rather than inherited: the template deepcopies the production recipe
+#: (configs/weather_era_0p25_fgvp_ens.py is 6), so without this a recipe change would silently propagate here.
 MODEL_BATCH = 6
 
-#: 单卡（cuda_devices 单卡空转，同 fgvp 档顶部说明）。
+#: Single GPU (cuda_devices is inert on one GPU; see the note at the top of the fgvp suite).
 GPUS = 1
 
-#: 标准答案根。出处记在 golden/PROVENANCE.md。
+#: Golden reference root. Provenance is recorded in golden/PROVENANCE.md.
 GOLDEN_ROOT = DATA_ROOT / "golden"
 
-#: 整点起报 → cli 的目录名写 ``%Y%m%d``（8 位）。
+#: Hourly initialization -> the CLI writes the directory name as ``%Y%m%d`` (8 digits).
 INIT_DIR = "20250721"
 
-#: 均值对拍的噪声倍数：|z|>4 概率 ≈ 6.3e-5，远低于 1e-3 的判据线。
+#: Noise multiplier for the mean comparison: P(|z|>4) ≈ 6.3e-5, far below the 1e-3 decision line.
 Z_MAX = 4.0
 
-#: golden 逐点成员散度低于它就算确定性格点，回落 RTOL/ATOL。
-#: 绝对值而非相对值：输出变量量级 O(1)~O(1e5)，1e-6 之下纯属 float 噪声。
+#: Golden per-point member spread below this counts as a deterministic cell, falling back to RTOL/ATOL.
+#: An absolute rather than relative value: output variables range over O(1)-O(1e5), and anything below 1e-6 is pure float noise.
 SIGMA_FLOOR = 1e-6
 
-#: 均值对拍违规占比的失败线，按变量覆盖。tp 的 0.05 是实测定的（见文件头「tp 例外」）。
+#: Failure threshold for the violation fraction of the mean comparison, overridable per variable.
+#: tp's 0.05 is empirically derived (see "tp is an exception" in the module header).
 _FAIL_FRACTION = {"tp": 0.05}
 
-#: 成员目录名：member_000 起步（0 基）。
+#: Member directory names: start at member_000 (0-based).
 _MEMBER_RE = re.compile(r"^member_(\d{3})$")
+
+_hint = data_root_hint(DATA_ROOT)
+if _hint:
+    pytest.skip(_hint, allow_module_level=True)
 
 _missing = []
 if not DATASET_ROOT.is_dir() or len(list(DATASET_ROOT.glob("*.zarr"))) != 3:
@@ -102,23 +113,24 @@ else:
 if _missing:
     pytest.skip(
         f"fixture 不齐: {DATA_ROOT}（缺 {', '.join(_missing)}）—— "
-        "把切片 store、模型、.so、golden 放进该目录后再跑",
+        "把切片 store、模型、.so、golden 放进该目录后再跑；"
+        "DATA_ROOT 在 tests/integration/realdata_common.py 顶部配置",
         allow_module_level=True,
     )
 
 
 _CONFIG_TEMPLATE = Template('''\
 # -*- coding: utf-8 -*-
-"""fgvp_ens 真实数据档的推理配方 —— 由 test_fgvp_ens_realdata.py 运行时生成，别手改。"""
+"""fgvp_ens realdata inference recipe; generated at runtime by test_fgvp_ens_realdata.py. Do not edit."""
 import copy
 from pathlib import Path
 
 from xmetai_inference.configs.weather_era_0p25_fgvp_ens import cfg as _production
 
-# deepcopy：import 拿到的是缓存的同一个对象，直接改会把正式配方改成指向 fixture。
+# deepcopy: import returns the same cached object; mutating it directly would point the production recipe at the fixture.
 cfg = copy.deepcopy(_production)
 
-# 三个切片 store glob 出来即用；通道按名字选，顺序不影响结果。
+# Use all three sliced stores found by glob; channels are selected by name, so order does not matter.
 DATASET_ROOT = Path("$dataset_root")
 _paths = sorted(DATASET_ROOT.glob("*.zarr"))
 if len(_paths) != 3:
@@ -130,19 +142,20 @@ cfg.dataset["paths"] = [str(p) for p in _paths]
 
 DATA_ROOT = Path("$data_root")
 cfg.model_path = str(DATA_ROOT / "$onnx_name")
-# .so 与 onnxruntime/CUDA 是 ABI 绑定的，必须用 fixture 里配套的那份。
+# The .so is ABI-bound to onnxruntime/CUDA; use the copy shipped with the fixture.
 cfg.ops_library = "$ops_library"
 
-# 自回归第 i 步只依赖第 <i 步。集合语义下 golden 也只存 3 步。
+# Autoregressive step i depends only on steps < i. For ensembles, the golden data also stores only 3 steps.
 cfg.times = "$times"
 cfg.steps = $steps
 cfg.members = $members
 cfg.gpus = $gpus
-# 前向批：本档要证明批量化路径本身没坏（切块 → 一次 forward k 条 → 逐行回填），
-# 所以显式给值，不靠正式配方漂过来（见 MODEL_BATCH 的说明）。图不是动态 batch 轴
-# 时 runner 会打 WARNING 退回 1，由 test_..._model_batch_takes_effect 拦。
+# Forward batching: this suite verifies the batching path itself (split into chunks -> one
+# forward for k members -> fill rows back), so set the value explicitly instead of inheriting
+# it from the production recipe (see MODEL_BATCH). If the graph has no dynamic batch axis, the
+# runner logs a WARNING and falls back to 1; test_..._model_batch_takes_effect catches that.
 cfg.model_batch = $model_batch
-# worker 设 0 免得 DataLoader 再起子进程。
+# num_workers=0 avoids spawning DataLoader subprocesses.
 cfg.dataloader = {
     "batch_size": 1,
     "num_workers": 0,
@@ -154,13 +167,13 @@ cfg.dataloader = {
 
 
 def _ops_library_path() -> str:
-    """fixture 里那份 .so 的路径（同名可能带版本后缀，glob 出来）。"""
+    """Path to the .so in the fixture (the same base name may carry a version suffix; found by glob)."""
     matches = sorted(DATA_ROOT.glob("xmetai_onnx_plugins*.so"))
     return str(matches[0]) if matches else "xmetai_onnx_plugins.so"
 
 
 def _write_config(dest: Path) -> Path:
-    """把模板落成真文件。CLI 收的是路径，给不了对象。"""
+    """Materialize the template as a real file. The CLI accepts paths, not objects."""
     dest.write_text(
         _CONFIG_TEMPLATE.substitute(
             dataset_root=str(DATASET_ROOT),
@@ -178,11 +191,13 @@ def _write_config(dest: Path) -> Path:
     return dest
 
 
-# 51 成员 × 3 步 × 5 变量的场 ≈6GB float64 持不住，故逐成员流式累计 sum/sumsq/count。
-# float64 累计是必须的：z500 平方和方差比 mean² 小 ~1e-6，float32 舍入会吃掉散度。
+# The full 51 members x 3 steps x 5 variables field set (~6 GB as float64) does not fit in memory,
+# so sum/sumsq/count are accumulated streaming, member by member.
+# float64 accumulation is essential: the variance is mean-square minus mean^2, a difference of
+# only ~1e-6 relative to the mean square, and float32 rounding would consume the spread.
 
 def _member_dirs(root: Path) -> dict:
-    """成员目录根 -> ``{成员号(3位): 路径}``，只认 ``member_NNN`` 命名。"""
+    """Member root directory -> ``{member id (3 digits): path}``; only ``member_NNN`` names are recognized."""
     found = {}
     for path in sorted(p for p in root.iterdir() if p.is_dir()):
         match = _MEMBER_RE.fullmatch(path.name)
@@ -192,22 +207,22 @@ def _member_dirs(root: Path) -> dict:
 
 
 def _mean_std(sum_, sumsq, count):
-    """流式累计 -> (逐点均值, 逐点标准差)。未累计到的点计为 NaN。"""
+    """Streaming accumulators -> (per-point mean, per-point standard deviation). Points with no accumulated samples are NaN."""
     with np.errstate(invalid="ignore", divide="ignore"):
         mean = np.where(count > 0, sum_ / np.maximum(count, 1), np.nan)
         var = np.where(count > 1,
                        sumsq / np.maximum(count, 1) - mean * mean, np.nan)
-    # 平方和法的微负截回 0。
+    # Clamp the small negative variance of the sum-of-squares method to 0.
     std = np.sqrt(np.maximum(var, 0.0))
     return mean, std
 
 
 def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
-    """两侧 51 成员目录流式对拍，返回 ``{rows, skipped, twins}``。
+    """Stream-compare the 51-member directories on both sides; returns ``{rows, skipped, twins}``.
 
-    ``rows`` 每个 (步, 变量) 一条（均值对拍 + NaN/spread 指标）；``skipped`` 记只在
-    一侧存在的 (成员/步/变量)；``twins`` 记与 member_000 逐位相同的 (成员, 步)。
-    网格不一致直接抛 ValueError。
+    ``rows`` holds one entry per (step, variable) (mean comparison plus NaN/spread metrics);
+    ``skipped`` records members/steps/variables present on only one side; ``twins`` records
+    (member, step) pairs bit-identical to member_000. A grid mismatch raises ValueError.
     """
     run_members = _member_dirs(run_members_root)
     golden_members = _member_dirs(golden_members_root)
@@ -220,13 +235,13 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
         raise ValueError(
             f"两侧没有共同的成员目录。\n  产物: {sorted(run_members)}\n  golden: {sorted(golden_members)}")
 
-    # 变量清单从第一对文件探测（同一次运行里所有成员/步都一样）。
+    # Probe the variable list from the first file pair (identical across all members/steps within one run).
     first_run_dir = run_members[common[0]]
     first_golden_dir = golden_members[common[0]]
     names = None
-    base = {}          # member_000 各 (step, var) 的场，成员互异性的比对基准
+    base = {}          # member_000 fields per (step, var), the baseline for member distinctness
     twin_members = []
-    acc = {}            # (step, var) -> 累计器；run/golden 两侧各一套
+    acc = {}            # (step, var) -> accumulators; one set each for run and golden
 
     def _slot(step, var):
         key = (step, var)
@@ -258,7 +273,7 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
             skipped.append(("步", f"{member_id}/{step:03d}", "只在 golden 侧"))
         steps = sorted(run_steps & gold_steps)
 
-        member_is_twin = {}  # step -> 是否与基准成员完全相同
+        member_is_twin = {}  # step -> whether identical to the baseline member
         for step in steps:
             path_run = run_dir / f"{step:03d}.nc"
             path_gold = gold_dir / f"{step:03d}.nc"
@@ -272,7 +287,7 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
 
             fields_run, lat_r, lon_r = load_fields(path_run, names)
             fields_gold, lat_g, lon_g = load_fields(path_gold, names)
-            # 网格对不上说明网格本身变了，逐格相减没有意义。
+            # A grid mismatch means the grid itself changed; cell-wise subtraction is meaningless.
             if lat_r.shape != lat_g.shape or lon_r.shape != lon_g.shape:
                 raise ValueError(f"网格 shape 不一致：{path_run} 与 {path_gold}")
             if not (np.allclose(lat_r, lat_g, atol=1e-4)
@@ -305,7 +320,7 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
             if twin_here:
                 twin_members.append((member_id, step))
 
-    noise_scale = np.sqrt(2.0 / MEMBERS)   # 两次独立 51 成员采样均值差的 σ 倍率
+    noise_scale = np.sqrt(2.0 / MEMBERS)   # sigma multiplier for the mean difference of two independent 51-member samples
     rows = []
     for (step, var), slot in sorted(acc.items()):
         run_mean, run_std = _mean_std(slot["run_sum"], slot["run_sumsq"],
@@ -315,7 +330,7 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
         compared = (slot["run_count"] > 0) & (slot["gold_count"] > 0)
         diff = run_mean - gold_mean
         noise = gold_std * noise_scale
-        # 确定性格点（golden 散度可忽略）回落 RTOL/ATOL；集合格点 4 倍预测噪声。
+        # Deterministic cells (negligible golden spread) fall back to RTOL/ATOL; stochastic cells use 4x predicted noise.
         deterministic = compared & (gold_std <= SIGMA_FLOOR)
         stochastic = compared & ~deterministic
         fail = np.zeros(diff.shape, dtype=bool)
@@ -343,7 +358,7 @@ def _collect(run_members_root: Path, golden_members_root: Path) -> dict:
 
 @pytest.fixture(scope="session")
 def run(tmp_path_factory):
-    """跑一次真 51 成员推理并对拍，整模块共用。返回 ``(指标, 配方路径)``。"""
+    """Run the real 51-member inference once and compare, shared across the module. Returns ``(metrics, recipe path)``."""
     from xmetai_inference import main
 
     config_path = _write_config(
@@ -357,7 +372,7 @@ def run(tmp_path_factory):
     else:
         print(f"\n[fixture] 提醒：{provenance} 缺失 —— golden 出处未记录")
 
-    # SystemExit 单独接住，理由同 fgvp 档。
+    # Catch SystemExit separately, for the same reason as the fgvp suite.
     try:
         rc = main(["--config", str(config_path), "--out", str(out_dir)])
     except SystemExit as exc:
@@ -369,9 +384,10 @@ def run(tmp_path_factory):
         f"产物目录里没有 {INIT_DIR}/，实有：{sorted(p.name for p in out_dir.iterdir())}")
     metrics = _collect(run_root, GOLDEN_ROOT / INIT_DIR)
 
-    # 批量化进没进图只有 rank 日志说得清：单卡走 cli._run_infer 的 gpus<=1 分支，日志
-    # 固定落 <out>/rank_0.log（多卡才是 rank_N.log）。判定放在用例里，免得日志路径一变
-    # 连坐四条与批量化无关的用例。
+    # Only the rank log reveals whether batching actually entered the graph: a single GPU goes
+    # through cli._run_infer's gpus<=1 branch, and the log always lands at <out>/rank_0.log
+    # (rank_N.log only with multiple GPUs). The assertion lives in the test so that a change of
+    # log path does not also fail the four tests unrelated to batching.
     log_path = out_dir / "rank_0.log"
     log_text = (log_path.read_text(encoding="utf-8", errors="replace")
                 if log_path.is_file() else "")
@@ -386,7 +402,7 @@ def run(tmp_path_factory):
 
 
 def test_fgvp_ens_mean_matches_golden(run):
-    """核心：集合均值与 golden 均值的偏离不得超过预测采样噪声（自标定口径）。"""
+    """Core: the ensemble mean must not deviate from the golden mean beyond the predicted sampling noise (self-calibrated)."""
     metrics, _ = run
     rows = metrics["rows"]
     assert rows, "没有可比对象 —— 产物和标准答案没有共同的 (成员, 步, 变量)"
@@ -412,7 +428,7 @@ def test_fgvp_ens_mean_matches_golden(run):
 
 
 def test_fgvp_ens_perturbation_alive(run):
-    """集合性：成员必须互不相同，且每个 (步, 变量) 的 spread 必须为正。"""
+    """Ensemble sanity: members must differ from one another, and the spread of every (step, variable) must be positive."""
     metrics, _ = run
 
     assert not metrics["twins"], (
@@ -432,7 +448,7 @@ def test_fgvp_ens_perturbation_alive(run):
 
 
 def test_fgvp_ens_coverage(run):
-    """覆盖面兜底：51 成员 × 步 × 变量一个都不能静默少比；另加 tp 非负。"""
+    """Coverage guard: no member, step, or variable may be silently skipped; also checks that tp is non-negative."""
     metrics, config_path = run
     rows, skipped = metrics["rows"], metrics["skipped"]
 
@@ -462,7 +478,7 @@ def test_fgvp_ens_coverage(run):
 
 
 def test_fgvp_ens_no_nan_mismatch(run):
-    """NaN↔数值的格子不进超容差统计，缺测位置得逐成员盯。"""
+    """Cells that are NaN on one side and numeric on the other do not enter the exceed statistics; missing-data positions are checked per member."""
     metrics, _ = run
     bad = [r for r in metrics["rows"] if r["nan_mismatch"] > 0]
     assert not bad, (
@@ -473,11 +489,12 @@ def test_fgvp_ens_no_nan_mismatch(run):
 
 
 def test_fgvp_ens_model_batch_takes_effect(run):
-    """批量化层：``model_batch>1`` 必须真进图，不能悄悄退回逐条。
+    """Batching layer: ``model_batch>1`` must actually enter the graph, not silently fall back to per-sample.
 
-    图不是动态 batch 轴时 runner 只打一条 WARNING 就退回 1，这一趟照跑完、均值/散度/
-    成员互异照样全绿 —— 那时这条档与批量化无关。故以 rank 日志为凭：「生效」或
-    「退回」必有其一。
+    When the graph has no dynamic batch axis, the runner emits a single WARNING and falls back
+    to 1; the run still completes and the mean/spread/member-distinctness checks all pass, so
+    this suite would prove nothing about batching. The rank log is therefore authoritative:
+    exactly one of "active" or "fell back" must appear.
     """
     metrics, _ = run
     info = metrics["model_batch"]

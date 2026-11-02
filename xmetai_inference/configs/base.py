@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""推理配置基座：公共网格/通道声明 + InferConfig + load_config()。
+"""Inference config base: common grid/channel declarations + InferConfig + load_config().
 
-每个 ``configs/<name>.py`` = 模型类（声明契约）+ 全局 ``cfg``（运行配方）；配方里
-公共件统一 ``from xmetai_inference.configs.base import ...``。
+Each ``configs/<name>.py`` = model class (declares the contract) + module-level ``cfg`` (run recipe);
+recipes import shared pieces via ``from xmetai_inference.configs.base import ...``.
 """
 import importlib.util
 import os
@@ -15,14 +15,15 @@ from typing import Any
 import numpy as np
 
 
-# FuXi-Ens、FuXi-2.1 和 FGVP 共用的 0.25° 全球规则网格。
+# Shared 0.25 degree global regular grid for FuXi-Ens, FuXi-2.1, and FGVP.
 GRID_025 = {
     "lat": {"start": 90.0, "step": -0.25, "size": 721},
     "lon": {"start": 0.0, "step": 0.25, "size": 1440},
 }
 
-# 南→北版本（CRA store 原生朝向，Tongyun-CRA 图就用它）。用它**不要**配 geometry：
-# 该处理器会把南→北无条件翻成北→南，把场喂反。输出 lat 坐标也取自这个 grid。
+# South-to-north variant (native CRA store orientation; used by the Tongyun-CRA graph).
+# Do NOT pair it with geometry: that processor unconditionally flips south-to-north to
+# north-to-south, feeding fields in reverse. Output lat coordinates also come from this grid.
 GRID_025_S = {
     "lat": {"start": -90.0, "step": 0.25, "size": 721},
     "lon": {"start": 0.0, "step": 0.25, "size": 1440},
@@ -54,8 +55,9 @@ FUXI_ENS_CHANNELS = _expand_channels(
 FUXI21_CHANNELS = _expand_channels(
     PL_VARS, LEVELS, FUXI21_SFC_VARS)
 
-# fengshun2.0：87 通道 = 上层 65 + 22 地面（比 FuXi-2.1 多 t2m_min/t2m_max）。
-# 顺序必须与输入盘 channel 数组及图内 mean/std 逐位一致；改顺序不报错、只会整场错位。
+# fengshun2.0: 87 channels = 65 upper-air + 22 surface (adds t2m_min/t2m_max over FuXi-2.1).
+# Order must match the input store's channel array and the graph's mean/std element by
+# element; reordering raises no error but misaligns the whole field.
 FENGSHUN_SFC_VARS = [
     "msl", "t2m", "t2m_min", "t2m_max", "d2m", "sst", "ws10m", "ws100m",
     "u10m", "v10m", "u100m", "v100m", "lcc", "mcc", "hcc", "tcc",
@@ -70,20 +72,20 @@ FENGQING_SFC_VARS = ["tp", "msl", "u10m", "v10m", "t2m"]
 FENGQING_CHANNELS = _expand_channels(
     FENGQING_PL_VARS, FENGQING_LEVELS, FENGQING_SFC_VARS)
 
-# Pangu-Weather：层级与上层变量序同 FengQing；地面通道无 tp，= [msl,u10m,v10m,t2m]。
+# Pangu-Weather: same levels and upper-air variable order as FengQing; surface channels have no tp, = [msl,u10m,v10m,t2m].
 PANGU_LEVELS = FENGQING_LEVELS
 PANGU_PL_VARS = FENGQING_PL_VARS
 PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
 PANGU_CHANNELS = _expand_channels(
     PANGU_PL_VARS, PANGU_LEVELS, PANGU_SFC_VARS)
 
-# CRA c71：上层 z/t/u/v/q × 13 层（50→1000 升序）+ 地面 [t2m,q2m,u10m,v10m,msl,tp]。
+# CRA c71: upper-air z/t/u/v/q x 13 levels (50 to 1000 ascending) + surface [t2m,q2m,u10m,v10m,msl,tp].
 CRA_SFC_VARS = ["t2m", "q2m", "u10m", "v10m", "msl", "tp"]
 CRA_CHANNELS = _expand_channels(PL_VARS, LEVELS, CRA_SFC_VARS)
 
 
 def grid_coords(grid):
-    """模型网格契约 → 纬度、经度坐标数组。"""
+    """Convert a model grid contract to latitude and longitude coordinate arrays."""
     latitude = grid["lat"]
     longitude = grid["lon"]
     lat = (
@@ -97,16 +99,16 @@ def grid_coords(grid):
     return lat, lon
 
 
-# 项目根目录（绝对）；wheel 安装在外部时可显式设置 XMETAI_INFERENCE_ROOT。
+# Project root (absolute); set XMETAI_INFERENCE_ROOT explicitly when the wheel is installed elsewhere.
 ROOT = os.environ.get("XMETAI_INFERENCE_ROOT") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# 包内配方目录（--config <name> / --model <name> 都解析到这里）。
+# In-package recipe directory (both --config <name> and --model <name> resolve here).
 PACKAGE_RECIPES = os.path.dirname(os.path.abspath(__file__))
 
 
 def _parse_dt(token):
-    """单个起报时间 token -> datetime（YYYYMMDD 或 YYYYMMDDHH）。"""
+    """Parse one initialization-time token into a datetime (YYYYMMDD or YYYYMMDDHH)."""
     token = token.strip()
     if re.fullmatch(r"\d{8}", token):
         return datetime.strptime(token, "%Y%m%d")
@@ -116,15 +118,15 @@ def _parse_dt(token):
 
 
 def parse_times(spec, hour_interval=24):
-    """把统一的 `times` 字符串展开成起报时间列表（datetime，升序去重）。
+    """Expand the unified `times` string into initialization times (datetime, ascending, deduplicated).
 
-    语法：
+    Syntax:
       ""                                 → []
-      "2025010600" / "20250106"          → 单个起报
-      "20250106,20250112"                → 显式列表（逗号分隔）
-      "2025010600..2025020500"           → 闭区间，步长 hour_interval（默认 24h=每天一次）
-      "2025010600..2025020500:24"        → 闭区间，`:N` 覆盖步长（小时）
-    单个与区间可混在同一个逗号列表里，如 "20250106,20250110..20250112:12"。
+      "2025010600" / "20250106"          → single initialization
+      "20250106,20250112"                → explicit list (comma-separated)
+      "2025010600..2025020500"           → closed interval, step hour_interval (default 24h = once per day)
+      "2025010600..2025020500:24"        → closed interval, `:N` overrides the step (hours)
+    Singles and intervals may be mixed in one comma-separated list, e.g. "20250106,20250110..20250112:12".
     """
     if spec is None or str(spec).strip() == "":
         return []
@@ -153,7 +155,7 @@ def parse_times(spec, hour_interval=24):
 
 @dataclass
 class ModelProcessingConfig:
-    """模型侧三段处理配方：input / recurrent / output。"""
+    """Model-side three-stage processing recipe: input / recurrent / output."""
 
     input: Any = field(default_factory=list)
     recurrent: Any = field(default_factory=list)
@@ -162,41 +164,42 @@ class ModelProcessingConfig:
 
 @dataclass
 class InferConfig:
-    """一次推理的完整运行配方（由 cli 加载并执行）。"""
+    """Complete run recipe for a single inference job (loaded and executed by the CLI)."""
     name: str
-    model_path: str                          # 模型文件路径（.onnx/.pt2）
-    model_class: Any = "fuxi_ens_onnx"       # 注册名，或直接传 BaseInferModel 子类
-    # Processor 属于模型运行配方，不属于 Dataset/DataLoader。
+    model_path: str                          # Model file path (.onnx/.pt2)
+    model_class: Any = "fuxi_ens_onnx"       # Registered name, or a BaseInferModel subclass directly
+    # Processors are part of the model run recipe, not of Dataset/DataLoader.
     model_processing: Any = None
-    pre_processors: Any = None               # 旧配置兼容；新配置用 model_processing
+    pre_processors: Any = None               # Legacy compatibility; new configs use model_processing
     recurrent_processors: Any = None
     output_processors: Any = None
-    ops_library: str = ""                    # 自定义算子库 .so（空 = 标准模型）
-    gpu_state: Any = None                    # None = 用模型类默认；True/False 可覆盖
-    intra_op_threads: int = 0                # 0 = ORT 默认
+    ops_library: str = ""                    # Custom operator library .so (empty = standard model)
+    gpu_state: Any = None                    # None = use the model class default; True/False overrides
+    intra_op_threads: int = 0                # 0 = ORT default
     cudnn_algo_search: str = ""              # "" = EXHAUSTIVE
-    # 一次 forward 堆几条轨迹（前向批，不是 dataset 的 batch_size）。要求图的 batch
-    # 轴是符号维且不与 gpu_state=True 同用；显存按此倍数涨。
+    # Number of trajectories stacked per forward pass (forward batch, not the dataset batch_size).
+    # The graph's batch axis must be symbolic, and this must not be combined with
+    # gpu_state=True; memory scales by this factor.
     model_batch: int = 1
     dataset: Any = None
     dataloader: Any = field(default_factory=dict)
-    data_root: str = ""                      # 可选覆盖数据源根目录（保留字段；当前 Dataset 使用绝对路径）
-    times: str = ""                          # 起报时间（统一格式，见 parse_times）
-    steps: int = 60                          # 预报步数
-    hour_interval: int = 0                  # 时间步长小时（0 = 读模型类的 hour_interval）
-    members: int = 0                         # 集合成员数（0 = 读模型类的 members）
-    vars: str = ""                           # 输出变量，逗号分隔（空 = 保存全部通道）
-    gpu_mem: float = 0.7                     # 显存占用比例
-    log_level: str = "INFO"                  # 控制台日志级别
-    gpus: int = 1                            # 卡数（>1 时按起报时间分摊到各卡）
-    cuda_devices: str = "0"                  # 物理卡号，逗号分隔，按序对应各 rank
-    output_dir: str = ""                     # 输出目录（空 = 只做输入校验，不跑模型）
-    # 仅文档 / K8s Job 用：标明该配置应在哪个镜像里跑（自定义算子 .so 是 ABI 绑定）
+    data_root: str = ""                      # Optional data source root override (reserved; current Datasets use absolute paths)
+    times: str = ""                          # Initialization times (unified format; see parse_times)
+    steps: int = 60                          # Forecast steps
+    hour_interval: int = 0                  # Time step in hours (0 = read hour_interval from the model class)
+    members: int = 0                         # Ensemble member count (0 = read members from the model class)
+    vars: str = ""                           # Output variables, comma-separated (empty = save all channels)
+    gpu_mem: float = 0.7                     # GPU memory fraction
+    log_level: str = "INFO"                  # Console log level
+    gpus: int = 1                            # GPU count (>1 distributes initialization times across GPUs)
+    cuda_devices: str = "0"                  # Physical device IDs, comma-separated, mapped to ranks in order
+    output_dir: str = ""                     # Output directory (empty = input validation only, no model run)
+    # Documentation / K8s Job only: the image this config should run in (custom operator .so is ABI-bound)
     image: str = "registry.bingosoft.net/pytorch/pytorch:2.11.0-cuda12.8-mamba3-20260403"
     _source_path: str = field(init=False, repr=False, default="")
 
     def resolve_path(self, value):
-        """相对外部 config 所在目录解析本地路径；URL 和绝对路径保持不变。"""
+        """Resolve a local path relative to the external config's directory; URLs and absolute paths are unchanged."""
         if not value or os.path.isabs(value) or "://" in value:
             return value
         base = os.path.dirname(self._source_path) if self._source_path else ROOT
@@ -209,7 +212,7 @@ class InferConfig:
         return self.resolve_path(self.ops_library)
 
     def processor_specs(self):
-        """取 (input, recurrent, output) 三段；兼容旧的平铺字段。"""
+        """Return the (input, recurrent, output) triple; also supports the legacy flat fields."""
         if self.model_processing is not None:
             if any(
                 value is not None
@@ -235,14 +238,14 @@ class InferConfig:
 
 
 def _resolve_config_path(value):
-    """解析外部配置路径或包内配方名（包内配方 = ``configs/<name>.py``）。"""
+    """Resolve an external config path or an in-package recipe name (in-package recipe = ``configs/<name>.py``)."""
     value = os.fspath(value)
     direct = os.path.abspath(value)
     if os.path.isfile(direct):
         return direct
 
     name = value.replace("\\", "/")
-    # 带目录前缀的写法（含 job yaml 里拼的绝对路径片段）继续接受。
+    # Paths with a directory prefix (including absolute fragments assembled in job yamls) remain accepted.
     for prefix in ("configs/", "models/"):
         if name.startswith(prefix):
             name = name.rsplit("/", 1)[-1]
@@ -257,17 +260,18 @@ def _resolve_config_path(value):
 
 
 def load_config(path):
-    """加载外部配置文件或包内配方名，返回其中的 InferConfig。
+    """Load an external config file or in-package recipe name and return its InferConfig.
 
-    按文件路径逐次 exec（而非 import_module）：重新 load 会得到新一批配置对象，
-    文件改动与模块级 ``os.environ`` 读取都生效。因此配方里必须用绝对导入。
+    The file is exec'd by path each time (rather than import_module): reloading yields a fresh
+    set of config objects, and both file edits and module-level ``os.environ`` reads take effect.
+    Recipes must therefore use absolute imports.
     """
     path = _resolve_config_path(path)
     if not os.path.isfile(path):
         raise SystemExit(f"配置文件不存在：{path}")
     config_dir = os.path.dirname(path)
     if config_dir not in sys.path:
-        # 不删：config 导入的本地模型可能后续还要加载同目录的其他模块。
+        # Do not remove: local models imported by the config may later load other modules from the same directory.
         sys.path.insert(0, config_dir)
     module_name = f"_xmetai_run_config_{abs(hash(path))}"
     spec = importlib.util.spec_from_file_location(module_name, path)

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""ONNX Runtime 后端：通用加载 + 一步前向。
+"""ONNX Runtime backend: generic loading plus single-step forward.
 
-时间标量的编码差异用类属性 ``time_features`` 声明，不必重写 forward。
+Differences in time scalar encoding are declared via the class attribute
+``time_features``; forward need not be overridden.
 """
 import logging
 import os
@@ -15,16 +16,16 @@ log = logging.getLogger(__name__)
 
 
 def _as_numpy_onnx(value):
-    """torch → contiguous numpy；ONNX Runtime 输入边界允许这一次转换。"""
+    """torch -> contiguous numpy; the ONNX Runtime input boundary permits this one conversion."""
     if hasattr(value, "detach") and hasattr(value, "cpu"):
         return np.ascontiguousarray(value.detach().cpu().numpy())
     return np.ascontiguousarray(value)
 
 
 def _preload_onnxruntime_lib():
-    """用 RTLD_GLOBAL 预加载版本化的 libonnxruntime，供自定义算子 .so 解析。
+    """Preload the versioned libonnxruntime with RTLD_GLOBAL so custom-op .so files can resolve it.
 
-    失败静默；真正的错误留给 register_custom_ops_library 抛。
+    Failures are silent; the real error is left to register_custom_ops_library to raise.
     """
     import ctypes
     import glob
@@ -33,7 +34,7 @@ def _preload_onnxruntime_lib():
         import onnxruntime as _ort
 
         capi = os.path.join(os.path.dirname(_ort.__file__), "capi")
-        # 优先无版本号的软链（若环境已经补过），否则取版本化文件
+        # Prefer the unversioned symlink (if the environment already created one), otherwise the versioned file
         for pattern in ("libonnxruntime.so.1", "libonnxruntime.so.1.*"):
             matches = sorted(glob.glob(os.path.join(capi, pattern)))
             if matches:
@@ -44,19 +45,21 @@ def _preload_onnxruntime_lib():
     return None
 
 
-# 时间标量输入的默认编码（Tongyun-CRA 口径，逐位等于旧版实现）。
-# 模型类用 ``time_features`` 覆盖任意一项，没写的键沿用这里；调用点按图签名过滤。
+# Default encoding for time scalar inputs (Tongyun-CRA convention, bit-identical to the
+# previous implementation). Model classes override any entry via ``time_features``; omitted
+# keys fall back to this table and are filtered by the graph signature at the call site.
 DEFAULT_TIME_FEATURES = {
     "step": {"divisor": 1.0},
     "hour": {"divisor": 24.0},
     "doy": {"divisor": 365.0, "clip_max": 365},
-    # 图内扰动的幅度旋钮（CRA 版 Tongyun 有，ERA5 版没有）：1.0 = 训练时的标称噪声。
+    # Amplitude knob for in-graph perturbation (present in the CRA Tongyun version, absent
+    # from ERA5): 1.0 = nominal noise at training time.
     "perturb_std_scale": {"value": 1.0},
 }
 
 
 def _day_of_year(value):
-    """day-of-year：pandas Timestamp 有 day_of_year / dayofyear，datetime 走 timetuple。"""
+    """day-of-year: pandas Timestamp has day_of_year / dayofyear; datetime goes through timetuple."""
     for attr in ("day_of_year", "dayofyear"):
         day = getattr(value, attr, None)
         if day is not None:
@@ -65,10 +68,11 @@ def _day_of_year(value):
 
 
 def _scalar_feeds(valid_time, step, features=None):
-    """构造图内标量输入（模型签名里没有的键会被 drop）。
+    """Build in-graph scalar inputs (keys absent from the model signature are dropped).
 
-    每项可给 ``divisor`` / ``clip_max`` / ``value``；hour/doy 取输入窗末帧的时刻。
-    编码在 float64 上做、最后转 float32，与旧实现逐位相同。
+    Each entry may provide ``divisor`` / ``clip_max`` / ``value``; hour/doy use the
+    timestamp of the last frame in the input window. Encoding is done in float64 and
+    cast to float32 at the end, bit-identical to the previous implementation.
     """
     table = DEFAULT_TIME_FEATURES if features is None else features
     times = [valid_time] if np.ndim(valid_time) == 0 else list(valid_time)
@@ -97,12 +101,12 @@ def _scalar_feeds(valid_time, step, features=None):
 
 
 class OnnxInferModel(BaseInferModel):
-    """ONNX Runtime 后端（CUDAExecutionProvider）。"""
+    """ONNX Runtime backend (CUDAExecutionProvider)."""
     backend = "onnx"
-    # 时间标量编码的覆盖，只写要改的键（图接口契约）
+    # Overrides for time scalar encoding; only keys to change need to be written (graph interface contract)
     time_features = {}
     use_cpu_initializers = True
-    ops_library = None                   # 自定义算子库 .so，None = 不需要
+    ops_library = None                   # Custom operator library .so; None = not needed
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
         super().__init__(device_id=device_id, gpu_mem_fraction=gpu_mem_fraction)
@@ -123,12 +127,12 @@ class OnnxInferModel(BaseInferModel):
                 raise ValueError(
                     f"time_features[{name!r}] 有未知字段 {sorted(bad)}"
                     f"（可选 {sorted(allowed_keys)}）")
-        # 合并成实例表：子类只写要覆盖的项，行为与「照抄整张表」等价
+        # Merge into an instance table: subclasses override only selected entries; behavior equals copying the whole table
         self._time_features = {**DEFAULT_TIME_FEATURES, **overrides}
 
     def _make_session(self, path):
-        """建 ONNX InferenceSession（路径校验 + 选项 + provider + 自定义算子）。"""
-        # JSON 误传成模型时给明确提示，而不是 ORT 的 Protobuf 报错
+        """Create an ONNX InferenceSession (path validation + options + provider + custom ops)."""
+        # Give a clear message when a JSON file is passed instead of a model, rather than ORT's Protobuf error
         if not os.path.exists(path):
             raise FileNotFoundError(f"模型文件不存在：{path}")
         if path.lower().endswith(".json"):
@@ -147,14 +151,14 @@ class OnnxInferModel(BaseInferModel):
         options.enable_cpu_mem_arena = True
         options.enable_mem_reuse = True
         options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        # 不设 intra_op 时 ORT 吃满物理核，多 worker 会超订；inter_op 在
-        # ORT_SEQUENTIAL 下无效，恒为 1。
+        # Without intra_op set, ORT saturates physical cores and oversubscribes with multiple
+        # workers; inter_op is ineffective under ORT_SEQUENTIAL and is always 1.
         if int(getattr(self, "intra_op_threads", 0) or 0) > 0:
             options.intra_op_num_threads = int(self.intra_op_threads)
         options.inter_op_num_threads = 1
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         if self.use_cpu_initializers:
-            # 权重留在主机内存，按需送显存（大模型省显存的关键）
+            # Keep weights in host memory and transfer to GPU on demand (key to saving GPU memory for large models)
             options.add_session_config_entry("session.use_device_allocator_for_initializers", "0")
             options.add_session_config_entry("session.use_ort_model_bytes_directly", "1")
         options.log_severity_level = 3
@@ -164,11 +168,11 @@ class OnnxInferModel(BaseInferModel):
             "arena_extend_strategy": "kSameAsRequested",
             "cudnn_conv_use_max_workspace": "0",
             "do_copy_in_default_stream": "1",
-            # CUDA EP 选项：首次推理慢，之后缓存每层最优 kernel
+            # CUDA EP option: the first inference is slow; afterwards the best kernel per layer is cached
             "cudnn_conv_algo_search": str(
                 getattr(self, "cudnn_algo_search", "") or "EXHAUSTIVE"),
         }
-        # 拿不到真实显存上限时不写 gpu_mem_limit；非法值会被 ORT 当成 0 字节上限。
+        # Omit gpu_mem_limit when the real memory limit cannot be queried; invalid values are treated by ORT as a 0-byte limit.
         limit = _default_gpu_mem_limit(self.device_id, self.gpu_mem_fraction)
         if limit is not None:
             cuda_opts["gpu_mem_limit"] = str(limit)
@@ -177,7 +181,7 @@ class OnnxInferModel(BaseInferModel):
         if "CUDAExecutionProvider" in ort.get_available_providers():
             providers.append(("CUDAExecutionProvider", cuda_opts))
         providers.append(("CPUExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}))
-        # 自定义算子 .so 必须与 onnxruntime 版本 ABI 匹配
+        # The custom operator .so must match the onnxruntime version ABI
         if self.ops_library:
             if not os.path.exists(self.ops_library):
                 raise FileNotFoundError(f"自定义算子库不存在：{self.ops_library}")
@@ -186,12 +190,12 @@ class OnnxInferModel(BaseInferModel):
         return ort.InferenceSession(path, sess_options=options, providers=providers)
 
     def load(self, path):
-        """加载 ONNX 会话。"""
+        """Load the ONNX session."""
         self.session = self._make_session(path)
         self._pred_name = self.session.get_outputs()[0].name
         self._out_shape = self.session.get_outputs()[0].shape
         self._input_names = set(i.name for i in self.session.get_inputs())
-        # 一次吃多条轨迹要求输入与输出的 batch 轴都是符号维
+        # Running multiple trajectories at once requires the batch axis of both inputs and outputs to be symbolic
         _inputs = self.session.get_inputs()
         _state_input = next((i for i in _inputs if i.name == "input"), _inputs[0])
         _in_shape = list(getattr(_state_input, "shape", None) or [])
@@ -200,12 +204,13 @@ class OnnxInferModel(BaseInferModel):
             bool(_in_shape) and bool(_out_dim)
             and isinstance(_in_shape[0], str) and isinstance(_out_dim[0], str))
         self._check_gpu_state_frames()
-        self._spare = None    # 输出 buffer 复用，避免每步重新分配显存
+        self._spare = None    # Output buffer reuse to avoid reallocating GPU memory every step
 
     def _check_gpu_state_frames(self):
-        """gpu_state=True 时要求「图输出帧数 == 输入帧数」。
+        """When gpu_state=True, require "graph output frames == input frames".
 
-        GPU 常驻分支绕过 forward override 里的补帧和帧数校验，会静默算错。
+        The GPU-resident path bypasses the frame padding and frame-count validation in
+        the forward override, and would silently compute wrong results.
         """
         if not self.gpu_state:
             return
@@ -213,7 +218,7 @@ class OnnxInferModel(BaseInferModel):
         if not expected or expected <= 1:
             return
         shape = self._out_shape
-        # 只拦「5D 输出且帧维为 1」这一确凿特征，其余布局放过，避免误伤
+        # Only reject the unambiguous pattern "5D output with frame dim == 1"; let other layouts pass to avoid false positives
         if not shape or len(shape) != 5 or shape[1] != 1:
             return
         raise ValueError(
@@ -233,17 +238,17 @@ class OnnxInferModel(BaseInferModel):
                     valid_time, step, self._time_features).items():
                 if k in self._input_names:
                     feeds[k] = v
-        # 返回完整滑动窗口，末帧是本步预报；回填由 Rollout 负责
+        # Return the full sliding window; the last frame is this step's forecast; backfill is handled by Rollout
         result = self.session.run([self._pred_name], feeds)[0]
         return result
 
-    # GPU 常驻（IOBinding）：state 全程在显存，只在落盘时搬回 CPU
+    # GPU-resident (IOBinding): state stays in GPU memory throughout and only moves back to CPU when written
     def to_gpu(self, x):
         return ort.OrtValue.ortvalue_from_numpy(
             _as_numpy_onnx(x), "cuda", self.device_id)
 
     def forward_gpu(self, state, step, valid_time):
-        # 复用上一拍回收的 buffer 作为本步输出；读写的不是同一个 OrtValue
+        # Reuse the buffer reclaimed from the previous step as this step's output; the read and written OrtValues are different
         out = self._spare if self._spare is not None else \
             ort.OrtValue.ortvalue_from_shape_and_type(
                 self._out_shape, np.float32, "cuda", self.device_id)
@@ -257,12 +262,12 @@ class OnnxInferModel(BaseInferModel):
                     binding.bind_cpu_input(k, v)
         binding.bind_ortvalue_output(self._pred_name, out)
         self.session.run_with_iobinding(binding)
-        # 输入已被读完，回收为下一个输出 buffer
+        # The input has been consumed; reclaim it as the next output buffer
         self._spare = state
         return out
 
     def release(self):
-        """丢掉当前 session。"""
+        """Drop the current session."""
         self.session = None
         self._spare = None
         super().release()

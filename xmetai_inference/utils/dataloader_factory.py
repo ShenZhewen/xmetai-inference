@@ -1,6 +1,6 @@
-"""配置 → DataLoader：按 ``dataset.type`` 分发到 ``data/<category>/`` 下的实现。
+"""Config → DataLoader: dispatch on ``dataset.type`` to the implementation under ``data/<category>/``.
 
-加一种类型 = 新建 ``data/<category>/<type>.py`` 并在下面加一条分支。
+Adding a type means creating ``data/<category>/<type>.py`` and adding a branch below.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def create_dataloader(
     model_path=None,
     dataloader_options=None,
 ):
-    """按 ``config["dataset"]`` 声明的类型构建推理 DataLoader。"""
+    """Build an inference DataLoader for the type declared in ``config["dataset"]``."""
     if not isinstance(spec, Mapping):
         raise TypeError("dataset 必须是包含 type 和参数的配置字典")
     name = spec.get("type")

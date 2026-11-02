@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""启动期校验 ``cli._check_model_batch`` 的三条静态规则。
+"""Static startup checks for the three rules enforced by ``cli._check_model_batch``.
 
-图是不是动态 batch 轴要 load 读图才知道（``backends/onnx.py`` 设
-``batch_axis_dynamic``），不在这一层判；这里只钉住与图无关、配错必然跑不通的组合。
+Whether the graph has a dynamic batch axis can only be determined by loading it
+(``backends/onnx.py`` sets ``batch_axis_dynamic``), so it is not validated here;
+this module pins only the graph-independent combinations that cannot run when
+misconfigured.
 """
 import pytest
 

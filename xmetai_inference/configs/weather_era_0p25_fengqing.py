@@ -10,9 +10,23 @@ from xmetai_inference.configs.base import (
     FENGQING_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
 
 
+# Placeholder paths; replace before deployment.
+FENGQING_ROOT = "/path/to/models/FengQing"
+ERA5_ROOT = "/path/to/data/era5_foundation_store2"
+TP_ROOT = "/path/to/data/era5_tp_zarr"
+FENGQING_ONNX = f"{FENGQING_ROOT}/onnx/fengqing_pre.onnx"
+OUTPUT_DIR = "/path/to/output/fengqing_output"
+
+FENGQING_STORES = [
+    f"{TP_ROOT}/era5.202501-202607.c1.p25.h6.v1.lon180.zarr",
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+]
+
+
 def _temporal_condition(dt):
-    """temporal_condition 的 4 特征编码 = [HourOfDay, MonthOfYear, DayOfMonth,
-    DayOfYear]（同官方 timefeatures('h')）；第 2 个是月不是星期。
+    """4-feature temporal_condition encoding = [HourOfDay, MonthOfYear, DayOfMonth,
+    DayOfYear] (same as the official timefeatures('h')); the second entry is month, not weekday.
     """
     return np.asarray(
         [[
@@ -26,7 +40,9 @@ def _temporal_condition(dt):
 
 
 def _find_artifact(model_path, relative_paths):
-    """在模型文件本身及上两级父目录里查找工件（兼容 .../onnx/ 与 .../models/ 两种布局）。"""
+    """Look for an artifact in the model file's directory and its two parent levels
+    (supports both the .../onnx/ and .../models/ layouts).
+    """
     bases = [model_path.parent, model_path.parents[1], model_path.parents[2]]
     for relative in relative_paths:
         for base in bases:
@@ -39,14 +55,15 @@ def _find_artifact(model_path, relative_paths):
 
 
 class FengqingPreOnnxModel(OnnxInferModel):
-    """FengQing V1.5Beta 降水图契约。
+    """FengQing V1.5Beta precipitation graph contract.
 
-    4 键输入：upper/surface/temporal_condition/spatial_condition；输出归一化残差，
-    本类做一步前向 + 残差反演，全程归一化空间。surface 通道序 =
-    tp,msl,u10m,v10m,t2m（以 mean_pre.npy 实测为准，与官方 readme 不同）。
+    4 keyed inputs: upper/surface/temporal_condition/spatial_condition; the output is a normalized
+    residual, and this class performs one forward step plus residual reconstruction entirely in
+    normalized space. Surface channel order = tp,msl,u10m,v10m,t2m
+    (per measured mean_pre.npy, differs from the official readme).
 
-    只写非默认契约；history_steps=2 / hour_interval=6 / deterministic / 1 成员 /
-    gpu_state=False 用 BaseInferModel 默认值。无 forward_gpu。
+    Only non-default contract entries are declared; history_steps=2 / hour_interval=6 /
+    deterministic / 1 member / gpu_state=False use BaseInferModel defaults. No forward_gpu.
     """
     model_name = "fengqing_pre_onnx"
     input_channels = FENGQING_CHANNELS
@@ -111,7 +128,7 @@ class FengqingPreOnnxModel(OnnxInferModel):
         return self
 
     def forward(self, x, step, valid_time):
-        """一步前向：归一化量进/出，只出预报帧。x = (1,2,70,H,W)。"""
+        """Single forward step: normalized values in and out; returns only the forecast frame. x = (1,2,70,H,W)."""
         state = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
         arr = state.detach().cpu().numpy().astype(np.float32)
         frames = arr[0]
@@ -144,19 +161,9 @@ class FengqingPreOnnxModel(OnnxInferModel):
             pred[:, None], dtype=state.dtype, device=state.device)
 
 
-FENGQING_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/FengQing"
-ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
-TP_ROOT = "/workspace/data/liujunjie/era5_tp_zarr"
-
-FENGQING_STORES = [
-    f"{TP_ROOT}/era5.202501-202607.c1.p25.h6.v1.lon180.zarr",
-    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
-    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
-]
-
 cfg = InferConfig(
     name="weather_era_0p25_fengqing",
-    model_path=f"{FENGQING_ROOT}/onnx/fengqing_pre.onnx",
+    model_path=FENGQING_ONNX,
     model_class="fengqing_pre_onnx",
 
     dataset={
@@ -189,5 +196,5 @@ cfg = InferConfig(
     vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl,tp",
     gpus=2,
     cuda_devices="0,1",
-    output_dir="/workspace/data/shenzw/fengqing_output",
+    output_dir=OUTPUT_DIR,
 )

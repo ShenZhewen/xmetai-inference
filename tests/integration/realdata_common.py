@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""realdata 集成档的共享原语：读取、对齐、分档、对拍。
+"""Shared primitives for the realdata integration suites: loading, alignment,
+classification, and comparison.
 
-不带 ``test_`` 前缀、不 import pytest：import 任何 ``test_`` 模块都会触发它的
-模块级 fixture 自检。分档阈值从老 ``util/compare_outputs.py`` 原样冻结，**不要改**。
+Deliberately has no ``test_`` prefix and does not import pytest: importing any
+``test_`` module triggers its module-level fixture checks. Classification thresholds
+are frozen verbatim from the legacy ``util/compare_outputs.py``; do not modify them.
 """
 import re
 from pathlib import Path
@@ -11,12 +13,43 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-#: rtol 容忍 float32 往返与代数化简的舍入；atol 给大片为 0 的场（tp）兜底。
+#: Fixture data root for the realdata suites (placeholder; replace before running integration tests).
+DATA_ROOT = "/path/to/data/inference_test_data"
+
+FGVP_FIXTURE_ROOT = Path(DATA_ROOT) / "fgvp_test_data"
+FGVP_ENS_FIXTURE_ROOT = Path(DATA_ROOT) / "fgvp_ens_test_data"
+FUXI_FIXTURE_ROOT = Path(DATA_ROOT) / "fuxi_test_data"
+
+
+def data_root_hint(root) -> str:
+    """Return a uniform reminder when the fixture root is unavailable; return an empty string otherwise.
+
+    pytest is deliberately not imported here so the module can be imported by plain scripts.
+    """
+    root = Path(root)
+    if str(root).startswith("/path/to/"):
+        return (
+            f"数据根仍是占位地址：{root}\n"
+            "请先打开 tests/integration/realdata_common.py，把顶部的 DATA_ROOT 改成"
+            "真实的 fixture 目录（其下应有 fgvp_test_data / fgvp_ens_test_data / "
+            "fuxi_test_data），再跑 pytest -m realdata。"
+        )
+    if not root.is_dir():
+        return (
+            f"数据目录不存在：{root}\n"
+            "请检查 tests/integration/realdata_common.py 顶部的 DATA_ROOT 是否指向"
+            "真实 fixture 目录；放好切片数据和 golden 后再跑 pytest -m realdata。"
+        )
+    return ""
+
+
+#: rtol absorbs float32 round-trip and algebraic-simplification rounding; atol covers
+#: fields that are zero over large areas (tp).
 RTOL = 1e-5
 ATOL = 1e-6
-EXCEED_FRACTION_CLOSE = 1e-3      # 万分之一以下：随机舍入
-EXCEED_FRACTION_DRIFT = 0.5       # 半数以上：多数点都变了
-DRIFT_STD_FRACTION = 1e-2         # max|diff| 超场自身变率这个比例 ⇒ 物理上可分辨
+EXCEED_FRACTION_CLOSE = 1e-3      # below 0.01%: random rounding
+EXCEED_FRACTION_DRIFT = 0.5       # above half: most points changed
+DRIFT_STD_FRACTION = 1e-2         # max|diff| exceeding this fraction of field variability is physically resolvable
 
 VERDICT_RANK = {"IDENTICAL": 0, "CLOSE": 1, "DRIFT": 2, "DIFFER": 3}
 
@@ -25,7 +58,7 @@ _STEP_RE = re.compile(r"^(\d{3})\.nc$")
 
 
 def init_dirs(root: Path) -> dict:
-    """子目录名 -> 起报时刻。兼容 YYYYMMDD 与 YYYYMMDDHH 两种命名。"""
+    """Subdirectory name -> initialization time. Accepts both YYYYMMDD and YYYYMMDDHH naming."""
     found = {}
     for entry in sorted(p for p in root.iterdir() if p.is_dir()):
         if _INIT_RE.fullmatch(entry.name):
@@ -35,7 +68,7 @@ def init_dirs(root: Path) -> dict:
 
 
 def steps_in(directory: Path) -> list:
-    """目录里的 ``NNN.nc`` 步序号。"""
+    """Step indices of the ``NNN.nc`` files in a directory."""
     return sorted(
         int(match.group(1))
         for path in directory.iterdir()
@@ -44,13 +77,13 @@ def steps_in(directory: Path) -> list:
 
 
 def variables_in(path: Path) -> set:
-    """NetCDF 里的二维变量名（小写）。"""
+    """Two-dimensional variable names in a NetCDF file (lowercase)."""
     with xr.open_dataset(path) as ds:
         return {str(name).lower() for name in ds.data_vars if ds[name].ndim == 2}
 
 
 def align_grid(values, lat, lon):
-    """把场摆成「北→南、经度 0..360 升序」。shape 与坐标数不符直接报错。"""
+    """Orient a field north-to-south with longitude ascending over 0..360. Raises if the shape does not match the coordinates."""
     values = np.asarray(values, dtype=np.float64)
     lat = np.asarray(lat, dtype=np.float64).reshape(-1)
     lon = np.asarray(lon, dtype=np.float64).reshape(-1)
@@ -66,7 +99,7 @@ def align_grid(values, lat, lon):
 
 
 def load_fields(path: Path, variables):
-    """读一个预测文件里的二维场 -> (``{变量: (H,W)}``, lat, lon)。变量名大小写不敏感。"""
+    """Read the two-dimensional fields of a prediction file -> (``{variable: (H,W)}``, lat, lon). Variable names are case-insensitive."""
     with xr.open_dataset(path) as ds:
         if "lat" not in ds.coords or "lon" not in ds.coords:
             raise ValueError(f"{path} 缺少 lat/lon 坐标")
@@ -84,8 +117,9 @@ def load_fields(path: Path, variables):
 
 
 def classify(max_diff, ref_std, exceed_fraction):
-    """给一档判定。主判据是超容差点**占比**而非 max|diff|；max|diff| 超场自身空间
-    变率 1%（``DRIFT_STD_FRACTION``）时无论占比多少直接 DIFFER。
+    """Assign a verdict. The primary criterion is the **fraction** of tolerance-exceeding
+    points, not max|diff|; if max|diff| exceeds 1% of the field's own spatial
+    variability (``DRIFT_STD_FRACTION``), the verdict is DIFFER regardless of that fraction.
     """
     if max_diff == 0.0:
         return "IDENTICAL"
@@ -99,8 +133,9 @@ def classify(max_diff, ref_std, exceed_fraction):
 
 
 def field_metrics(a, b, rtol=RTOL, atol=ATOL):
-    """两个 (H,W) 场 -> 指标 dict。容差 ``|a-b| <= atol + rtol*|b|``；NaN 位置不一致
-    单独计数，一侧缺测的格子不进超容差统计。
+    """Two (H,W) fields -> metrics dict. Tolerance is ``|a-b| <= atol + rtol*|b|``; NaN
+    position mismatches are counted separately, and cells missing on one side are excluded
+    from the exceed statistics.
     """
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -118,7 +153,7 @@ def field_metrics(a, b, rtol=RTOL, atol=ATOL):
 
     diff = np.abs(a - b)[both]
     max_diff = float(diff.max())
-    ref_std = float(b[both].std())  # 标准答案自身的空间变率
+    ref_std = float(b[both].std())  # spatial variability of the reference field itself
     exceed_frac = float(np.count_nonzero(diff > atol + rtol * np.abs(b[both]))
                         / diff.size)
     return {
@@ -132,10 +167,11 @@ def field_metrics(a, b, rtol=RTOL, atol=ATOL):
 
 def compare_dirs(root_a: Path, root_b: Path, step_limit=None,
                  rtol=RTOL, atol=ATOL):
-    """两份输出根目录 -> ``(rows, skipped)``。确定性档（无成员维度）专用。
+    """Compare two output root directories -> ``(rows, skipped)``. Intended for deterministic suites (no member dimension).
 
-    ``rows`` 每个 (起报, step, 变量) 一条；``skipped`` 记只在一侧存在的
-    ``(级别, 什么, 为什么)`` —— 覆盖面断言靠它抓「产物少写一步反而更容易绿」。
+    ``rows`` holds one entry per (initialization, step, variable); ``skipped`` records
+    ``(level, what, why)`` for entries present on only one side -- the coverage assertions
+    rely on it to catch outputs that pass more easily by writing fewer steps.
     """
     inits_a, inits_b = init_dirs(root_a), init_dirs(root_b)
     if not inits_a:
@@ -178,7 +214,7 @@ def compare_dirs(root_a: Path, root_b: Path, step_limit=None,
 
             fields_a, lat_a, lon_a = load_fields(path_a, names)
             fields_b, lat_b, lon_b = load_fields(path_b, names)
-            # 网格对不上说明网格本身变了，逐格相减只有假「漂移」。
+            # A grid mismatch means the grid itself changed; cell-wise subtraction would only yield spurious drift.
             if lat_a.shape != lat_b.shape or lon_a.shape != lon_b.shape:
                 raise ValueError(f"网格 shape 不一致：{path_a} 与 {path_b}")
             if not (np.allclose(lat_a, lat_b, atol=1e-4)
@@ -196,7 +232,7 @@ def compare_dirs(root_a: Path, root_b: Path, step_limit=None,
 
 
 def expected_vars(config_path: Path) -> set:
-    """配方声明要落盘的变量集合（小写）。从配方读，不在测试里再抄一份。"""
+    """The set of variables the recipe declares for output (lowercase). Read from the recipe rather than duplicated in the test."""
     from xmetai_inference.configs.base import load_config
 
     cfg = load_config(str(config_path))

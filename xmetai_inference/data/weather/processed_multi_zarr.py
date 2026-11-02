@@ -1,9 +1,10 @@
-"""``processed_multi_zarr``：直接读原始 Zarr，选通道后逐样本跑处理器链。
+"""``processed_multi_zarr``: read the raw Zarr directly, select channels, then run the processor chain per sample.
 
     {"type": "processed_multi_zarr", "paths": [...], "processors": [...]}
 
-读盘交给 xmetai-core 的 ``MultiZarrDataset``；前处理由 ``dataset.processors``
-声明，在 ``__getitem__`` 里执行（DataLoader worker 中）。
+Disk reading is delegated to ``MultiZarrDataset`` from xmetai-core; preprocessing is
+declared by ``dataset.processors`` and executed in ``__getitem__`` (inside DataLoader
+workers).
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from xmetai_inference.utils.dataset_processors import (
 
 
 def _raw_channel_name(model_name: str, available: set[str]) -> str:
-    """模型通道名 ``z50`` → store 通道名 ``z_50``（先精确匹配，再插下划线）。"""
+    """Model channel name ``z50`` -> store channel name ``z_50`` (exact match first, then insert an underscore)."""
     if model_name in available:
         return model_name
     match = re.fullmatch(r"([A-Za-z]+)(\d+)", model_name)
@@ -35,7 +36,7 @@ def _raw_channel_name(model_name: str, available: set[str]) -> str:
 
 
 def select_init_positions(dataset, init_times: Sequence[object]) -> list[int]:
-    """起报时刻 → Core Dataset 的位置下标（查不到直接报错）。"""
+    """Init times -> positions in the Core Dataset (raises if not found)."""
     available = {
         pd.Timestamp(dataset.id_to_time[int(raw_index)]): position
         for position, raw_index in enumerate(dataset.inds)
@@ -52,7 +53,7 @@ def select_init_positions(dataset, init_times: Sequence[object]) -> list[int]:
 
 
 class RawMultiZarrTensorDataset(Dataset):
-    """先读原始帧，再跑张量处理器链的包装 Dataset。"""
+    """Wrapper Dataset that reads raw frames first, then runs the tensor processor chain."""
 
     def __init__(self, base, positions, processors=()):
         self.base = base
@@ -93,7 +94,7 @@ def create_processed_multi_zarr_dataset(
     hour_interval: int,
     model_path: str | None = None,
 ):
-    """建 Dataset（不建 DataLoader）；``type`` 由 ``create_dataloader`` 校验。"""
+    """Build a Dataset (not a DataLoader); ``type`` is validated by ``create_dataloader``."""
     config = dict(spec)
     config.pop("type", None)
     paths = config.pop("paths", None)

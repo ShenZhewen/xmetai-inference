@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""``configs/weather_era_0p25_fgvp.py`` 的单元测试：配置与模型契约之间的一致性。
+"""Unit tests for ``configs/weather_era_0p25_fgvp.py``: consistency between the
+configuration and the model contract.
 
-config 是一串声明，写错大多不报错、只是静默不生效（单位换算键名拼错 = 悄悄不换算；
-``vars`` 拼错 = 落盘少一个变量）。这里测的是**声明之间的一致性**，作用是变更探测器；
-值本身对不对要靠 ``test_fgvp_realdata.py`` 跟标准答案对拍。
+A config is a series of declarations; most mistakes raise nothing and merely fail
+silently (a misspelled unit-conversion key means no conversion happens; a misspelled
+``vars`` entry means one fewer variable is written). These tests check **consistency
+between declarations** and act as a change detector; whether the values themselves
+are correct is verified against the reference by ``test_fgvp_realdata.py``.
 """
 import re
 from datetime import datetime
@@ -14,7 +17,8 @@ from xmetai_inference.configs import InferConfig, load_config, parse_times
 from xmetai_inference.configs import FUXI_ENS_CHANNELS
 from xmetai_inference.utils.model_factory import get_model_class
 
-#: 通道名去层号（z50 → z），带尾字母（t2m/u10m）和纯字母（ssr/msl/tp）原样。
+#: Strip the level suffix from channel names (z50 -> z); trailing-letter names
+#: (t2m/u10m) and pure-letter names (ssr/msl/tp) are left unchanged.
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
 
 EXPECTED_VARS = {
@@ -47,7 +51,7 @@ def test_loads_as_inferconfig_named_fgvp(cfg):
 
 
 def test_model_class_is_the_gdn2_backbone(cfg, model_cls):
-    """必须解析到确定性 gdn2 那支，而不是同通道布局的集合档 mamba_ens。"""
+    """Must resolve to the deterministic gdn2 backbone, not the ensemble mamba_ens variant with the same channel layout."""
     assert cfg.model_class == "iwc_fgvp_gdn2_onnx"
     assert model_cls.__name__ == "IwcFgvpGdn2Model"
     assert model_cls.windowed_output is False
@@ -59,18 +63,20 @@ def test_hour_interval_matches_model(cfg, model_cls):
 
 
 def test_members_is_one_for_deterministic_model(cfg, model_cls):
-    """图只出一帧、没有扰动通路，members>1 只会把同一份结果存 N 遍。"""
+    """The graph emits a single frame and has no perturbation path; members>1 only stores the same result N times."""
     assert model_cls.forecast_type == "deterministic"
     assert model_cls.members == 1
     assert cfg.members == 1
 
 
 def test_gpu_state_is_off_by_default(cfg, monkeypatch):
-    """GPU 常驻和本模型「输入 2 帧输出 1 帧」的窗口形状不相容，默认必须关。
+    """GPU persistence is incompatible with this model's two-input-frame,
+    one-output-frame window shape, so it must be off by default.
 
-    重新 load 而非用 fixture：gpu_state 是模块 exec 时读环境变量算出来的。
-    要 load 的必须是 ``cfg`` 那份文件（``cfg._source_path``），不是硬编码的
-    "fgvp" —— 否则验的永远是包内那份原始配置而不是被测对象。
+    Reload instead of using the fixture: gpu_state is derived from an environment
+    variable at module exec time. The file loaded must be the one ``cfg`` came from
+    (``cfg._source_path``), not a hard-coded "fgvp" -- otherwise the test always
+    checks the packaged original config rather than the object under test.
     """
     monkeypatch.delenv("XMETAI_GPU_STATE", raising=False)
     fresh = load_config(cfg._source_path)
@@ -78,7 +84,7 @@ def test_gpu_state_is_off_by_default(cfg, monkeypatch):
 
 
 def test_env_override_only_accepts_literal_one(cfg, monkeypatch):
-    """``XMETAI_GPU_STATE`` 只有字面 "1" 才算开；true/yes/on 都静默当没设。"""
+    """``XMETAI_GPU_STATE`` counts as on only for the literal "1"; true/yes/on are silently treated as unset."""
     monkeypatch.setenv("XMETAI_GPU_STATE", "1")
     assert load_config(cfg._source_path).gpu_state is True
 
@@ -90,7 +96,7 @@ def test_env_override_only_accepts_literal_one(cfg, monkeypatch):
 
 
 def test_declared_vars_are_real_model_output_channels(cfg, model_cls):
-    """`vars` 拼错一个不报错，只是那个变量不落盘 —— 往往跑完整年才发现。"""
+    """A misspelled ``vars`` entry raises nothing and simply drops that variable from the output -- often noticed only after a full year of runs."""
     declared = {v.strip() for v in cfg.vars.split(",") if v.strip()}
     assert declared == EXPECTED_VARS, "落盘变量清单变了，确认是有意的再改这里"
 
@@ -100,7 +106,7 @@ def test_declared_vars_are_real_model_output_channels(cfg, model_cls):
 
 
 def test_unit_convert_keys_are_real_base_variables(cfg, model_cls):
-    """换算表的键是基础变量名（q 而非 q700），拼错就是静默不换算。"""
+    """Conversion keys are base variable names (q rather than q700); a misspelling silently skips the conversion."""
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     scales = processors["unit_convert"]["scales"]
 
@@ -113,7 +119,7 @@ def test_unit_convert_keys_are_real_base_variables(cfg, model_cls):
 
 
 def test_unit_convert_scales_are_the_agreed_conventions(cfg):
-    """系数是实测对齐过的约定，钉住防无意改动；约定本身对错由 realdata 档兜底。"""
+    """The factors are measured, agreed conventions pinned against unintended changes; whether the conventions are correct is covered by the realdata suite."""
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     scales = processors["unit_convert"]["scales"]
 
@@ -124,8 +130,10 @@ def test_unit_convert_scales_are_the_agreed_conventions(cfg):
 
 
 def test_fill_missing_targets_real_channel_and_is_strict(cfg, model_cls):
-    """规则里的变量得是真通道（拼错 = 静默不填，NaN 一路进模型）；
-    unconfigured="error" 是安全属性：没配规则的通道缺测宁可炸。"""
+    """Rule variables must be real channels (a misspelling means silent no-fill, and NaN
+    flows into the model); unconfigured="error" is a safety property: a channel without
+    a rule should fail rather than proceed when data is missing.
+    """
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     fill = processors["fill_missing"]
 
@@ -139,7 +147,7 @@ def test_fill_missing_targets_real_channel_and_is_strict(cfg, model_cls):
 
 
 def test_model_processing_is_empty(cfg):
-    """归一化烘焙在图里，模型侧挂任何 Processor 都会与图内处理叠加，数值不报错只是全错。"""
+    """Normalization is baked into the graph; attaching any model-side Processor would stack on top of it and yield wrong values without raising."""
     input_specs, recurrent_specs, output_specs = cfg.processor_specs()
     assert list(input_specs) == []
     assert list(recurrent_specs) == []
@@ -147,7 +155,7 @@ def test_model_processing_is_empty(cfg):
 
 
 def test_cuda_devices_cover_every_rank(cfg):
-    """多卡分支按 rank 取 cuda_devices[rank]，短一个只在多卡启动时才 IndexError。"""
+    """Multi-GPU branches index cuda_devices[rank]; being one short raises IndexError only on multi-GPU startup."""
     devices = [d for d in str(cfg.cuda_devices).split(",") if d.strip()]
     assert cfg.gpus >= 1
     assert len(devices) >= cfg.gpus, (
@@ -156,7 +164,7 @@ def test_cuda_devices_cover_every_rank(cfg):
 
 
 def test_times_expand_to_four_daily_inits(cfg):
-    """`times` 结尾的 ``:24`` 不是冗余：不带后缀会按 hour_interval=6 展开。"""
+    """The ``:24`` suffix on ``times`` is not redundant: without it the range expands at hour_interval=6."""
     inits = parse_times(cfg.times, cfg.hour_interval)
     assert inits == [
         datetime(2025, 1, 2), datetime(2025, 1, 3),
@@ -171,7 +179,7 @@ def test_steps_and_interval_span_the_expected_lead_time(cfg):
 
 
 def test_dynamic_stores_are_the_expected_trio(cfg):
-    """三个动态 store 的名单；用集合比 —— 通道按名字选，顺序不影响结果。"""
+    """The three dynamic stores; compared as a set -- channels are selected by name, so order does not affect results."""
     paths = cfg.dataset["paths"]
     assert cfg.dataset["type"] == "processed_multi_zarr"
     assert len(paths) == 3

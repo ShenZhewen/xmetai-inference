@@ -1,4 +1,4 @@
-"""``python -m xmetai_inference`` 入口。"""
+"""Entry point for ``python -m xmetai_inference``."""
 
 from .cli import main
 

@@ -27,8 +27,9 @@ zarr = [
 onnx = [
     "onnxruntime",
 ]
-# 跑测试：pytest 本体，加上集成测试要用的读数据后端（realdata 档只在这些都在时才跑）。
-# 安装：pip install -e ".[dev]"
+# Running tests: pytest itself plus the data-reading backends needed by the
+# integration tests (realdata cases run only when all of these are installed).
+# Install: pip install -e ".[dev]"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=3.0",
@@ -50,13 +51,14 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-# --strict-markers：用了没登记的 marker 直接报错，免得打错字的 marker 静默失效
-# （比如 -m realdaat 会「选中 0 个测试」而不是报错）。
+# --strict-markers: an unregistered marker is an error, so a typo in a marker does
+# not silently take effect (e.g. -m realdaat would "select 0 tests" instead of failing).
 #
-# 默认 `-m 'not realdata'`：光注册 marker 并不会让它们不跑，而 realdata 档会真起一次
-# GPU 推理。有 fixture 的机器上一句 `pytest` 就顺带跑掉，代价太大 —— 所以做成显式
-# opt-in：想跑就 `pytest -m realdata`（命令行给的 -m 会覆盖这里的）。
+# Default `-m 'not realdata'`: registering markers alone does not stop them from
+# running, and the realdata suite starts a real GPU inference. On a machine with
+# fixtures a plain `pytest` would run it incidentally at high cost, so it is explicit
+# opt-in: use `pytest -m realdata` to run it (a command-line -m overrides this).
 addopts = "-v --strict-markers -m 'not realdata'"
 markers = [
-    "realdata: 需要真实模型与切片数据；fixture 目录不齐时整个模块 skip，缺 onnxruntime 等依赖时也 skip",
+    "realdata: requires real models and clipped data; the whole module is skipped when the fixture directory is incomplete or a dependency such as onnxruntime is missing",
 ]

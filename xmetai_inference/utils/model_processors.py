@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-"""模型侧处理（主进程）：自回归回填（recurrent）与输出反变换（output）。
+"""Model-side processing (main process): recurrent state feed-back and output inverse
+transforms.
 
-数据侧（store → 模型输入，DataLoader worker）在 ``dataset_processors.py``。
+Data-side processing (store → model input, DataLoader worker) lives in
+``dataset_processors.py``.
 """
 import logging
 import os
@@ -18,7 +20,7 @@ log = logging.getLogger(__name__)
 
 
 def _as_torch(value, dtype=None, device=None):
-    """尽可能零拷贝地转成 torch.Tensor；已是 tensor 时只按需 cast/搬运。"""
+    """Convert to torch.Tensor with minimal copying; if already a tensor, cast/move only as needed."""
     if isinstance(value, torch.Tensor):
         tensor = value
     else:
@@ -31,7 +33,7 @@ def _as_torch(value, dtype=None, device=None):
 
 
 class Processor:
-    """数组阶段处理基类：子类声明 stage 并实现 process_array(value)。"""
+    """Base class for array-stage processing: subclasses declare stage and implement process_array(value)."""
 
     def __init__(self, model_cls=None, data_source=None, model_path=None, **kwargs):
         self.model_cls = model_cls
@@ -46,7 +48,7 @@ _REGISTRY = {}
 
 
 def register(name):
-    """极简注册表：@register('denormalize') 把类登记进 _REGISTRY，config 按名字挂载。"""
+    """Minimal registry: @register('denormalize') registers a class in _REGISTRY, and config mounts it by name."""
 
     def deco(cls):
         _REGISTRY[name] = cls
@@ -106,7 +108,7 @@ class _ArrayStatsProcessor(Processor):
 
 @register("denormalize")
 class Denormalize(_ArrayStatsProcessor):
-    """模型工作空间 → 物理量；可对指定通道执行 expm1 和非负截断。"""
+    """Model working space → physical quantities; optionally applies expm1 and non-negative clipping to selected channels."""
 
     stage = "output"
 
@@ -135,9 +137,10 @@ class Denormalize(_ArrayStatsProcessor):
 
 @register("denormalize_fengqing")
 class DenormalizeFengqing(Processor):
-    """FengQing 归一化空间 → 物理量（与 normalize_fengqing 互逆）。
+    """FengQing normalized space → physical quantities (inverse of normalize_fengqing).
 
-    mean 逐像素、std 逐通道；tp 的非负钳位在模型 forward 里完成。
+    mean is per pixel, std is per channel; non-negative clamping of tp is done inside
+    model forward.
     """
 
     stage = "output"
@@ -194,7 +197,7 @@ class DenormalizeFengqing(Processor):
 
 @register("zero_channels")
 class ZeroChannels(Processor):
-    """回填前把诊断通道置成归一化空间的 0（官方 input.nc 就是如此，不是物理清零）。"""
+    """Zero diagnostic channels in normalized space before feed-back (matching the official input.nc; not physical zeroing)."""
 
     stage = "recurrent"
 
@@ -210,7 +213,7 @@ class ZeroChannels(Processor):
 
 
 class ProcessingPipeline:
-    """统一管理自回归回填（recurrent）与输出（output）两个处理阶段。"""
+    """Manages the two processing stages: recurrent feed-back and output."""
 
     def __init__(self, processors):
         self.recurrent_processors = [p for p in processors if p.stage == "recurrent"]
@@ -231,9 +234,9 @@ class ProcessingPipeline:
 
 def build_pipeline(input_specs, model_cls, data_source, model_path=None,
                    recurrent_specs=None, output_specs=None):
-    """config 的 Processor 列表 → ProcessingPipeline。
+    """Build a ProcessingPipeline from the config's Processor lists.
 
-    input_specs 必须为空：输入侧前处理走 dataset.processors。
+    input_specs must be empty: input-side preprocessing belongs in dataset.processors.
     """
     if input_specs:
         raise ValueError(
@@ -271,7 +274,7 @@ def build_pipeline(input_specs, model_cls, data_source, model_path=None,
 
 
 def build_dataset_batch(batch, verbose=False):
-    """DataLoader batch → (inputs[B,T,C,H,W], init_times)。"""
+    """DataLoader batch → (inputs[B,T,C,H,W], init_times)."""
     values = _as_torch(batch["inputs"], dtype=torch.float32)
     if values.ndim != 5:
         raise ValueError(f"Dataset inputs 应为 [B,T,C,H,W]，实际 shape={values.shape}")

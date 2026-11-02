@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-"""utils/model_processors.py（模型侧）+ utils/dataset_processors.py（数据侧）的单元
-测试：纯函数 + tmp_path 造的 mean.nc/std.nc，不碰真实模型和 zarr。"""
+"""Unit tests for utils/model_processors.py (model side) and
+utils/dataset_processors.py (data side): pure functions plus mean.nc/std.nc files
+created with tmp_path; no real models or Zarr are touched.
+"""
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +16,7 @@ from xmetai_inference.utils import model_processors as mp
 
 
 class _FakeModel:
-    """Processor 只读通道契约，这里给个最小假模型类。"""
+    """Processors only read the channel contract; this is a minimal fake model class."""
 
     input_channels = ["a", "b"]
     output_channels = ["a", "b"]
@@ -31,7 +33,7 @@ def _context(channels=("a", "b"), lat=None, model_path=None):
 
 
 def _write_stats(directory, mean, std, channels=("a", "b")):
-    """模型统计量约定：mean.nc/std.nc 放在模型文件旁边，带 channel 坐标。"""
+    """Model statistics convention: mean.nc/std.nc sit next to the model file and carry a channel coordinate."""
     for name, values in (("mean.nc", mean), ("std.nc", std)):
         xr.DataArray(
             np.asarray(values, dtype="f4"),
@@ -71,7 +73,7 @@ def test_alignment_rejects_resolution_mismatch():
 
 
 def test_alignment_rolls_offset_lon_to_start_at_zero():
-    """偏移网格要把经度 0 挪到下标 0（roll 方向不得反）。"""
+    """An offset grid must roll longitude 0 to index 0 (the roll direction must not be reversed)."""
     lat = np.array([10.0, -10.0])
     lon = np.array([120.0, 240.0, 0.0])
     _, aligned_lon = dp.aligned_coordinates(lat, lon, (2, 3))
@@ -112,7 +114,7 @@ def test_normalize_applies_log1p_then_zscore(tmp_path):
     value = torch.tensor([[[[2.0, 3.0], [4.0, 5.0]],
                           [[0.0, 7.0], [8.0, 9.0]]]])  # [1,2,2,2]
     expected_a = (value[0, 0] - 1.0) / 2.0
-    expected_b = (torch.log1p(value[0, 1]) - 2.0) / 4.0  # 先算：float32 输入会被原地改写
+    expected_b = (torch.log1p(value[0, 1]) - 2.0) / 4.0  # compute first: the float32 input is modified in place
     out = norm(value)
     assert torch.allclose(out[0, 0], expected_a)
     assert torch.allclose(out[0, 1], expected_b)
@@ -271,7 +273,7 @@ def test_denormalize_rejects_stats_channel_mismatch(tmp_path):
 
 
 def _write_stats_zarr(path, mean, std, channels):
-    """归一化态 store 的最小替身：根上的 mean/std 数组 + channel 坐标。"""
+    """Minimal stand-in for a normalized store: mean/std arrays at the root plus a channel coordinate."""
     xr.Dataset(
         {
             "mean": ("channel", np.asarray(mean, dtype="f4")),
@@ -282,7 +284,7 @@ def _write_stats_zarr(path, mean, std, channels):
 
 
 def test_denormalize_matches_stats_by_name_not_position(tmp_path):
-    # 新 ERA5 盘是超集、顺序也和模型不同：z_50 排第二、t2m 排第一。
+    # The new ERA5 store is a superset with a different order from the model: z_50 is second, t2m is first.
     store = tmp_path / "stats.zarr"
     _write_stats_zarr(
         store, mean=[9.0, 10.0, 7.0], std=[3.0, 4.0, 1.0],
@@ -303,7 +305,7 @@ def test_denormalize_rejects_channel_missing_from_store(tmp_path):
 
 
 def test_denormalize_expm1_after_restore(tmp_path):
-    # tp 在新盘里是 log1p 归一化，模型要物理量：反归一化后 expm1，其余通道不动。
+    # tp is log1p-normalized in the new store and the model needs physical values: expm1 after denormalization, other channels unchanged.
     store = tmp_path / "stats.zarr"
     _write_stats_zarr(store, mean=[0.0, 0.0], std=[1.0, 1.0],
                       channels=["tp", "a"])

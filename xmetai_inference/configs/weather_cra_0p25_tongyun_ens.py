@@ -4,6 +4,13 @@ from xmetai_inference.configs.base import (
     CRA_CHANNELS, GRID_025_S, InferConfig, ModelProcessingConfig)
 
 
+# Placeholder paths; replace before deployment.
+CRA_STORE = "/path/to/data/zarr_refresh_v3/cra.19790101_20260714.c71.p25.h6.v1"
+SRC_GRAPH = "/path/to/models/20261019/tongyun_ens_cra_fp16.onnx"
+OPS_LIBRARY = "/path/to/models/xmetai_onnx_plugins.ort1_24.cuda12.so"
+OUTPUT_DIR = "/path/to/output/tongyun_cra"
+
+
 TongyunCraEnsModel = OnnxInferModel.declare(
     "TongyunCraEnsModel",
     model_name="tongyun_cra_ens_onnx",
@@ -14,10 +21,6 @@ TongyunCraEnsModel = OnnxInferModel.declare(
     windowed_output=False,
 )
 
-
-CRA_STORE = "/workspace/data/zarr_refresh_v3/cra.19790101_20260714.c71.p25.h6.v1"
-SRC_GRAPH = "/workspace/tmp/douzsh/models/20261019/tongyun_ens_cra_fp16.onnx"
-OPS_LIBRARY = "/workspace/tmp/douzsh/models/xmetai_onnx_plugins.ort1_24.cuda12.so"
 
 cfg = InferConfig(
     name="weather_cra_0p25_tongyun_ens",
@@ -54,5 +57,5 @@ cfg = InferConfig(
     cuda_devices="0",
     intra_op_threads=0,
     cudnn_algo_search="EXHAUSTIVE",
-    output_dir="/workspace/data/shenzw/tongyun_cra",
+    output_dir=OUTPUT_DIR,
 )

@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
-"""``configs/weather_era_0p25_fgvp_ens.py`` 的单元测试：配置与集合模型契约之间的一致性（变更探测器，
-思路同 ``test_fgvp_config.py``）。本档最要紧的两条不变量：``members=51`` 与集合
-模型类绑定（扰动是图内随机算子 + 51 次独立前向，改数字就是换语义）；
-``model_processing`` 必须全空（归一化烘焙在图里，挂任何 Processor 都会叠加）。
+"""Unit tests for ``configs/weather_era_0p25_fgvp_ens.py``: consistency between the
+configuration and the ensemble model contract (a change detector, following
+``test_fgvp_config.py``). The two key invariants for this recipe: ``members=51`` and
+the ensemble model class binding (perturbation is a random operator inside the graph
+plus 51 independent forward passes; changing the number changes the semantics); and
+``model_processing`` must be entirely empty (normalization is baked into the graph,
+so attaching any Processor stacks on top of it).
 """
 import re
 from datetime import datetime
@@ -41,7 +44,7 @@ def test_loads_as_inferconfig_named_fgvp_ens(cfg):
 
 
 def test_model_class_is_the_ensemble_mamba_backbone(cfg, model_cls):
-    """必须解析到集合档那一支，而不是同通道布局的确定性 gdn2 —— 推理语义完全不同。"""
+    """Must resolve to the ensemble variant, not the deterministic gdn2 with the same channel layout -- inference semantics differ completely."""
     assert cfg.model_class == "iwc_fgvp_mamba_ens_onnx"
     assert model_cls.__name__ == "IwcFgvpMambaEnsModel"
     assert model_cls.forecast_type == "ensemble"
@@ -49,13 +52,13 @@ def test_model_class_is_the_ensemble_mamba_backbone(cfg, model_cls):
 
 
 def test_members_is_51_on_both_sides(cfg, model_cls):
-    """members 就是集合语义本身，任何一侧改数字都是换语义（噪声口径 √(2/51) 也随之失效）。"""
+    """members is the ensemble semantics itself; changing the number on either side changes the semantics (and invalidates the sqrt(2/51) noise convention)."""
     assert model_cls.members == 51
     assert cfg.members == 51
 
 
 def test_gpu_state_is_off(cfg):
-    """GPU 常驻和单帧输出图不相容，开了只会算错不会报错。"""
+    """GPU persistence is incompatible with a single-frame output graph; enabling it computes wrong values instead of raising."""
     assert cfg.gpu_state is False
 
 
@@ -68,7 +71,7 @@ def test_declared_vars_are_real_model_output_channels(cfg, model_cls):
 
 
 def test_model_processing_is_empty(cfg):
-    """归一化烘焙在图里，模型侧三个 Processor 必须全空 —— 叠加一遍就是全错。"""
+    """Normalization is baked into the graph; all three model-side Processors must be empty -- stacking it again yields entirely wrong values."""
     input_specs, recurrent_specs, output_specs = cfg.processor_specs()
     assert list(input_specs) == []
     assert list(recurrent_specs) == []
@@ -76,7 +79,7 @@ def test_model_processing_is_empty(cfg):
 
 
 def test_dataset_processors_match_fgvp_conventions(cfg, model_cls):
-    """数据侧前处理与 fgvp single 同一套约定（同族、同一套源 store），钉住防无意改动。"""
+    """Data-side preprocessing uses the same conventions as fgvp single (same family, same source stores), pinned against unintended changes."""
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     assert set(processors) == {"unit_convert", "geometry", "fill_missing"}, (
         "fgvp 族图内自带归一化，数据侧不该出现 normalize 之类的处理器"
@@ -99,7 +102,7 @@ def test_dataset_processors_match_fgvp_conventions(cfg, model_cls):
 
 
 def test_dynamic_stores_are_the_expected_trio(cfg):
-    """与 fgvp single 同一套源 store 三件套（集合档只是换了模型，没换数据源）。"""
+    """The same three source stores as fgvp single (the ensemble recipe only changes the model, not the data source)."""
     paths = cfg.dataset["paths"]
     assert cfg.dataset["type"] == "processed_multi_zarr"
     assert len(paths) == 3
@@ -114,7 +117,7 @@ def test_dynamic_stores_are_the_expected_trio(cfg):
 
 
 def test_times_are_daily_midnight_inits(cfg):
-    """起报全部每日 00Z、间隔均匀（``:24`` 后缀防 hour_interval=6 展开，同 fgvp 档）。"""
+    """All init times are daily 00Z and evenly spaced (the ``:24`` suffix prevents hour_interval=6 expansion, as in the fgvp recipe)."""
     inits = parse_times(cfg.times, cfg.hour_interval)
     assert inits, "times 展开为空"
     assert all(t.hour == 0 for t in inits), "出现了非 00Z 起报"
@@ -136,9 +139,10 @@ def test_cuda_devices_cover_every_rank(cfg):
 
 
 def test_steps_and_interval_span_the_expected_lead_time(cfg, model_cls):
-    """steps × 有效步长 = 15 天。``hour_interval=0`` 是「读模型类」的哨兵值
-    （``cli.py`` 的 ``interval = ... or cls.hour_interval``），所以断言解析后的
-    有效值，不是 config 字面值。"""
+    """steps x effective step length = 15 days. ``hour_interval=0`` is a sentinel meaning
+    "read from the model class" (``interval = ... or cls.hour_interval`` in ``cli.py``),
+    so assert the resolved effective value, not the literal config value.
+    """
     assert cfg.hour_interval in (0, 6)
     effective = cfg.hour_interval or model_cls.hour_interval
     assert effective == 6

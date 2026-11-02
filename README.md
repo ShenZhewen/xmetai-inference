@@ -85,7 +85,7 @@ All datasources are ingested via `processed_multi_zarr`, backed by `xmetai-core`
 ```python
 dataset = {
     "type": "processed_multi_zarr",
-    "paths": ["/abs/path/to/store_a.zarr", "/abs/path/to/store_b.zarr"],
+    "paths": ["<store_root>/store_a.zarr", "<store_root>/store_b.zarr"],
     "processors": [ ... ],          # executed in the DataLoader worker, in order
 }
 ```
@@ -101,8 +101,7 @@ dataset = {
 
 ### Store Inventory
 
-Roots: `era5_foundation_store2` → `/workspace/data/liujunjie/era5_foundation_store2`; the tp store →
-`/workspace/data/liujunjie/era5_tp_zarr`; all `zarr_refresh_v3/...` entries → `/workspace/data/zarr_refresh_v3`.
+The store root names below are relative to the data roots declared at the top of each recipe in `configs/`.
 File names encode channel count, resolution, and step (`c84.p25.h6` = 84 channels, 0.25°, 6-hourly).
 
 | Store | Channels | Coverage / step | Layout | Orientation | What it holds | Used by |
@@ -124,7 +123,7 @@ store. Inspect it before wiring a new model (this is a read-only command, safe t
 ```bash
 python - <<'PY'
 import xarray as xr
-store = xr.open_zarr("/workspace/data/.../store.zarr", consolidated=True)
+store = xr.open_zarr("<store_root>/store.zarr", consolidated=True)
 print(store.sizes)
 print(list(store.channel.values))
 PY
@@ -236,9 +235,9 @@ and output representation.
 ├── pyproject.toml           # PyPI build metadata and CLI entry
 ├── xmetai_inference/        # The installable Python package (package name: xmetai-inference)
 │   ├── cli.py               # Config loading, multi-GPU scheduling, the autoregressive main loop, async disk-write
-│   ├── data/                # Dataset 实现，按分类放子包（weather/）
-│   ├── utils/               # dataloader_factory（配置 → DataLoader，按 dataset.type 分发）,
-│   │                        #   runner（Rollout / Trajectory 自回归编排）,
+│   ├── data/                # Dataset implementations, grouped into subpackages by category (weather/)
+│   ├── utils/               # dataloader_factory (config -> DataLoader, dispatched by dataset.type),
+│   │                        #   runner (Rollout / Trajectory autoregressive orchestration),
 │   │                        #   model_factory (MODEL_REGISTRY / get_model_class / create_model),
 │   │                        #   model-side pipeline (recurrent/output), data-side tensor processors, logging
 │   ├── backends/            # BaseInferModel + onnx / pt2 execution engines
@@ -335,13 +334,13 @@ xmetai-infer --model weather_era_0p25_fuxi_ens \
   --times "2025010600..2025011200:24" \
   --steps 60 --members 51 --gpus 4 --cuda-devices 0,1,2,3 \
   --vars z500,u200,v200,msl,tp \
-  --out /workspace/data/shenzw/fuxi_ens_output
+  --out <output_dir>
 ```
 
 - `--model-path` replaces the recipe's weight file; `--model` selects the recipe.
 - `--times` syntax is documented in [configs/base.py `parse_times`](xmetai_inference/configs/base.py): a single
   `2025010600`, a comma-separated list, a closed interval `A..B` (24h step by default), and `:N` to override the step.
-- An external `.py` recipe loads via `xmetai-infer /path/to/config.py` (or `--config`); see `configs/` for examples.
+- An external `.py` recipe loads via `xmetai-infer <config.py>` (or `--config`); see `configs/` for examples.
 
 ## Configuration Reference
 

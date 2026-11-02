@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""统一推理入口：配置加载、多卡调度、自回归推理与 NetCDF 输出。
+"""Unified inference entry point: config loading, multi-GPU scheduling, autoregressive inference, and NetCDF output.
 
-用法：xmetai-infer --model weather_era_0p25_fgvp --times 2025010700..2025020500:24
-输出 ``{out}/{起报}/member_{成员3位}/{步号3位}.nc``（确定性省掉 member 层）。
-多卡按成员或起报拆子进程；写盘走单个后台线程（netCDF4/HDF5 非线程安全）。
+Usage: xmetai-infer --model weather_era_0p25_fgvp --times 2025010700..2025020500:24
+Outputs ``{out}/{init}/member_{member:03d}/{step:03d}.nc`` (deterministic runs omit the member level).
+Multi-GPU runs split members or init times across subprocesses; writes go through a single background thread (netCDF4/HDF5 are not thread-safe).
 """
 import argparse
 import gc
@@ -32,14 +32,14 @@ from xmetai_inference.configs.base import load_config, parse_times
 from xmetai_inference.utils.logging_util import configure_logging
 
 
-# 推理后端和具体模型在 worker 启动后按需导入，配置帮助不依赖可选模型运行环境。
+# Inference backends and concrete models are imported lazily after the worker starts, so config help does not depend on optional model runtimes.
 log = logging.getLogger(__name__)
 
 
 def _output_init_dir(init):
-    """00 UTC 用 YYYYMMDD，其他时次用 YYYYMMDDHH，避免同日多时次互相覆盖。
+    """Use YYYYMMDD for 00 UTC and YYYYMMDDHH otherwise, avoiding collisions between same-day init times.
 
-    起报间隔混用时两种目录名并存，下游解析要能同时吃 8 位与 10 位。
+    When init intervals are mixed, both directory-name forms coexist; downstream parsers must accept both 8- and 10-digit forms.
     """
     init = pd.Timestamp(init)
     if init.hour == 0 and init.minute == 0:
@@ -48,9 +48,9 @@ def _output_init_dir(init):
 
 
 def _resolve_output_indices(channels, requested):
-    """把要保存的变量名（z500/u200/v200/msl/tp）映射成通道下标。
+    """Map output variable names (z500/u200/v200/msl/tp) to channel indices.
 
-    requested=None 时保存全部通道；名字大小写不敏感，不存在的跳过并告警。
+    requested=None saves all channels; names are case-insensitive, and unknown names are skipped with a warning.
     """
     if requested is None:
         return list(range(len(channels)))
@@ -68,7 +68,7 @@ def _resolve_output_indices(channels, requested):
 
 
 def _select_netcdf_engine():
-    """挑选可用的最快 NetCDF 写引擎：netcdf4 > h5netcdf > scipy（兜底）。"""
+    """Select the fastest available NetCDF write engine: netcdf4 > h5netcdf > scipy (fallback)."""
     for eng, import_name in (("netcdf4", "netCDF4"), ("h5netcdf", "h5netcdf")):
         try:
             importlib.import_module(import_name)
@@ -80,12 +80,13 @@ def _select_netcdf_engine():
 
 
 class _AsyncWriter:
-    """后台单线程写 NetCDF；写失败则把该 step 原始数组兜底存 .npy。"""
+    """Write NetCDF on a single background thread; on failure, save the step's raw arrays to .npy as a fallback."""
 
     def __init__(self, save_dir, atomic=True):
         self.save_dir = save_dir
-        # 先写隐藏临时名再 os.replace 原子改名：下游永远读不到半个文件，
-        # 前导点也让 `*.nc` 通配不会把半成品当产物。
+        # Write to a hidden temporary name first, then rename atomically with os.replace:
+        # downstream never sees a partial file, and the leading dot keeps `*.nc` globs
+        # from treating a partial file as output.
         self.atomic = bool(atomic)
         self.q = queue.Queue(maxsize=2)
         self.errors = []
@@ -102,7 +103,7 @@ class _AsyncWriter:
             path = os.path.join(self.save_dir, fname)
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                # 不压缩：zlib 压缩单步要数秒，裸写 ~500MB/s，推理不必等磁盘。
+                # No compression: zlib compression takes seconds per step, while raw writes reach ~500MB/s, so inference need not wait on disk.
                 target = path
                 if self.atomic:
                     target = os.path.join(
@@ -129,9 +130,9 @@ class _AsyncWriter:
                 self.q.task_done()
 
     def flush(self):
-        """阻塞直到待写文件全部落盘。
+        """Block until all pending files are written.
 
-        写输出 NetCDF 时主线程若并发读输入 NetCDF，HDF5 会段错误；必须让读写串行。
+        If the main thread reads input NetCDF concurrently while output NetCDF is written, HDF5 segfaults; reads and writes must be serialized.
         """
         self.q.join()
 
@@ -145,7 +146,7 @@ class _AsyncWriter:
 
 
 def _init_times(args, interval):
-    """把 --inits（列表）/ --start/--end/--freq（区间）/ --time（单次）展开成起报时间列表。"""
+    """Expand --inits (list) / --start/--end/--freq (range) / --time (single) into a list of init times."""
     if args.inits is not None:
         toks = [t for t in re.split(r"[,\s]+", args.inits) if t]
         if not toks:
@@ -172,15 +173,15 @@ def _init_times(args, interval):
 
 
 def _pick(overrides, key, default):
-    """覆盖参数优先，没给（None）则回落 config 默认值。"""
+    """Overrides take precedence; fall back to the config default when unset (None)."""
     value = overrides.get(key)
     return default if value is None else value
 
 
 def _run_scope(cfg, overrides):
-    """本次运行的范围（模型 / 起报 / 步数 / 成员 / 变量 / 输出 / 步长）。
+    """Scope of the current run (model / init times / steps / members / variables / output / interval).
 
-    worker 参数与任务表都从这一份取，避免两处各算一遍导致成员数对不上。
+    Both worker arguments and the task table are derived from this single scope, so member counts cannot diverge between the two.
     """
     model_path = _pick(overrides, "model_path", cfg.model_path)
     inits = parse_times(_pick(overrides, "times", cfg.times))
@@ -200,7 +201,7 @@ def _run_scope(cfg, overrides):
 
 
 def _build_infer_argv(cfg, overrides, *, scope=None, intra_op_threads=0):
-    """将运行范围覆盖转为 worker 参数；组件由 worker 重新加载 config 获得。"""
+    """Convert run-scope overrides into worker arguments; the worker reloads the config to obtain components."""
     scope = scope or _run_scope(cfg, overrides)
     argv = [
         "--config-source", cfg._source_path,
@@ -241,7 +242,7 @@ def _build_infer_argv(cfg, overrides, *, scope=None, intra_op_threads=0):
 
 
 def _run_infer(cfg, overrides):
-    """使用同一个包模块启动一个或多个隔离 worker。"""
+    """Launch one or more isolated workers from the same package module."""
     scope = _run_scope(cfg, overrides)
     gpus = _pick(overrides, "gpus", cfg.gpus)
     cuda_devices = _pick(
@@ -296,7 +297,7 @@ def _run_infer(cfg, overrides):
         log_files.append(log_file)
 
     status = 0
-    # 主进程心跳：rank 日志在各自文件里，每 30 秒报一次存活情况，避免控制台像冻住。
+    # Main-process heartbeat: rank logs go to separate files, so report liveness every 30 seconds to keep the console from appearing frozen.
     from time import sleep as _sleep
 
     from xmetai_inference.backends.base import _fmt_dur as _fmt_dur_main
@@ -308,7 +309,7 @@ def _run_infer(cfg, overrides):
         statuses = [
             (rank, process.poll()) for rank, process in enumerate(processes)
         ]
-        # rank 一死立刻报告：OOM kill 是 SIGKILL，rank 自己的日志会戛然而止。
+        # Report a dead rank immediately: OOM kills use SIGKILL, so the rank's own log ends abruptly.
         for rank, code in statuses:
             if code is None or rank in reported:
                 continue
@@ -420,10 +421,10 @@ def _config_main(argv=None):
 def _run_plain_block(model, processors, dataloader, writer, args, member_indices,
                      save_names, lat, lon, interval, local_rank, world_size, members,
                      total_inits, num_workers=0, model_batch=1):
-    """确定性 / 同 session 集合的一段编舞：数据集在内层遍历，逐 batch 落盘并 flush。
+    """Driver for a deterministic / same-session ensemble block: iterate the dataset in the inner loop, writing each batch to disk and flushing.
 
-    members==1：每起报一条轨迹，输出 ``{起报}/{步号}.nc``；members>1：每成员一条轨迹，
-    输出 ``{起报}/member_{成员3位}/{步号}.nc``。返回跑完的起报条数。
+    members==1: one trajectory per init time, output ``{init}/{step:03d}.nc``; members>1: one trajectory per member,
+    output ``{init}/member_{member:03d}/{step:03d}.nc``. Returns the number of completed init times.
     """
     from xmetai_inference.backends.base import _fmt_dur
     from xmetai_inference.utils.runner import Rollout, Trajectory
@@ -432,8 +433,8 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
     log.info("开始迭代数据集，等待首个 batch 装载（workers=%s，"
              "每个 worker 要重新打开 zarr 并读满一个 batch，可能较慢）...", num_workers)
     t_fetch = perf_counter()
-    # 注意：循环体内已有局部 batch_index（按 batch_inits 枚举），这里用
-    # data_batch_index 区分，避免遮蔽/改绑。
+    # Note: the loop body has a local batch_index (enumerating batch_inits); use
+    # data_batch_index here to avoid shadowing/rebinding it.
     for data_batch_index, batch in enumerate(dataloader):
         fetch_dur = perf_counter() - t_fetch
         state, batch_inits = model.prepare_dataset_batch(batch)
@@ -441,7 +442,7 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
             log.info("首个 batch 就绪：state 形状 %s，装载+前处理耗时 %s",
                      tuple(state.shape), _fmt_dur(fetch_dur))
 
-        # 确定性：一次 Rollout 跑完整个 batch；集合：每个起报一次 Rollout，成员即轨迹。
+        # Deterministic: one Rollout covers the whole batch; ensemble: one Rollout per init time, with members as trajectories.
         if members == 1:
             def on_batch_step(step, step_state, batch_inits=batch_inits):
                 step_idx = step + 1
@@ -494,8 +495,8 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
                             raw=(step_state[local_index], step, init),
                         )
 
-                # 成员即轨迹：共享同一初始态（扰动来自图内随机算子）；
-                # member_indices 已是本 rank 那部分。
+                # Members are trajectories sharing the same initial state (perturbations come from
+                # in-graph random ops); member_indices is already this rank's subset.
                 Rollout(model, processors).run(
                     [
                         Trajectory(
@@ -509,8 +510,8 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
                     hour_interval=interval,
                     model_batch=model_batch,
                 on_step=on_step,
-                # 一次 Rollout 几十步 × 全部成员，关掉进度行会全程零日志；
-                # 逐轨迹进度本身稀疏（每 5 步一行），不会刷屏。
+                # A Rollout runs tens of steps × all members, so disabling the progress line
+                # would leave no logs; per-trajectory progress is sparse (one line every 5 steps).
                 progress=True,
                 progress_label=f"[rank {local_rank}/{world_size}] {init:%m%d%H}",
                 )
@@ -532,10 +533,10 @@ def _run_plain_block(model, processors, dataloader, writer, args, member_indices
 
 
 def _check_model_batch(model_batch, *, gpu_state, has_recurrent):
-    """启动期校验 ``model_batch`` 与运行模式的组合，非法当场失败。
+    """Validate the combination of ``model_batch`` and the run mode at startup, failing fast when invalid.
 
-    只判静态可知的错；图是不是动态 batch 要 load 读图才知道，那一步由 ``Rollout``
-    负责（静态图则退回 1 并告警）。
+    Only statically knowable errors are checked; whether the graph supports dynamic batch is known only
+    after loading it, which ``Rollout`` handles (a static graph falls back to 1 with a warning).
     """
     model_batch = 1 if model_batch is None else int(model_batch)
     if model_batch < 1:
@@ -602,11 +603,11 @@ def _worker_main(argv=None):
         console=not args.no_console_log,
         rank=f"{local_rank}/{world_size}",
     )
-    # 多卡时 inference.py 已用 CUDA_VISIBLE_DEVICES 隔离每个进程，device 恒为 0；
-    # 单进程想指定别的卡仍可用 --device 覆盖。
+    # With multiple GPUs, inference.py already isolates each process via CUDA_VISIBLE_DEVICES,
+    # so device is always 0; a single process can still override the card with --device.
     device_id = args.device if args.device is not None else 0
 
-    # 每个 worker 重新加载同一 config，确保外部 Model/Dataset 在多进程中可用。
+    # Each worker reloads the same config so external Model/Dataset classes remain available across processes.
     worker_cfg = load_config(args.config_source)
     model_spec = worker_cfg.model_class
     try:
@@ -620,7 +621,7 @@ def _worker_main(argv=None):
 
     interval = args.interval or getattr(cls, "hour_interval", 6)
     history = args.history or getattr(cls, "history_steps", 2)
-    # 集合/确定性显式化：members 缺省从模型类读；类型与成员数不一致时告警（不报错）
+    # Make ensemble/deterministic explicit: members defaults to the model class; warn (not error) when type and member count disagree.
     forecast_type = getattr(cls, "forecast_type", "deterministic")
     members = args.members if args.members is not None else getattr(cls, "members", 1)
     if forecast_type == "deterministic" and members > 1:
@@ -631,9 +632,10 @@ def _worker_main(argv=None):
                     cls.__name__, members)
     init_times = _init_times(args, interval)
 
-    # 多卡分工有两种切法：按起报切（每 rank 跑部分起报、全部成员）或按成员切。
-    # 每条轨迹持有一份 ~645MB state，按起报切会让每卡挂全部成员（51 成员 ≈ 33GB，
-    # 实测 OOM）；集合优先按成员切，成员少于卡数时退回按起报切。
+    # Multi-GPU work splits two ways: by init time (each rank runs some init times with all
+    # members) or by member. Each trajectory holds ~645MB of state, so splitting by init time
+    # makes each card hold all members (51 members ≈ 33GB, observed OOM); ensembles prefer
+    # splitting by member and fall back to init-time splitting when members < cards.
     n_init = len(init_times)
     per_rank_init = (n_init + world_size - 1) // world_size
     per_rank_member = (members + world_size - 1) // world_size
@@ -663,7 +665,7 @@ def _worker_main(argv=None):
              init_times[-1].strftime("%Y%m%d%H"), len(member_indices))
 
     input_specs, recurrent_specs, output_specs = worker_cfg.processor_specs()
-    # 前向批参数在开 zarr / 加载模型之前校验：配错当场失败，别付几分钟启动成本。
+    # Validate forward-batch parameters before opening zarr / loading the model: fail fast rather than paying minutes of startup cost.
     model_batch = _check_model_batch(
         worker_cfg.model_batch,
         gpu_state=(worker_cfg.gpu_state if worker_cfg.gpu_state is not None
