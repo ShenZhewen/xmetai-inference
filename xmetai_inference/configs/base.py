@@ -103,7 +103,7 @@ def grid_coords(grid):
 ROOT = os.environ.get("XMETAI_INFERENCE_ROOT") or os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# In-package recipe directory (both --config <name> and --model <name> resolve here).
+# In-package recipe directory (both positional config.py and --config <name> resolve here).
 PACKAGE_RECIPES = os.path.dirname(os.path.abspath(__file__))
 
 

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Unified inference entry point: config loading, multi-GPU scheduling, autoregressive inference, and NetCDF output.
 
-Usage: xmetai-infer --model weather_era_0p25_fgvp --times 2025010700..2025020500:24
+Usage: xmetai-infer --config weather_era_0p25_fgvp --times 2025010700..2025020500:24
 Outputs ``{out}/{init}/member_{member:03d}/{step:03d}.nc`` (deterministic runs omit the member level).
 Multi-GPU runs split members or init times across subprocesses; writes go through a single background thread (netCDF4/HDF5 are not thread-safe).
 """
@@ -352,14 +352,9 @@ def _config_main(argv=None):
         nargs="?",
         help="外部 config.py；等价于 --config config.py",
     )
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument(
-        "--model",
-        help="注册模型配方名，如 weather_era_0p25_fuxi21、weather_era_0p25_fgvp",
-    )
-    source.add_argument(
+    parser.add_argument(
         "--config",
-        help="高级用法：内置配置名或外部配置文件路径",
+        help="内置配置名或外部配置文件路径",
     )
     parser.add_argument(
         "--model-path",
@@ -387,12 +382,11 @@ def _config_main(argv=None):
     args = parser.parse_args(argv)
 
     selected = [
-        value for value in (args.config_path, args.config, args.model)
+        value for value in (args.config_path, args.config)
         if value is not None
     ]
     if len(selected) != 1:
-        parser.error(
-            "必须且只能指定一个 config.py、--config 或 --model")
+        parser.error("必须且只能指定一个 config.py 或 --config")
     recipe = selected[0]
     cfg = load_config(recipe)
     log_level = args.log_level or cfg.log_level
