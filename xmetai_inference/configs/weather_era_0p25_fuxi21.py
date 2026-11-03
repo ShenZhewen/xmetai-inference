@@ -2,8 +2,18 @@
 import os
 
 from xmetai_inference.backends.pt2 import Pt2InferModel
-from xmetai_inference.configs.base import (
-    FUXI21_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import (
+    GRID_025, LEVELS, PL_VARS, _expand_channels)
+
+
+# FuXi-2.1 surface channels: FuXi-Ens plus soil/wave-derived sfc vars (85 total = 65 upper + 20 sfc).
+FUXI21_SFC_VARS = [
+    "msl", "t2m", "d2m", "sst", "ws10m", "ws100m", "u10m", "v10m",
+    "u100m", "v100m", "lcc", "mcc", "hcc", "tcc",
+    "ssr", "ssrd", "fdir", "ttr", "tcw", "tp",
+]
+FUXI21_CHANNELS = _expand_channels(PL_VARS, LEVELS, FUXI21_SFC_VARS)
 
 
 # Placeholder paths; replace before deployment.

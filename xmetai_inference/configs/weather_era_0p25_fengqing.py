@@ -6,8 +6,17 @@ import numpy as np
 import torch
 
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    FENGQING_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import GRID_025, _expand_channels
+
+
+# FengQing upper-air levels/vars (ascending, 1000 first) and surface channels; the
+# channel list they build (order per .onnx contract). Self-contained, not shared.
+FENGQING_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+FENGQING_PL_VARS = ["z", "q", "t", "u", "v"]
+FENGQING_SFC_VARS = ["tp", "msl", "u10m", "v10m", "t2m"]
+FENGQING_CHANNELS = _expand_channels(
+    FENGQING_PL_VARS, FENGQING_LEVELS, FENGQING_SFC_VARS)
 
 
 # Placeholder paths; replace before deployment.

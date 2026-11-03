@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    FUXI_ENS_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import FUXI_ENS_CHANNELS, GRID_025
 
 
 # Placeholder paths; replace before deployment.

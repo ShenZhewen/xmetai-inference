@@ -1,7 +1,19 @@
 # -*- coding: utf-8 -*-
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    FENGSHUN_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import (
+    GRID_025, LEVELS, PL_VARS, _expand_channels)
+
+
+# fengshun2.0: 87 channels = 65 upper-air + 22 surface (adds t2m_min/t2m_max over FuXi-2.1).
+# Order must match the input store's channel array and the graph's mean/std element by
+# element; reordering raises no error but misaligns the whole field.
+FENGSHUN_SFC_VARS = [
+    "msl", "t2m", "t2m_min", "t2m_max", "d2m", "sst", "ws10m", "ws100m",
+    "u10m", "v10m", "u100m", "v100m", "lcc", "mcc", "hcc", "tcc",
+    "ssr", "ssrd", "fdir", "ttr", "tcw", "tp",
+]
+FENGSHUN_CHANNELS = _expand_channels(PL_VARS, LEVELS, FENGSHUN_SFC_VARS)
 
 
 # Placeholder paths; replace before deployment.

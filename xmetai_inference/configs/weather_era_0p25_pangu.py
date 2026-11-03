@@ -7,8 +7,16 @@ import pandas as pd
 import torch
 
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    GRID_025, PANGU_CHANNELS, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import GRID_025, _expand_channels
+
+# Pangu upper-air levels/vars (ascending, 1000 first) and surface channels (msl, u10m,
+# v10m, t2m; no tp) + the channel list they build. Self-contained, not shared with FengQing.
+PANGU_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+PANGU_PL_VARS = ["z", "q", "t", "u", "v"]
+PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
+PANGU_CHANNELS = _expand_channels(
+    PANGU_PL_VARS, PANGU_LEVELS, PANGU_SFC_VARS)
 
 # Placeholder paths; replace before deployment.
 PANGU_ROOT = "/path/to/models/Pangu-Weather-main"

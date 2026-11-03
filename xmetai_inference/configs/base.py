@@ -1,102 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Inference config base: common grid/channel declarations + InferConfig + load_config().
+"""Inference config machinery: InferConfig + ModelProcessingConfig + load_config().
 
-Each ``configs/<name>.py`` = model class (declares the contract) + module-level ``cfg`` (run recipe);
-recipes import shared pieces via ``from xmetai_inference.configs.base import ...``.
+Each ``configs/<name>.py`` = model class + module-level ``cfg``. Shared grid/channel
+names come from ``utils/config_util.py`` and are re-exported here for legacy callers;
+per-model channel lists live in the model's own config.
 """
 import importlib.util
 import os
-import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
 from typing import Any
 
-import numpy as np
-
-
-# Shared 0.25 degree global regular grid for FuXi-Ens, FuXi-2.1, and FGVP.
-GRID_025 = {
-    "lat": {"start": 90.0, "step": -0.25, "size": 721},
-    "lon": {"start": 0.0, "step": 0.25, "size": 1440},
-}
-
-# South-to-north variant (native CRA store orientation; used by the Tongyun-CRA graph).
-# Do NOT pair it with geometry: that processor unconditionally flips south-to-north to
-# north-to-south, feeding fields in reverse. Output lat coordinates also come from this grid.
-GRID_025_S = {
-    "lat": {"start": -90.0, "step": 0.25, "size": 721},
-    "lon": {"start": 0.0, "step": 0.25, "size": 1440},
-}
-
-LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
-PL_VARS = ["z", "t", "u", "v", "q"]
-FUXI_ENS_SFC_VARS = [
-    "t2m", "d2m", "sst", "u10m", "v10m", "u100m", "v100m",
-    "msl", "ssr", "ssrd", "fdir", "ttr", "tp",
-]
-FUXI21_SFC_VARS = [
-    "msl", "t2m", "d2m", "sst", "ws10m", "ws100m", "u10m", "v10m",
-    "u100m", "v100m", "lcc", "mcc", "hcc", "tcc",
-    "ssr", "ssrd", "fdir", "ttr", "tcw", "tp",
-]
-
-
-def _expand_channels(pl_vars, levels, surface_vars):
-    return [
-        f"{variable}{level}"
-        for variable in pl_vars
-        for level in levels
-    ] + list(surface_vars)
-
-
-FUXI_ENS_CHANNELS = _expand_channels(
-    PL_VARS, LEVELS, FUXI_ENS_SFC_VARS)
-FUXI21_CHANNELS = _expand_channels(
-    PL_VARS, LEVELS, FUXI21_SFC_VARS)
-
-# fengshun2.0: 87 channels = 65 upper-air + 22 surface (adds t2m_min/t2m_max over FuXi-2.1).
-# Order must match the input store's channel array and the graph's mean/std element by
-# element; reordering raises no error but misaligns the whole field.
-FENGSHUN_SFC_VARS = [
-    "msl", "t2m", "t2m_min", "t2m_max", "d2m", "sst", "ws10m", "ws100m",
-    "u10m", "v10m", "u100m", "v100m", "lcc", "mcc", "hcc", "tcc",
-    "ssr", "ssrd", "fdir", "ttr", "tcw", "tp",
-]
-FENGSHUN_CHANNELS = _expand_channels(PL_VARS, LEVELS, FENGSHUN_SFC_VARS)
-
-
-FENGQING_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
-FENGQING_PL_VARS = ["z", "q", "t", "u", "v"]
-FENGQING_SFC_VARS = ["tp", "msl", "u10m", "v10m", "t2m"]
-FENGQING_CHANNELS = _expand_channels(
-    FENGQING_PL_VARS, FENGQING_LEVELS, FENGQING_SFC_VARS)
-
-# Pangu-Weather: same levels and upper-air variable order as FengQing; surface channels have no tp, = [msl,u10m,v10m,t2m].
-PANGU_LEVELS = FENGQING_LEVELS
-PANGU_PL_VARS = FENGQING_PL_VARS
-PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
-PANGU_CHANNELS = _expand_channels(
-    PANGU_PL_VARS, PANGU_LEVELS, PANGU_SFC_VARS)
-
-# CRA c71: upper-air z/t/u/v/q x 13 levels (50 to 1000 ascending) + surface [t2m,q2m,u10m,v10m,msl,tp].
-CRA_SFC_VARS = ["t2m", "q2m", "u10m", "v10m", "msl", "tp"]
-CRA_CHANNELS = _expand_channels(PL_VARS, LEVELS, CRA_SFC_VARS)
-
-
-def grid_coords(grid):
-    """Convert a model grid contract to latitude and longitude coordinate arrays."""
-    latitude = grid["lat"]
-    longitude = grid["lon"]
-    lat = (
-        np.arange(latitude["size"], dtype=np.float64) * latitude["step"]
-        + latitude["start"]
-    )
-    lon = (
-        np.arange(longitude["size"], dtype=np.float64) * longitude["step"]
-        + longitude["start"]
-    )
-    return lat, lon
+from xmetai_inference.utils.config_util import (
+    FUXI_ENS_CHANNELS,
+    FUXI_ENS_SFC_VARS,
+    GRID_025,
+    GRID_025_S,
+    LEVELS,
+    PL_VARS,
+    grid_coords,
+    parse_times,
+)
 
 
 # Project root (absolute); set XMETAI_INFERENCE_ROOT explicitly when the wheel is installed elsewhere.
@@ -105,52 +29,6 @@ ROOT = os.environ.get("XMETAI_INFERENCE_ROOT") or os.path.abspath(
 
 # In-package recipe directory (both positional config.py and --config <name> resolve here).
 PACKAGE_RECIPES = os.path.dirname(os.path.abspath(__file__))
-
-
-def _parse_dt(token):
-    """Parse one initialization-time token into a datetime (YYYYMMDD or YYYYMMDDHH)."""
-    token = token.strip()
-    if re.fullmatch(r"\d{8}", token):
-        return datetime.strptime(token, "%Y%m%d")
-    if re.fullmatch(r"\d{10}", token):
-        return datetime.strptime(token, "%Y%m%d%H")
-    raise SystemExit(f"无法解析起报时间 {token!r}（应 YYYYMMDD 或 YYYYMMDDHH）")
-
-
-def parse_times(spec, hour_interval=24):
-    """Expand the unified `times` string into initialization times (datetime, ascending, deduplicated).
-
-    Syntax:
-      ""                                 → []
-      "2025010600" / "20250106"          → single initialization
-      "20250106,20250112"                → explicit list (comma-separated)
-      "2025010600..2025020500"           → closed interval, step hour_interval (default 24h = once per day)
-      "2025010600..2025020500:24"        → closed interval, `:N` overrides the step (hours)
-    Singles and intervals may be mixed in one comma-separated list, e.g. "20250106,20250110..20250112:12".
-    """
-    if spec is None or str(spec).strip() == "":
-        return []
-    out = []
-    for tok in str(spec).split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        m = re.fullmatch(r"(\d{8}(?:\d{2})?)\s*\.\.\s*(\d{8}(?:\d{2})?)(?::(\d+))?", tok)
-        if m:
-            start = _parse_dt(m.group(1))
-            end = _parse_dt(m.group(2))
-            step = int(m.group(3)) if m.group(3) else hour_interval
-            if step <= 0:
-                raise SystemExit(f"区间步长必须 >0：{tok!r}")
-            t = start
-            while t <= end:
-                out.append(t)
-                t += timedelta(hours=step)
-        else:
-            out.append(_parse_dt(tok))
-    if not out:
-        raise SystemExit(f"times 解析后为空：{spec!r}")
-    return sorted(set(out))
 
 
 @dataclass
@@ -294,27 +172,13 @@ def load_config(path):
 
 
 __all__ = [
-    "CRA_CHANNELS",
-    "CRA_SFC_VARS",
-    "FENGSHUN_CHANNELS",
-    "FENGSHUN_SFC_VARS",
-    "FENGQING_CHANNELS",
-    "FENGQING_LEVELS",
-    "FENGQING_PL_VARS",
-    "FENGQING_SFC_VARS",
     "FUXI_ENS_CHANNELS",
     "FUXI_ENS_SFC_VARS",
-    "FUXI21_CHANNELS",
-    "FUXI21_SFC_VARS",
     "GRID_025",
     "GRID_025_S",
     "InferConfig",
     "LEVELS",
     "ModelProcessingConfig",
-    "PANGU_CHANNELS",
-    "PANGU_LEVELS",
-    "PANGU_PL_VARS",
-    "PANGU_SFC_VARS",
     "PACKAGE_RECIPES",
     "PL_VARS",
     "ROOT",

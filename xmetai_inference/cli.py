@@ -216,10 +216,19 @@ def _run_scope(cfg, overrides):
     Both worker arguments and the task table are derived from this single scope, so member counts cannot diverge between the two.
     """
     model_path = _pick(overrides, "model_path", cfg.model_path)
-    inits = parse_times(_pick(overrides, "times", cfg.times))
+
+    dataset_type = str((cfg.dataset or {}).get("type", ""))
+    if dataset_type == "example_nc":
+        # Business single-input: init times come from the nc files' time coords, not cfg.times.
+        from xmetai_inference.data.weather import example_nc_init_times
+        inits = example_nc_init_times(cfg.dataset.get("paths", []))
+    else:
+        inits = parse_times(_pick(overrides, "times", cfg.times))
     if not inits:
         raise SystemExit(
-            f"配置 {cfg.name}：推理必须指定 times（如 \"2025010600..2025020500:24\"）")
+            "配置 {}：推理必须指定 times（如 \"2025010600..2025020500:24\"）"
+            .format(cfg.name) if dataset_type != "example_nc" else
+            f"配置 {cfg.name}：example_nc 的 dataset.paths 没有可用的 nc")
     steps = _pick(overrides, "steps", cfg.steps)
     if int(steps) < 1:
         raise SystemExit(f"配置 {cfg.name}：steps 必须 >= 1，实际 {steps}")

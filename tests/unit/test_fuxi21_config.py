@@ -15,7 +15,7 @@ from datetime import datetime
 import pytest
 
 from xmetai_inference.configs import InferConfig, load_config, parse_times
-from xmetai_inference.configs import FUXI21_CHANNELS
+from xmetai_inference.configs.weather_era_0p25_fuxi21 import FUXI21_CHANNELS
 from xmetai_inference.utils.model_factory import get_model_class
 
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")

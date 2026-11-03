@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    CRA_CHANNELS, GRID_025_S, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import (
+    GRID_025_S, LEVELS, PL_VARS, _expand_channels)
+
+
+# CRA c71: upper-air z/t/u/v/q x 13 levels (50 to 1000 ascending) + surface [t2m,q2m,u10m,v10m,msl,tp].
+CRA_SFC_VARS = ["t2m", "q2m", "u10m", "v10m", "msl", "tp"]
+CRA_CHANNELS = _expand_channels(PL_VARS, LEVELS, CRA_SFC_VARS)
 
 
 # Placeholder paths; replace before deployment.

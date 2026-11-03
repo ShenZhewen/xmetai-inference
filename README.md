@@ -24,6 +24,7 @@ declares, runs the rollout, and writes the forecast as NetCDF.
   - [Two Store Layouts](#two-store-layouts)
   - [Units](#units)
   - [Per-Model Preprocessing Chains](#per-model-preprocessing-chains)
+  - [Single-Input `.nc` Example](#single-input-nc-example)
 - [Project Structure](#project-structure)
 - [How It Works](#how-it-works)
 
@@ -69,6 +70,7 @@ xmetai-infer --config weather_era_0p25_fengqing
 xmetai-infer --config weather_era_0p25_pangu
 xmetai-infer --config weather_cra_0p25_tongyun_ens
 xmetai-infer --config s2s_cra_0p25_fengshun20_ens
+xmetai-infer --config weather_example_tongyun   # demo: single-input .nc (FGVP deterministic)
 ```
 
 Each recipe declares the weight path, dataset and preprocessing chain, initialization times, step
@@ -196,6 +198,29 @@ dataset = {
 - History frames are read backwards from each init time; a requested init time without enough
   history raises.
 
+**`example_nc`** — infer straight from one business-supplied `.nc` file instead of a Zarr store:
+
+```python
+dataset = {
+    "type": "example_nc",
+    "paths": ["/abs/input.nc"],
+    "mode": "model_ready",   # default; or "native"
+    # "processors": [...],   # native mode only; model_ready must not set it
+}
+```
+
+Each file is one initialization; all history frames live inside the nc itself (the engine never
+reads back into a store). The init time is the last `time` frame's value, so `cfg.times` is not
+consulted for this type. Two modes:
+
+- `model_ready` (default): the nc already holds exactly the model input — physical quantities in
+  `input_channels` order, in the model's native grid orientation. No processor chain runs; only
+  the channel axis is verified/rewritten.
+- `native`: the nc holds raw fields in its own channel order; the model's `dataset.processors`
+  chain runs as in `processed_multi_zarr`, then the channel axis is reordered to `input_channels`.
+
+Samples are built eagerly once at dataset build time, so this type is single-process-only.
+
 ### Store Inventory
 
 The store root names below are relative to the data roots declared at the top of each recipe in
@@ -276,6 +301,35 @@ How to tell them apart:
 ERA5 recipes default to the raw store2 root; the two CRA recipes read `zarr_refresh_v3` stores.
 The v3 ERA5 stores (c116 / c78) have no shipped recipe — copy an existing ERA5 recipe and swap
 `paths` (and `times`) to run them.
+
+### Single-Input `.nc` Example
+
+`weather_example_tongyun` is a self-contained demo recipe that infers straight from **one
+business-supplied `.nc`** — no Zarr store. The graph is the FGVP deterministic model
+(`tongyun_det.onnx` == `iwc_fgvp_gdn2_onnx`): **78 channels** (FGVP/ERA5 order), `GRID_025`
+north→south, single member, 2-frame history, physical units in/out (normalization baked into the
+graph).
+
+1. Download the sample input (a 78-channel `input.nc`, already `model_ready`):
+   https://drive.google.com/file/d/1h8jBXPEtQLfayUe8f_UpNCHWwIKDGHeD/view?usp=drive_link
+2. Point the three placeholders in `configs/weather_example_tongyun.py` at your model, custom-op
+   library, and the downloaded `.nc`:
+   ```python
+   SRC_GRAPH        = "<tongyun_det.onnx>"
+   OPS_LIBRARY      = "<xmetai_onnx_plugins.ort1_24.cuda12.so>"
+   TONGYUN_NC_INPUT = "<path>/input.nc"
+   ```
+3. Run — one command:
+   ```bash
+   python -m xmetai_inference --config weather_example_tongyun --out <output_dir>
+   ```
+   Output lands at `{out}/{YYYYMMDD}/{step:03d}.nc` (60 steps, 6 h apart; single member, so no
+   `member_XXX` layer).
+
+The input only works if it is exactly the graph's input: physical quantities in
+`FUXI_ENS_CHANNELS` order, `GRID_025` orientation, `float32`, `(time=history, channel=78, 721,
+1440)`, and `sst` cold-spots filled. `tools/make_tongyun_sample_nc.py` regenerates such a file
+from any normalized store (denormalize in, `geometry`/`fill_missing` preserved).
 
 ## Project Structure
 
