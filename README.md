@@ -15,6 +15,7 @@ declares, runs the rollout, and writes the forecast as NetCDF.
   - [Requirements](#requirements)
   - [Install](#install)
   - [Run](#run)
+  - [Single-Input `.nc` Example](#single-input-nc-example)
   - [Override Parameters](#override-parameters)
 - [Supported Models](#supported-models)
   - [Channel Sets and Order](#channel-sets-and-order)
@@ -24,7 +25,6 @@ declares, runs the rollout, and writes the forecast as NetCDF.
   - [Two Store Layouts](#two-store-layouts)
   - [Units](#units)
   - [Per-Model Preprocessing Chains](#per-model-preprocessing-chains)
-  - [Single-Input `.nc` Example](#single-input-nc-example)
 - [Project Structure](#project-structure)
 - [How It Works](#how-it-works)
 
@@ -86,6 +86,35 @@ Output goes to `{out}/{YYYYMMDD|YYYYMMDDHH}/[member_XXX/]{step:03d}.nc`, one Net
 
 `xmetai-infer --worker ...` is the internal worker subprocess entry point used for every run
 (single- or multi-GPU) and should not be called manually.
+
+### Single-Input `.nc` Example
+
+`weather_example_tongyun` is a self-contained demo recipe that infers straight from **one
+business-supplied `.nc`** — no Zarr store. The graph is the FGVP deterministic model
+(`tongyun_det.onnx` == `iwc_fgvp_gdn2_onnx`): **78 channels** (FGVP/ERA5 order), `GRID_025`
+north→south, single member, 2-frame history, physical units in/out (normalization baked into the
+graph).
+
+1. Download the sample input (a 78-channel `input.nc`, already `model_ready`):
+   https://drive.google.com/file/d/1h8jBXPEtQLfayUe8f_UpNCHWwIKDGHeD/view?usp=drive_link
+2. Point the three placeholders in `configs/weather_example_tongyun.py` at your model, custom-op
+   library, and the downloaded `.nc`:
+   ```python
+   SRC_GRAPH        = "<tongyun_det.onnx>"
+   OPS_LIBRARY      = "<xmetai_onnx_plugins.ort1_24.cuda12.so>"
+   TONGYUN_NC_INPUT = "<path>/input.nc"
+   ```
+3. Run — one command:
+   ```bash
+   python -m xmetai_inference --config weather_example_tongyun --out <output_dir>
+   ```
+   Output lands at `{out}/{YYYYMMDD}/{step:03d}.nc` (60 steps, 6 h apart; single member, so no
+   `member_XXX` layer).
+
+The input only works if it is exactly the graph's input: physical quantities in
+`FUXI_ENS_CHANNELS` order, `GRID_025` orientation, `float32`, `(time=history, channel=78, 721,
+1440)`, and `sst` cold-spots filled. `tools/make_tongyun_sample_nc.py` regenerates such a file
+from any normalized store (denormalize in, `geometry`/`fill_missing` preserved).
 
 ### Override Parameters
 
@@ -301,35 +330,6 @@ How to tell them apart:
 ERA5 recipes default to the raw store2 root; the two CRA recipes read `zarr_refresh_v3` stores.
 The v3 ERA5 stores (c116 / c78) have no shipped recipe — copy an existing ERA5 recipe and swap
 `paths` (and `times`) to run them.
-
-### Single-Input `.nc` Example
-
-`weather_example_tongyun` is a self-contained demo recipe that infers straight from **one
-business-supplied `.nc`** — no Zarr store. The graph is the FGVP deterministic model
-(`tongyun_det.onnx` == `iwc_fgvp_gdn2_onnx`): **78 channels** (FGVP/ERA5 order), `GRID_025`
-north→south, single member, 2-frame history, physical units in/out (normalization baked into the
-graph).
-
-1. Download the sample input (a 78-channel `input.nc`, already `model_ready`):
-   https://drive.google.com/file/d/1h8jBXPEtQLfayUe8f_UpNCHWwIKDGHeD/view?usp=drive_link
-2. Point the three placeholders in `configs/weather_example_tongyun.py` at your model, custom-op
-   library, and the downloaded `.nc`:
-   ```python
-   SRC_GRAPH        = "<tongyun_det.onnx>"
-   OPS_LIBRARY      = "<xmetai_onnx_plugins.ort1_24.cuda12.so>"
-   TONGYUN_NC_INPUT = "<path>/input.nc"
-   ```
-3. Run — one command:
-   ```bash
-   python -m xmetai_inference --config weather_example_tongyun --out <output_dir>
-   ```
-   Output lands at `{out}/{YYYYMMDD}/{step:03d}.nc` (60 steps, 6 h apart; single member, so no
-   `member_XXX` layer).
-
-The input only works if it is exactly the graph's input: physical quantities in
-`FUXI_ENS_CHANNELS` order, `GRID_025` orientation, `float32`, `(time=history, channel=78, 721,
-1440)`, and `sst` cold-spots filled. `tools/make_tongyun_sample_nc.py` regenerates such a file
-from any normalized store (denormalize in, `geometry`/`fill_missing` preserved).
 
 ## Project Structure
 
