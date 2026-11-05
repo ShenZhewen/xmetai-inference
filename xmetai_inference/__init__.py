@@ -1,10 +1,10 @@
-"""配置驱动的气象模型推理与评测。"""
+"""Config-driven weather model inference and evaluation."""
 
 __version__ = "0.1.0"
 
 
 def main(argv=None):
-    """推理命令行入口。"""
+    """Inference command-line entry point."""
     from .cli import main as _main
 
     return _main(argv)

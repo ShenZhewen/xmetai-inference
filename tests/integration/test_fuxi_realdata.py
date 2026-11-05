@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-"""fuxi（fuxi21 / FuXi-2.1）真实数据档：真 .pt2 在切片数据上跑一遍，和标准答案对拍。
+"""fuxi (fuxi21 / FuXi-2.1) realdata suite: run the real .pt2 model on sliced data and compare against golden.
 
-配方是 configs/weather_era_0p25_fuxi21.py 的 deepcopy 派生，只覆盖 fixture 特有项。fuxi2.1 在 GPU 上
-不可逐位复现：第 1 步按变量判档（地面 CLOSE、高空 DRIFT），第 2 步起噪声经回填扩散到
-全部通道，只挂灾难线；第 1 步全变量就偏 ⇒ 前处理或时间条件的问题。
+The recipe is derived by deepcopying configs/weather_era_0p25_fuxi21.py and overrides only
+fixture-specific entries. fuxi2.1 is not bit-reproducible on GPU: step 1 is classified per
+variable (surface CLOSE, upper-air DRIFT), and from step 2 on the noise spreads into every
+channel through feedback, so only the catastrophe limit applies there. A deviation on all
+variables at step 1 indicates a preprocessing or time-feature problem.
 
-跑法：pytest -m realdata tests/integration/test_fuxi_realdata.py
+Usage: pytest -m realdata tests/integration/test_fuxi_realdata.py
 """
 import sys
 from pathlib import Path
@@ -20,24 +22,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from realdata_common import ATOL, RTOL, VERDICT_RANK, compare_dirs, expected_vars
+from realdata_common import (ATOL, RTOL, VERDICT_RANK, FUXI_FIXTURE_ROOT,
+                             compare_dirs, data_root_hint, expected_vars)
 
-#: fixture 根。模型三件套（fuxi-2.1.pt2 / mean.nc / std.nc）手工放，5 个切片 store。
-DATA_ROOT = Path("/workspace/data/shenzw/inference_test_data/fuxi_test_data")
+#: Fixture root. The three model files (fuxi-2.1.pt2 / mean.nc / std.nc) are placed manually,
+#: plus 5 sliced stores. The absolute path is configured at the top of realdata_common.py.
+DATA_ROOT = FUXI_FIXTURE_ROOT
 
-#: 起报时间。切片只覆盖这一个，标准答案也只对这一个（在正式配方 times 范围内）。
+#: Initialization time. The slice covers only this one, and the golden data is for it alone (within the production recipe's times range).
 TIMES = "2025010200"
 
-#: 参与对拍的步序号（1-based，与落盘的 ``001.nc`` 对齐）。
+#: Step indices compared (1-based, aligned with the written ``001.nc`` files).
 STEPS = 3
 
-#: 确定性档：members=1，每个 (步, 变量) 逐场对拍。
+#: Deterministic suite: members=1, comparing each (step, variable) field directly.
 MEMBERS = 1
 GPUS = 1
 
-# 单卡跑哪张卡由外层 CUDA_VISIBLE_DEVICES 决定（同 fgvp 档顶部说明）。
+# On a single GPU, the device is chosen by the outer CUDA_VISIBLE_DEVICES (see the note at the top of the Tongyun suite).
 
-#: GPU 非确定性只打高空通道 —— 这组变量第 1 步放宽到 DRIFT，其余仍按 CLOSE。
+#: GPU nondeterminism affects only upper-air channels; these variables are relaxed to DRIFT at step 1, the rest stay at CLOSE.
 UPPER_AIR_VARS = {"z500", "q700", "t700", "t850", "u850", "v850"}
 
 
@@ -46,20 +50,24 @@ def _pass_rank(variable: str) -> int:
             else VERDICT_RANK["CLOSE"])
 
 
-#: 判档对拍只看这一步；第 2 步起噪声经回填扩散到全部通道，紧门槛必红。
+#: Classification comparison applies only to this step; from step 2 on the noise spreads into every channel through feedback, so a strict threshold would always fail.
 STRICT_STEP = 1
 
-#: 灾难线（全步生效）：max|diff| 超场变率这个比例即红。
+#: Catastrophe limit (all steps): fail when max|diff| exceeds this fraction of field variability.
 CATASTROPHE_STD_LIMIT = 0.5
 
-#: 标准答案根。
+#: Golden reference root.
 GOLDEN_ROOT = DATA_ROOT / "golden"
 
-#: 整点起报 → cli 的目录名写 ``%Y%m%d``（8 位）。
+#: Hourly initialization -> the CLI writes the directory name as ``%Y%m%d`` (8 digits).
 INIT_DIR = "20250102"
 
-#: 切片 store 个数（fuxi21 用 5 个动态 store，比 fgvp 多 soil / wave）。
+#: Number of sliced stores (fuxi21 uses 5 dynamic stores, adding soil / wave over Tongyun).
 _N_STORES = 5
+
+_hint = data_root_hint(DATA_ROOT)
+if _hint:
+    pytest.skip(_hint, allow_module_level=True)
 
 _missing = []
 if not (DATA_ROOT / "dataset").is_dir():
@@ -78,26 +86,27 @@ if not (GOLDEN_ROOT / INIT_DIR).is_dir():
 if _missing:
     pytest.skip(
         f"fixture 不齐: {DATA_ROOT}（缺 {', '.join(_missing)}）—— "
-        "把切片 store、模型三件套、golden 放进该目录后再跑",
+        "把切片 store、模型三件套、golden 放进该目录后再跑；"
+        "DATA_ROOT 在 tests/integration/realdata_common.py 顶部配置",
         allow_module_level=True,
     )
 
 
-# string.Template 的理由同 fgvp 档。
+# string.Template is used for the same reason as in the Tongyun suite.
 _CONFIG_TEMPLATE = Template('''\
 # -*- coding: utf-8 -*-
-"""fuxi21 真实数据档的推理配方 —— 由 test_fuxi_realdata.py 运行时生成，别手改。"""
+"""fuxi21 realdata inference recipe; generated at runtime by test_fuxi_realdata.py. Do not edit."""
 import copy
 from pathlib import Path
 
 from xmetai_inference.configs.weather_era_0p25_fuxi21 import cfg as _production
 
-# deepcopy：import 拿到的是缓存的同一个对象，直接改会把正式配方改成指向 fixture。
+# deepcopy: import returns the same cached object; mutating it directly would point the production recipe at the fixture.
 cfg = copy.deepcopy(_production)
 
 DATA_ROOT = Path("$data_root")
 
-# 切片 store 沿用源文件名，glob 自动对齐；通道按名字选，顺序不影响结果。
+# The sliced stores keep their source file names, so glob alignment is automatic; channels are selected by name, so order does not matter.
 _paths = sorted((DATA_ROOT / "dataset").glob("*.zarr"))
 if len(_paths) != 5:
     raise SystemExit(
@@ -106,15 +115,15 @@ if len(_paths) != 5:
     )
 cfg.dataset["paths"] = [str(p) for p in _paths]
 
-# 模型指到 fixture。mean.nc/std.nc 按 model_path 所在目录解析，跟着模型过来。
+# Point the model at the fixture. mean.nc/std.nc resolve relative to the model_path directory and ship with the model.
 cfg.model_path = f"{DATA_ROOT}/fuxi-2.1.pt2"
 
-# 自回归第 i 步只依赖第 <i 步，跑 3 步的前 3 步与跑 60 步数值相同。
+# Autoregressive step i depends only on steps < i, so the first 3 steps of a 60-step run are numerically identical.
 cfg.times = "$times"
 cfg.steps = $steps
 cfg.members = $members
 cfg.gpus = $gpus
-# worker 设 0 免得 DataLoader 再起子进程。
+# num_workers=0 avoids spawning DataLoader subprocesses.
 cfg.dataloader = {
     "batch_size": 1,
     "num_workers": 0,
@@ -126,7 +135,7 @@ cfg.dataloader = {
 
 
 def _write_config(dest: Path) -> Path:
-    """把模板落成真文件。CLI 收的是路径，给不了对象。"""
+    """Materialize the template as a real file. The CLI accepts paths, not objects."""
     dest.write_text(
         _CONFIG_TEMPLATE.substitute(
             data_root=str(DATA_ROOT),
@@ -142,7 +151,7 @@ def _write_config(dest: Path) -> Path:
 
 @pytest.fixture(scope="session")
 def run(tmp_path_factory):
-    """跑一次真推理并对拍，整模块共用。返回 ``(产物目录, rows, skipped, 配方路径)``。"""
+    """Run the real inference once and compare, shared across the module. Returns ``(output directory, rows, skipped, recipe path)``."""
     from xmetai_inference import main
 
     config_path = _write_config(
@@ -150,7 +159,7 @@ def run(tmp_path_factory):
     out_dir = tmp_path_factory.mktemp("fuxi_realdata")
     print(f"\n[fixture] 本次用的配方：{config_path}")
 
-    # SystemExit 单独接住，理由同 fgvp 档。
+    # Catch SystemExit separately, for the same reason as the Tongyun suite.
     try:
         rc = main(["--config", str(config_path), "--out", str(out_dir)])
     except SystemExit as exc:
@@ -166,7 +175,7 @@ def run(tmp_path_factory):
 
 
 def test_fuxi_matches_golden(run):
-    """核心：第 1 步按变量判档，全部步挂灾难线（口径见文件头）。"""
+    """Core: classify step 1 per variable, and apply the catastrophe limit to all steps (see the module header)."""
     _, rows, _, _ = run
     assert rows, "没有可比对象 —— 产物和标准答案没有共同的 (起报, 步, 变量)"
 
@@ -174,7 +183,7 @@ def test_fuxi_matches_golden(run):
     bad = [r for r in strict
            if VERDICT_RANK[r["verdict"]] > _pass_rank(r["var"])]
 
-    # NaN 的比较结果为假，not 之后进 blown —— NaN 本来就该红。
+    # Comparisons involving NaN are false, so `not` sends them to blown -- NaN should fail anyway.
     blown = [r for r in rows
              if not (r["diff_over_std"] < CATASTROPHE_STD_LIMIT)]
 
@@ -207,7 +216,7 @@ def test_fuxi_matches_golden(run):
 
 
 def test_fuxi_coverage(run):
-    """覆盖面兜底：缺文件静默少比 = 更容易绿（同 fgvp 档）。"""
+    """Coverage guard: silently comparing fewer files passes more easily (same as the Tongyun suite)."""
     _, rows, skipped, config_path = run
 
     assert {r["step"] for r in rows} == set(range(1, STEPS + 1)), (
@@ -227,7 +236,7 @@ def test_fuxi_coverage(run):
 
 
 def test_fuxi_no_nan_mismatch(run):
-    """NaN↔数值的格子不进超容差统计，缺测位置得单独盯。"""
+    """Cells that are NaN on one side and numeric on the other do not enter the exceed statistics; missing-data positions are checked separately."""
     _, rows, _, _ = run
     bad = [r for r in rows if r["nan_mismatch"] > 0]
     assert not bad, (

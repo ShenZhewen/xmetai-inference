@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""自回归 rollout：把单步 forward 串成多轨迹循环。
+"""Autoregressive rollout: chains single-step forward calls into a multi-trajectory loop.
 
-一条 Trajectory = 一条独立轨迹（集合成员或多起报）。
+One Trajectory is one independent trajectory (an ensemble member or a separate initialization).
 """
 import gc
 import logging
@@ -17,18 +17,18 @@ from ..backends.base import _fmt_dur
 
 log = logging.getLogger(__name__)
 
-_PROGRESS_INTERVAL = 5   # 每隔多少步打一条完整进度行
+_PROGRESS_INTERVAL = 5   # Steps between full progress lines
 
-#: 集成档靠这两个标记判断批量化有没有进图，改措辞会连带改测试。
+#: The ensemble registry uses these two markers to determine whether batching entered the graph; changing the wording also requires updating tests.
 BATCH_ACTIVE_MARK = "前向批生效"
 BATCH_FALLBACK_MARK = "模型未声明 batch_axis_dynamic"
 
-#: 每个起报都会新建 Rollout，提示按 key 在进程内去重一次。
+#: A new Rollout is created per initialization; notices are deduplicated per key within the process.
 _batch_notices = set()
 
 
 def _notice_once(key, level, message, *args):
-    """同一条 model_batch 提示在一个进程里只打一次。"""
+    """Emit each model_batch notice only once per process."""
     if key in _batch_notices:
         return
     _batch_notices.add(key)
@@ -36,21 +36,21 @@ def _notice_once(key, level, message, *args):
 
 
 def _copy_state(value):
-    """numpy 用 copy()，torch 用 clone()。"""
+    """Use copy() for numpy and clone() for torch."""
     if isinstance(value, torch.Tensor):
         return value.clone()
     return value.copy()
 
 
 def _stack(values, axis=0):
-    """torch 用 torch.stack，numpy 用 np.stack。"""
+    """Use torch.stack for torch and np.stack for numpy."""
     if values and isinstance(values[0], torch.Tensor):
         return torch.stack(values, dim=axis)
     return np.stack(values, axis)
 
 
 def _cat(values, axis=0):
-    """torch 用 torch.cat，numpy 用 np.concatenate。"""
+    """Use torch.cat for torch and np.concatenate for numpy."""
     if values and isinstance(values[0], torch.Tensor):
         return torch.cat(values, dim=axis)
     return np.concatenate([np.asarray(v) for v in values], axis=axis)
@@ -58,7 +58,7 @@ def _cat(values, axis=0):
 
 @dataclass
 class Trajectory:
-    """一条轨迹：初始状态 (1, in_frames, C, H, W) + 起报时刻 + 日志标签。"""
+    """One trajectory: initial state (1, in_frames, C, H, W) + initialization time + log label."""
 
     state: Any
     init_time: pd.Timestamp
@@ -66,10 +66,10 @@ class Trajectory:
 
 
 class Rollout:
-    """多轨迹自回归循环。
+    """Multi-trajectory autoregressive loop.
 
-    model 需实现 forward(x, step, valid_time)；gpu_state=True 时还需
-    to_gpu / forward_gpu / to_numpy。processing=None 表示不做变换。
+    model must implement forward(x, step, valid_time); with gpu_state=True it must also
+    implement to_gpu / forward_gpu / to_numpy. processing=None means no transform.
     """
 
     def __init__(self, model, processing=None):
@@ -85,16 +85,18 @@ class Rollout:
 
     def run(self, trajectories, steps, hour_interval=6, on_step=None,
             progress=True, progress_label="", model_batch=1):
-        """跑 steps 步，每步对全部轨迹各前向一次。
+        """Run steps steps, forwarding all trajectories once per step.
 
-        传 on_step 则流式回调、返回 None；否则返回 (n_traj, steps, C, H, W)。
-        model_batch 是一次 forward 堆的轨迹数：要求图的 batch 轴是符号维，否则退回 1；
-        不能与 gpu_state=True 同用；显存按 k 倍涨。
+        If on_step is given, results are streamed via callback and None is returned; otherwise
+        returns (n_traj, steps, C, H, W).
+        model_batch is the number of trajectories stacked per forward call: the graph's batch
+        axis must be symbolic, otherwise it falls back to 1; cannot be combined with
+        gpu_state=True; memory grows k-fold.
         """
         if not trajectories:
             raise ValueError("trajectories 为空，没有可跑的轨迹")
 
-        # 跨步有状态模型（Pangu 的 24h 锚点）每批轨迹前清空；缺省 no-op。
+        # Reset stateful cross-step models (Pangu's 24h anchor) before each batch of trajectories; no-op by default.
         reset = getattr(self.model, "reset_runtime_state", None)
         if reset is not None:
             reset()
@@ -114,7 +116,7 @@ class Rollout:
                     "（forward_gpu）的 _spare buffer 复用假设固定 shape，"
                     "动态 batch 轴建不出 buffer。")
             if not getattr(self.model, "batch_axis_dynamic", False):
-                # 静态 batch 图喂 k>1 会被 ORT 拒，退回 1。
+                # Feeding k>1 to a static-batch graph is rejected by ORT; fall back to 1.
                 _notice_once(
                     ("fallback", type(self.model).__name__),
                     logging.WARNING,
@@ -134,7 +136,7 @@ class Rollout:
         chunks = [list(range(start, min(start + model_batch, len(trajectories))))
                   for start in range(0, len(trajectories), model_batch)]
 
-        # 每块一份独立缓冲；state 已带 batch 维，多条用 cat 不用 stack。
+        # Each chunk gets its own buffer; state already carries the batch axis, so concatenate rather than stack multiple entries.
         if use_gpu:
             states = [self.model.to_gpu(t.state) for t in trajectories]
         else:
@@ -146,7 +148,7 @@ class Rollout:
         in_frames = trajectories[0].state.shape[1]
         init_times = [pd.to_datetime(t.init_time) for t in trajectories]
 
-        # 0 = valid = init + step*interval（fuxi 系）；FengQing 用 1。
+        # 0 = valid = init + step*interval (FuXi family); FengQing uses 1.
         offset = getattr(self.model, "valid_time_step_offset", 0)
         windowed = getattr(self.model, "windowed_output", True)
 
@@ -172,12 +174,12 @@ class Rollout:
                     continue
 
                 prev = states[chunk_index]
-                # 多条块喂时刻列表，forward 内部拼成 (k,) 的 step/hour/doy。
+                # Multi-entry chunks pass a list of times; forward assembles step/hour/doy of shape (k,).
                 result = self.model.forward(
                     prev, step,
                     valid_times[0] if len(chunk) == 1 else valid_times)
                 next_state = self._next_state(prev, result, in_frames, windowed)
-                # 先取副本再回填：recurrent Processor 可能原地改。
+                # Copy before refilling: the recurrent Processor may modify in place.
                 preds = next_state[:, -1]
                 for row in range(preds.shape[0]):
                     frame = preds[row]
@@ -209,9 +211,10 @@ class Rollout:
 
     @staticmethod
     def _next_state(prev, result, in_frames, windowed):
-        """forward 输出 → 下一拍输入窗。
+        """Map forward output to the input window of the next step.
 
-        windowed_output=True 时整体回填；False 时拼成 [输入末帧, 预报]。
+        With windowed_output=True the output is used as-is; with False it is concatenated as
+        [last input frame, forecast].
         """
         if windowed:
             if result.shape[1] != in_frames:
@@ -220,7 +223,7 @@ class Rollout:
                     f"输入 {in_frames} 帧，不一致，无法做 state=result 回填。"
                     "若该模型只输出预报帧，请在模型类声明 windowed_output=False。")
             return result
-        # (1,C,H,W) 先补成 (1,1,C,H,W)。
+        # Expand (1,C,H,W) to (1,1,C,H,W) first.
         if result.ndim == prev.ndim - 1:
             result = result[:, None]
         if result.shape[1] != 1:
@@ -234,7 +237,7 @@ class Rollout:
         return np.concatenate([np.asarray(last), np.asarray(result)], axis=1)
 
     def _log_progress(self, step, steps, hour_interval, step_times, label):
-        """每隔 _PROGRESS_INTERVAL 步打一行；首步必打。"""
+        """Log a line every _PROGRESS_INTERVAL steps; the first step is always logged."""
         done = step + 1
         first = done == 1
         if done != steps and not first and done % _PROGRESS_INTERVAL:

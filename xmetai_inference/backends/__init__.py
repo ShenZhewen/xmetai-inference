@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""推理后端包门面：只 re-export BaseInferModel。
+"""Inference backend package facade: re-exports BaseInferModel only.
 
-不要在这里 re-export onnx/pt2 引擎——onnx.py 顶层 import onnxruntime，门面一旦
-带上它，PT2-only 环境导入任何 backends 符号都会被拖上 ONNX Runtime。
+Do not re-export the onnx/pt2 engines here: onnx.py imports onnxruntime at module
+level, so exposing it through the facade would drag ONNX Runtime into any import of
+a backends symbol in PT2-only environments.
 """
 from .base import BaseInferModel
 

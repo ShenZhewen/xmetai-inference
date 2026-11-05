@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""torch.export (.pt2) 后端：加载、dtype/输入名推断、一步前向（torch in / torch out）。
-
-latent_forcing 在加载后改写 fx 图（weights/spa_pt2.py），ξ 走 GraphModule 的
-``spw_xi`` 属性（export 图签名固定，塞不进新输入）。
-"""
+"""torch.export (.pt2) backend: loading, dtype/input-name inference, single-step forward (torch in / torch out)."""
 import logging
 import os
 
@@ -15,9 +11,8 @@ log = logging.getLogger(__name__)
 
 
 class Pt2InferModel(BaseInferModel):
-    """torch.export (.pt2) 后端。"""
+    """torch.export (.pt2) backend."""
     backend = "pt2"
-    supports_latent_forcing = True       # 走 fx 图改写，不支持权重扰动
 
     def __init__(self, device_id=0, gpu_mem_fraction=0.7):
         super().__init__(device_id, gpu_mem_fraction)
@@ -25,8 +20,6 @@ class Pt2InferModel(BaseInferModel):
         self._input_names = []
         self._dtype = None
         self._device = None
-        # 真正在跑的 module（ep.module() 的返回值），forward 用 copy_ 写它的 spw_xi
-        self._forcing_gm = None
 
     def load(self, path):
         import inspect
@@ -36,34 +29,17 @@ class Pt2InferModel(BaseInferModel):
 
         if not os.path.exists(path):
             raise FileNotFoundError(f"模型文件不存在：{path}")
-        # 重新 load = 新的一批轨迹，丢掉旧的驱动状态（与旧版每次新建等价）
-        self._latent_stream.release()
         self._device = torch.device(
             f"cuda:{self.device_id}" if torch.cuda.is_available() else "cpu")
 
-        forcing = self.latent_forcing
-
-        # 模型 device 已烘焙进导出图，必须在目标卡上加载
+        # The model device is baked into the exported graph, so it must be loaded on the target GPU
         ctx = torch.cuda.device(self._device) if self._device.type == "cuda" else nullcontext()
         with ctx:
             ep = torch.export.load(path)
-            # 必须在 module() 之前改图
-            if forcing is not None:
-                from xmetai_inference.weights.spa_pt2 import attach_forcing
-
-                report = attach_forcing(ep, forcing, src_path=path)
-                self._latent_n_targets = int(report.get("n_targets", 0))
-                log.info("潜空间 AR(1) 强迫已启用（pt2）：%s member=%d -> %s",
-                         forcing.describe(), getattr(self, "member_index", 0),
-                         report.get("fingerprint", "-"))
             self._module = ep.module()
-            # ⚠ 必须用 copy_ 就地改写 spw_xi：ep.module() 新建的 GraphModule 与
-            # graph_module 共享同一批张量对象，setattr 换新张量只改到其中一个，
-            # 前向读到的仍是全 0，静默退化成确定性预报。
-            self._forcing_gm = self._module if self._latent_n_targets > 0 else None
             del ep
 
-        # torch.export 把参数名变成 args_0/args_1，按规范顺序回填
+        # torch.export renames parameters to args_0/args_1; restore the canonical order
         sig_names = list(inspect.signature(self._module.forward).parameters.keys())
         if sig_names and sig_names[0].startswith("args_"):
             self._input_names = ["input", "step", "hour", "doy"][:len(sig_names)]
@@ -91,7 +67,7 @@ class Pt2InferModel(BaseInferModel):
             state = torch.as_tensor(x)
         state = state.to(device=self._device, dtype=self._dtype)
 
-        # 分钟精度归一化（与官方 prepare_features 的 tod 一致）
+        # Minute-precision normalization (matches the official prepare_features tod)
         times = [valid_time] if np.ndim(valid_time) == 0 else list(valid_time)
         tod = [(value.hour * 60 + value.minute) / 1440.0 for value in times]
         feats = {
@@ -108,37 +84,15 @@ class Pt2InferModel(BaseInferModel):
             if name in self._input_names:
                 args.append(feats[name])
 
-        xi = self._latent_row(step)
-        if xi is not None:
-            if self._forcing_gm is None:
-                # 注入成功却丢了 gm 引用：喂不上 ξ 会静默退化，直接拦下
-                raise RuntimeError(
-                    "latent_forcing 已注入但 GraphModule 引用丢失（spw_xi 喂不上）。")
-            if int(state.shape[0]) != 1:
-                # spw_xi 是 [T,R] 缓冲、没有 batch 轴，塞不进 k 条轨迹的 ξ；
-                # 硬跑会让块内成员共用同一行、集合静默欠散。
-                raise ValueError(
-                    "pt2 后端的潜空间强迫（latent_forcing）不支持 model_batch>1："
-                    "ξ 走 spw_xi 缓冲（[T, R]，无 batch 轴），一次 forward 只能喂一条轨迹。"
-                    "请把 config 的 model_batch 设为 1（onnx 后端不受此限）。")
-            # 就地 copy_（不能 setattr，理由见 load）
-            self._forcing_gm.spw_xi.copy_(
-                torch.from_numpy(np.ascontiguousarray(xi[0])).to(
-                    device=self._device, dtype=self._dtype))
-
         with torch.no_grad():
             result = self._module(*args)
 
-        return result.float()    # 保持 device 上的 torch tensor，落盘时才 D2H
+        return result.float()    # Keep the torch tensor on device; only move D2H when writing output
 
     def release(self):
-        """丢掉 module 与潜空间驱动状态（换模型/进程收尾时调）。"""
+        """Drop the module (called when switching models or shutting down)."""
         self._module = None
-        self._forcing_gm = None
         super().release()
 
     def describe(self):
-        text = f"pt2 (dtype={self._dtype}, inputs={self._input_names})"
-        if self._latent_n_targets > 0:
-            text += f" + latent-ar1({self._latent_n_targets} targets)"
-        return text
+        return f"pt2 (dtype={self._dtype}, inputs={self._input_names})"

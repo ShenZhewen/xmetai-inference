@@ -7,21 +7,42 @@ import pandas as pd
 import torch
 
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    GRID_025, PANGU_CHANNELS, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import GRID_025, _expand_channels
+
+# Pangu upper-air levels/vars (ascending, 1000 first) and surface channels (msl, u10m,
+# v10m, t2m; no tp) + the channel list they build. Self-contained, not shared with FengQing.
+PANGU_LEVELS = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+PANGU_PL_VARS = ["z", "q", "t", "u", "v"]
+PANGU_SFC_VARS = ["msl", "u10m", "v10m", "t2m"]
+PANGU_CHANNELS = _expand_channels(
+    PANGU_PL_VARS, PANGU_LEVELS, PANGU_SFC_VARS)
+
+# Placeholder paths; replace before deployment.
+PANGU_ROOT = "/path/to/models/Pangu-Weather-main"
+ERA5_ROOT = "/path/to/data/era5_foundation_store2"
+PANGU_ONNX_6 = f"{PANGU_ROOT}/pangu_weather_6.onnx"
+OUTPUT_DIR = "/path/to/output/pangu_output"
+
+PANGU_STORES = [
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+]
+
 
 _N_UPPER = 5 * 13
 _N_SFC = 4
 
 
 class PanguOnnxModel(OnnxInferModel):
-    """Pangu-Weather ONNX 模型（6h 步进 + 每 24h 从锚点用 24h 图跳步）。
+    """Pangu-Weather ONNX model (6h stepping + a 24h jump from the anchor every 24h).
 
-    双输入 input (5,13,721,1440) / input_surface (4,721,1440)，双输出同形；物理量
-    进/出，单位 = ERA5 原生（z=m²/s²、q=kg/kg、msl=Pa），网格 = GRID_025。
+    Dual inputs input (5,13,721,1440) / input_surface (4,721,1440), dual outputs of the same shapes;
+    physical quantities in and out, units = native ERA5 (z=m²/s², q=kg/kg, msl=Pa), grid = GRID_025.
 
-    valid_time_step_offset 必须为 0（默认值，不要覆盖）：forward 用 valid_time 反推
-    init_time 作锚点键，非 0 会键错位。其余契约走 BaseInferModel 默认值。
+    valid_time_step_offset must be 0 (the default; do not override): forward derives
+    init_time from valid_time as the anchor key, and a non-zero value misaligns the key.
+    All other contract entries use BaseInferModel defaults.
     """
     model_name = "pangu_onnx"
     input_channels = PANGU_CHANNELS
@@ -40,19 +61,23 @@ class PanguOnnxModel(OnnxInferModel):
         return self
 
     def reset_runtime_state(self):
-        """每批轨迹开始前清空 24h 锚点（Rollout.run 调用），防跨批残留、限内存。"""
+        """Clear the 24h anchors before each trajectory batch (called by Rollout.run) to
+        prevent cross-batch residue and bound memory.
+        """
         self._anchors.clear()
 
     @staticmethod
     def _split(flat):
-        """(69, H, W) → upper(5, 13, H, W) + surface(4, H, W)，按 PANGU_CHANNELS 的 var-major 序。"""
+        """(69, H, W) → upper(5, 13, H, W) + surface(4, H, W), in PANGU_CHANNELS var-major order."""
         h, w = flat.shape[-2], flat.shape[-1]
         upper = np.ascontiguousarray(flat[:_N_UPPER].reshape(5, 13, h, w))
         surface = np.ascontiguousarray(flat[_N_UPPER:_N_UPPER + _N_SFC])
         return upper, surface
 
     def _run(self, session, upper, surface):
-        """跑一次 Pangu 前向，返回 (out_upper, out_surface)；抽出来为 6h/24h 共用。"""
+        """Run one Pangu forward pass and return (out_upper, out_surface); extracted for
+        shared use by the 6h/24h graphs.
+        """
         outputs = session.run(None, {"input": upper, "input_surface": surface})
         if len(outputs) != 2:
             raise ValueError(
@@ -64,10 +89,10 @@ class PanguOnnxModel(OnnxInferModel):
         return out_upper, out_surface
 
     def forward(self, x, step, valid_time):
-        """一步前向：物理量进/出，只出预报那一帧。
+        """Single forward step: physical quantities in and out; returns only the forecast frame.
 
-        x: (1, 1, 69, H, W) float32；step 0-based；valid_time = init + step*6h；
-        返回 (1, 1, 69, H, W)。
+        x: (1, 1, 69, H, W) float32; step is 0-based; valid_time = init + step*6h;
+        returns (1, 1, 69, H, W).
         """
         state = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
         flat = state.detach().cpu().numpy().astype(np.float32)[0, 0]
@@ -92,17 +117,9 @@ class PanguOnnxModel(OnnxInferModel):
             pred[None, None], dtype=state.dtype, device=state.device)
 
 
-PANGU_ROOT = "/workspace/szwCode/xmetai-inference2/model_artifacts/Pangu-Weather-main"
-ERA5_ROOT = "/workspace/data/liujunjie/era5_foundation_store2"
-
-PANGU_STORES = [
-    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
-    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
-]
-
 cfg = InferConfig(
     name="weather_era_0p25_pangu",
-    model_path=f"{PANGU_ROOT}/pangu_weather_6.onnx",
+    model_path=PANGU_ONNX_6,
     model_class="pangu_onnx",
 
     dataset={
@@ -129,5 +146,5 @@ cfg = InferConfig(
     vars="z500,q700,t700,t850,u850,v850,u10m,v10m,t2m,msl",
     gpus=1,
     cuda_devices="0",
-    output_dir="/workspace/data/shenzw/pangu_output",
+    output_dir=OUTPUT_DIR,
 )

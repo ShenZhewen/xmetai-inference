@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""data/ 与 utils/dataloader_factory.py 的单元测试。
+"""Unit tests for data/ and utils/dataloader_factory.py.
 
-整包 import 依赖 xmetai_core（MultiZarrDataset），本地没装则整模块 skip，
-服务器 Job 里真跑。不测真 zarr 读取，只测纯函数与配置校验。
+Importing the package depends on xmetai_core (MultiZarrDataset); if it is not
+installed locally the whole module is skipped and the tests run in the server Job.
+Real Zarr reads are not tested here, only pure functions and config validation.
 """
 import pandas as pd
 import pytest
@@ -31,7 +32,7 @@ def test_raw_channel_name_missing_raises():
 
 
 class _FakeCore:
-    """select_init_positions 只读 inds / id_to_time 两项。"""
+    """``select_init_positions`` reads only ``inds`` and ``id_to_time``."""
 
     inds = [0, 5, 10]
     id_to_time = {

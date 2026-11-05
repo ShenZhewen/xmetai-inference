@@ -2,8 +2,26 @@
 import os
 
 from xmetai_inference.backends.onnx import OnnxInferModel
-from xmetai_inference.configs.base import (
-    FUXI_ENS_CHANNELS, GRID_025, InferConfig, ModelProcessingConfig)
+from xmetai_inference.configs.base import InferConfig, ModelProcessingConfig
+from xmetai_inference.utils.config_util import FUXI_ENS_CHANNELS, GRID_025
+
+
+# Placeholder paths; replace before deployment.
+ERA5_ROOT = os.environ.get(
+    "ERA5_STORE_ROOT",
+    "/path/to/data/era5_foundation_store2",
+)
+FUXI_ENS_ONNX = os.environ.get(
+    "FUXI_ENS_ONNX",
+    "/path/to/models/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
+)
+OUTPUT_DIR = "/path/to/output/fuxi_ens_output_new"
+
+FUXI_ENS_DYNAMIC_STORES = [
+    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
+    f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
+]
 
 
 FuxiEnsOnnxModel = OnnxInferModel.declare(
@@ -17,23 +35,9 @@ FuxiEnsOnnxModel = OnnxInferModel.declare(
 )
 
 
-ERA5_ROOT = os.environ.get(
-    "ERA5_STORE_ROOT",
-    "/workspace/data/liujunjie/era5_foundation_store2",
-)
-
-FUXI_ENS_DYNAMIC_STORES = [
-    f"{ERA5_ROOT}/era5_pl_2025.01-2026.07.c84.p25.h6.zarr",
-    f"{ERA5_ROOT}/era5_sfc_2025.01-2026.07.c15.p25.h6.zarr",
-    f"{ERA5_ROOT}/era5_cldrad_2025.01-2026.07.c8.p25.h6.zarr",
-]
-
 cfg = InferConfig(
     name="weather_era_0p25_fuxi_ens",
-    model_path=os.environ.get(
-        "FUXI_ENS_ONNX",
-        "/workspace/szwCode/xmetai-inference/model_artifacts/fuxiens/fuxi_ens_onnx/fuxi_ens.onnx",
-    ),
+    model_path=FUXI_ENS_ONNX,
     gpu_state=os.environ.get("XMETAI_GPU_STATE", "1") == "1",
     model_class="fuxi_ens_onnx",
 
@@ -71,5 +75,5 @@ cfg = InferConfig(
     vars="z500,u200,v200,msl,tp",
     gpus=2,
     cuda_devices="0,1",
-    output_dir="/workspace/data/shenzw/fuxi_ens_output_new",
+    output_dir=OUTPUT_DIR,
 )

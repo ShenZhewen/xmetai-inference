@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""``configs/weather_era_0p25_fuxi21.py`` 的单元测试：配置与 FuXi-2.1 契约之间的一致性（变更探测器，
-思路同 ``test_fgvp_config.py``）。fuxi21 与 fgvp 族最大的不同：归一化**不在图里**，
-由 config 侧的 normalize/denormalize 显式做，配置面因此危险 —— 最要紧的不变量：
-``log1p`` ↔ ``expm1`` 配对（错一边数值静默全错）、recurrent 清零覆盖全部 5 个
-诊断通道、进出归一化用同一对 mean/std 文件。值对不对由 ``test_fuxi_realdata.py``
-对拍兜底。
+"""Unit tests for ``configs/weather_era_0p25_fuxi21.py``: consistency between the
+configuration and the FuXi-2.1 contract (a change detector, following
+``test_tongyun_config.py``). The biggest difference from the Tongyun family: normalization
+is **not** in the graph and is performed explicitly by config-side
+normalize/denormalize, which makes the configuration fragile. The key invariants:
+the ``log1p`` <-> ``expm1`` pairing (breaking either side makes values silently
+wrong), recurrent zeroing covering all 5 diagnostic channels, and input/output
+normalization using the same pair of mean/std files. Value correctness is covered
+by ``test_fuxi_realdata.py``.
 """
 import re
 from datetime import datetime
@@ -12,7 +15,7 @@ from datetime import datetime
 import pytest
 
 from xmetai_inference.configs import InferConfig, load_config, parse_times
-from xmetai_inference.configs import FUXI21_CHANNELS
+from xmetai_inference.configs.weather_era_0p25_fuxi21 import FUXI21_CHANNELS
 from xmetai_inference.utils.model_factory import get_model_class
 
 _BASE_NAME_RE = re.compile(r"([A-Za-z]+)(\d+)")
@@ -55,14 +58,14 @@ def test_model_class_is_the_pt2_fuxi21(cfg, model_cls):
 
 
 def test_deterministic_single_member(cfg, model_cls):
-    """FuXi-2.1 是确定性模型：图内没有扰动通路，members 必须两侧同为 1。"""
+    """FuXi-2.1 is a deterministic model: the graph has no perturbation path, so members must be 1 on both sides."""
     assert model_cls.forecast_type == "deterministic"
     assert model_cls.members == 1
     assert cfg.members == 1
 
 
 def test_channel_contract_is_85_symmetric(cfg, model_cls):
-    """输入/输出通道都必须是 85 通道布局且对称（torch.export 图进出同构）。"""
+    """Input and output channels must both use the 85-channel layout and be symmetric (the torch.export graph is isomorphic on input and output)."""
     assert model_cls.input_channels == list(FUXI21_CHANNELS)
     assert model_cls.output_channels == list(FUXI21_CHANNELS)
     assert len(FUXI21_CHANNELS) == 85
@@ -75,10 +78,11 @@ def test_hour_interval_and_history_match_model(cfg, model_cls):
 
 
 def test_dataset_processor_pipeline_order(cfg):
-    """顺序必须保持：单位换算 → 几何 → 归一化 → 填缺测。
+    """The order must be preserved: unit conversion -> geometry -> normalize -> fill_missing.
 
-    normalize 依赖单位换算先做（mean/std 是模型单位下的统计量）；填缺测必须在
-    归一化之后（填 0 填的是归一化后的值）。顺序错了不报错，数值全错。
+    normalize depends on unit conversion running first (mean/std are statistics in
+    model units); fill_missing must run after normalization (filling 0 fills
+    normalized values). A wrong order raises nothing and makes all values wrong.
     """
     names = [p["name"] for p in cfg.dataset["processors"]]
     assert names == ["unit_convert", "geometry", "normalize", "fill_missing"], (
@@ -87,8 +91,10 @@ def test_dataset_processor_pipeline_order(cfg):
 
 
 def test_log1p_expm1_pairing(cfg):
-    """``log1p`` ↔ ``expm1`` 配对不变量 —— 输入侧对 tp 做 log1p，输出侧就必须
-    expm1 恢复、还得 nonnegative。任何一侧单改，数值静默全错。"""
+    """``log1p`` <-> ``expm1`` pairing invariant -- tp is log1p-transformed on the input
+    side, so the output side must apply expm1 to restore it and keep it nonnegative.
+    Changing only one side makes values silently wrong.
+    """
     ds_processors = {p["name"]: p for p in cfg.dataset["processors"]}
     assert set(ds_processors["normalize"]["log1p_channels"]) == {"tp"}, (
         "输入侧 log1p 的通道清单变了，输出侧的 expm1 是否同步？"
@@ -103,7 +109,7 @@ def test_log1p_expm1_pairing(cfg):
 
 
 def test_normalize_and_denormalize_share_stats_files(cfg):
-    """进/出归一化必须用同一对 mean.nc/std.nc。"""
+    """Input and output normalization must use the same pair of mean.nc/std.nc files."""
     ds_processors = {p["name"]: p for p in cfg.dataset["processors"]}
     normalize = ds_processors["normalize"]
     _, _, output_specs = cfg.processor_specs()
@@ -114,8 +120,10 @@ def test_normalize_and_denormalize_share_stats_files(cfg):
 
 
 def test_recurrent_zero_channels_covers_diagnostics(cfg, model_cls):
-    """rollout 回填必须清零全部 5 个累积型诊断通道 —— 不清零就是把上一步的
-    累积值喂回下一步，短时效看不出、长时效静默烂掉。"""
+    """Rollout feedback must zero all 5 cumulative diagnostic channels -- otherwise the
+    accumulated value from the previous step is fed into the next, invisible at short
+    lead times but silently degrading at long lead times.
+    """
     input_specs, recurrent_specs, _ = cfg.processor_specs()
     assert list(input_specs) == []
     assert len(recurrent_specs) == 1
@@ -129,7 +137,7 @@ def test_recurrent_zero_channels_covers_diagnostics(cfg, model_cls):
 
 
 def test_unit_convert_scales_are_the_agreed_conventions(cfg, model_cls):
-    """换算系数钉住（与 fgvp 族同一套约定，共用同一个源 store）。"""
+    """Conversion factors are pinned (same conventions as the Tongyun family, sharing the same source stores)."""
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     scales = processors["unit_convert"]["scales"]
 
@@ -144,8 +152,10 @@ def test_unit_convert_scales_are_the_agreed_conventions(cfg, model_cls):
 
 
 def test_fill_missing_is_constant_zero_after_normalization(cfg):
-    """填 0 在归一化后做；未摸全的缺测组合先 keep（fuxi21 的源 store 比 fgvp 多
-    soil/wave，与 fgvp 的 error 选择不同）。"""
+    """Filling with 0 happens after normalization; missing-data combinations not yet
+    surveyed are kept for now (the fuxi21 source stores add soil/wave compared with
+    Tongyun, unlike Tongyun's error choice).
+    """
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     fill = processors["fill_missing"]
     assert set(fill["rules"]) == {"*"}
@@ -163,7 +173,7 @@ def test_declared_vars_are_real_model_output_channels(cfg, model_cls):
 
 
 def test_dynamic_stores_are_the_expected_five(cfg):
-    """fuxi21 用 5 个动态 store（比 fgvp 族多 soil / wave）—— 85 通道的来源。"""
+    """fuxi21 uses 5 dynamic stores (soil and wave in addition to the Tongyun family) -- the source of the 85 channels."""
     paths = cfg.dataset["paths"]
     assert cfg.dataset["type"] == "processed_multi_zarr"
     assert len(paths) == 5
