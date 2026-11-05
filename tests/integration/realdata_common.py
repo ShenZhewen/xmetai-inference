@@ -16,8 +16,8 @@ import xarray as xr
 #: Fixture data root for the realdata suites (placeholder; replace before running integration tests).
 DATA_ROOT = "/path/to/data/inference_test_data"
 
-FGVP_FIXTURE_ROOT = Path(DATA_ROOT) / "fgvp_test_data"
-FGVP_ENS_FIXTURE_ROOT = Path(DATA_ROOT) / "fgvp_ens_test_data"
+#: Fixture directory for the Tongyun deterministic suite.
+TONGYUN_FIXTURE_ROOT = Path(DATA_ROOT) / "tongyun_test_data"
 FUXI_FIXTURE_ROOT = Path(DATA_ROOT) / "fuxi_test_data"
 
 
@@ -31,8 +31,8 @@ def data_root_hint(root) -> str:
         return (
             f"数据根仍是占位地址：{root}\n"
             "请先打开 tests/integration/realdata_common.py，把顶部的 DATA_ROOT 改成"
-            "真实的 fixture 目录（其下应有 fgvp_test_data / fgvp_ens_test_data / "
-            "fuxi_test_data），再跑 pytest -m realdata。"
+            "真实的 fixture 目录（其下应有 tongyun_test_data / fuxi_test_data），"
+            "再跑 pytest -m realdata。"
         )
     if not root.is_dir():
         return (

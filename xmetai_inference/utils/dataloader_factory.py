@@ -9,8 +9,8 @@ from collections.abc import Mapping
 from torch.utils.data import DataLoader
 
 from ..data.weather import (
+    create_netcdf_data,
     create_processed_multi_zarr_dataset,
-    create_example_nc_dataset,
 )
 
 
@@ -38,9 +38,10 @@ def create_dataloader(
             hour_interval=hour_interval,
             model_path=model_path,
         )
-    elif name == "example_nc":
-        # init_times is derived from the nc files themselves; the CLI passes [].
-        dataset = create_example_nc_dataset(
+    elif name == "netcdf_data":
+        # Init times are derived from the nc files themselves; the CLI passes the run's
+        # init times, which only narrows the sample list per rank.
+        dataset = create_netcdf_data(
             spec,
             model_cls=model_cls,
             init_times=init_times,
@@ -50,7 +51,7 @@ def create_dataloader(
         )
     else:
         raise ValueError(
-            f"未知 Dataset {name!r}（当前仅支持 processed_multi_zarr / example_nc）"
+            f"未知 Dataset {name!r}（当前仅支持 processed_multi_zarr / netcdf_data）"
         )
 
     options = {

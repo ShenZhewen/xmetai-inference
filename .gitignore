@@ -41,7 +41,7 @@ dist/
 .vscode/
 
 # k8s Jobs for local integration tests (hard-coded in-cluster pvc/hostPath and namespace)
-tests/fgvp_realdata_job.yaml
+tests/tongyun_realdata_job.yaml
 tests/final_test_job.yaml
 
 # Local temporary scripts: job yaml / probes / reproductions (hard-coded local or in-cluster temporary paths)

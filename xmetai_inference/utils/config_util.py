@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 import numpy as np
 
 
-# Shared 0.25 degree global regular grid for FuXi-Ens, FuXi-2.1, and FGVP.
+# Shared 0.25 degree global regular grid for FuXi-Ens, FuXi-2.1, and Tongyun.
 GRID_025 = {
     "lat": {"start": 90.0, "step": -0.25, "size": 721},
     "lon": {"start": 0.0, "step": 0.25, "size": 1440},
@@ -36,7 +36,7 @@ GRID_025_S = {
 LEVELS = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
 PL_VARS = ["z", "t", "u", "v", "q"]
 
-# FuXi-Ens surface channels (shared by FuXi-Ens and the FGVP family inputs).
+# FuXi-Ens surface channels (shared by FuXi-Ens and the Tongyun inputs).
 FUXI_ENS_SFC_VARS = [
     "t2m", "d2m", "sst", "u10m", "v10m", "u100m", "v100m",
     "msl", "ssr", "ssrd", "fdir", "ttr", "tp",

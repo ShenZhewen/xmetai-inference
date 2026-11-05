@@ -39,7 +39,7 @@ STEPS = 3
 MEMBERS = 1
 GPUS = 1
 
-# On a single GPU, the device is chosen by the outer CUDA_VISIBLE_DEVICES (see the note at the top of the fgvp suite).
+# On a single GPU, the device is chosen by the outer CUDA_VISIBLE_DEVICES (see the note at the top of the Tongyun suite).
 
 #: GPU nondeterminism affects only upper-air channels; these variables are relaxed to DRIFT at step 1, the rest stay at CLOSE.
 UPPER_AIR_VARS = {"z500", "q700", "t700", "t850", "u850", "v850"}
@@ -62,7 +62,7 @@ GOLDEN_ROOT = DATA_ROOT / "golden"
 #: Hourly initialization -> the CLI writes the directory name as ``%Y%m%d`` (8 digits).
 INIT_DIR = "20250102"
 
-#: Number of sliced stores (fuxi21 uses 5 dynamic stores, adding soil / wave over fgvp).
+#: Number of sliced stores (fuxi21 uses 5 dynamic stores, adding soil / wave over Tongyun).
 _N_STORES = 5
 
 _hint = data_root_hint(DATA_ROOT)
@@ -92,7 +92,7 @@ if _missing:
     )
 
 
-# string.Template is used for the same reason as in the fgvp suite.
+# string.Template is used for the same reason as in the Tongyun suite.
 _CONFIG_TEMPLATE = Template('''\
 # -*- coding: utf-8 -*-
 """fuxi21 realdata inference recipe; generated at runtime by test_fuxi_realdata.py. Do not edit."""
@@ -159,7 +159,7 @@ def run(tmp_path_factory):
     out_dir = tmp_path_factory.mktemp("fuxi_realdata")
     print(f"\n[fixture] 本次用的配方：{config_path}")
 
-    # Catch SystemExit separately, for the same reason as the fgvp suite.
+    # Catch SystemExit separately, for the same reason as the Tongyun suite.
     try:
         rc = main(["--config", str(config_path), "--out", str(out_dir)])
     except SystemExit as exc:
@@ -216,7 +216,7 @@ def test_fuxi_matches_golden(run):
 
 
 def test_fuxi_coverage(run):
-    """Coverage guard: silently comparing fewer files passes more easily (same as the fgvp suite)."""
+    """Coverage guard: silently comparing fewer files passes more easily (same as the Tongyun suite)."""
     _, rows, skipped, config_path = run
 
     assert {r["step"] for r in rows} == set(range(1, STEPS + 1)), (

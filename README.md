@@ -15,7 +15,7 @@ declares, runs the rollout, and writes the forecast as NetCDF.
   - [Requirements](#requirements)
   - [Install](#install)
   - [Run](#run)
-  - [Single-Input `.nc` Example](#single-input-nc-example)
+  - [Examples](#examples)
   - [Override Parameters](#override-parameters)
 - [Supported Models](#supported-models)
   - [Channel Sets and Order](#channel-sets-and-order)
@@ -57,6 +57,14 @@ pip install -e ".[netcdf,zarr]"        # NetCDF I/O only: FuXi-2.1 / evaluation
 > instead (the `onnx` extra and `onnxruntime-gpu` conflict; use one or the other). The loader
 > logs a warning when it has to fall back to the CPU provider.
 
+> **XMetAI ONNX Runtime plugin (custom operators).** Recipes that set `ops_library` (the
+> Tongyun recipes and fengshun2.0) load custom operators through the XMetAI ONNX Runtime
+> plugin. Download the build matching your ONNX Runtime / CUDA version from
+> https://github.com/XMetAI-Lab/xmetai-onnx-plugins/releases/ and point the recipe's
+> `ops_library` at the downloaded `.so` (for example
+> `xmetai_onnx_plugins.ort1_24.cuda12.so`). Without the plugin the graph fails to load with
+> an unknown-operator error.
+
 ### Run
 
 Every supported model has a ready-made recipe (`configs/<name>.py`):
@@ -64,13 +72,14 @@ Every supported model has a ready-made recipe (`configs/<name>.py`):
 ```bash
 xmetai-infer --config weather_era_0p25_fuxi_ens
 xmetai-infer --config weather_era_0p25_fuxi21
-xmetai-infer --config weather_era_0p25_fgvp
-xmetai-infer --config weather_era_0p25_fgvp_ens
+xmetai-infer --config weather_era_0p25_tongyun
 xmetai-infer --config weather_era_0p25_fengqing
 xmetai-infer --config weather_era_0p25_pangu
+xmetai-infer --config weather_era_0p25_tongyun_ens
 xmetai-infer --config weather_cra_0p25_tongyun_ens
 xmetai-infer --config s2s_cra_0p25_fengshun20_ens
-xmetai-infer --config weather_example_tongyun   # demo: single-input .nc (FGVP deterministic)
+xmetai-infer --config weather_nc_fuxiens         # example: official FuXi-ENS input.nc
+xmetai-infer --config weather_nc_fuxi21          # example: official FuXi-2.1 input.nc
 ```
 
 Each recipe declares the weight path, dataset and preprocessing chain, initialization times, step
@@ -87,34 +96,58 @@ Output goes to `{out}/{YYYYMMDD|YYYYMMDDHH}/[member_XXX/]{step:03d}.nc`, one Net
 `xmetai-infer --worker ...` is the internal worker subprocess entry point used for every run
 (single- or multi-GPU) and should not be called manually.
 
-### Single-Input `.nc` Example
+### Examples
 
-`weather_example_tongyun` is a self-contained demo recipe that infers straight from **one
-business-supplied `.nc`** — no Zarr store. The graph is the FGVP deterministic model
-(`tongyun_det.onnx` == `iwc_fgvp_gdn2_onnx`): **78 channels** (FGVP/ERA5 order), `GRID_025`
-north→south, single member, 2-frame history, physical units in/out (normalization baked into the
-graph).
+Two self-contained example recipes infer straight from **one given `.nc`** (`dataset.type="netcdf_data"`)
+— no Zarr store. Both sample files ship with the corresponding official upstream release; this
+repository does not host them:
 
-1. Download the sample input (a 78-channel `input.nc`, already `model_ready`):
-   https://drive.google.com/file/d/1h8jBXPEtQLfayUe8f_UpNCHWwIKDGHeD/view?usp=drive_link
-2. Point the three placeholders in `configs/weather_example_tongyun.py` at your model, custom-op
-   library, and the downloaded `.nc`:
-   ```python
-   SRC_GRAPH        = "<tongyun_det.onnx>"
-   OPS_LIBRARY      = "<xmetai_onnx_plugins.ort1_24.cuda12.so>"
-   TONGYUN_NC_INPUT = "<path>/input.nc"
-   ```
-3. Run — one command:
-   ```bash
-   python -m xmetai_inference --config weather_example_tongyun --out <output_dir>
-   ```
-   Output lands at `{out}/{YYYYMMDD}/{step:03d}.nc` (60 steps, 6 h apart; single member, so no
-   `member_XXX` layer).
+| Recipe | Model (registry) | Files | members × steps |
+|---|---|---|---|
+| `weather_nc_fuxiens` | FuXi-ENS (`fuxi_ens_onnx`) | official `data/input.nc` + `model/fuxi_ens.onnx` (and its external weights `model/fuxi_ens`) | 2 × 2 |
+| `weather_nc_fuxi21` | FuXi-2.1 (`fuxi21_pt2`) | official `input.nc` + `fuxi-2.1.pt2` + `mean.nc`/`std.nc` | 1 × 2 |
 
-The input only works if it is exactly the graph's input: physical quantities in
-`FUXI_ENS_CHANNELS` order, `GRID_025` orientation, `float32`, `(time=history, channel=78, 721,
-1440)`, and `sst` cold-spots filled. `tools/make_tongyun_sample_nc.py` regenerates such a file
-from any normalized store (denormalize in, `geometry`/`fill_missing` preserved).
+Where the sample `.nc` files come from:
+
+- **FuXi-ENS** — `data/input.nc` (2 × 78 × 721 × 1440, initialization 2018-09-14 00Z) ships in
+  `FuXi-ENS-main.zip` from the official model record
+  [Zenodo 15124541](https://zenodo.org/records/15124541) (the release accompanying the Science
+  Advances paper, DOI [10.1126/sciadv.adu2854](https://doi.org/10.1126/sciadv.adu2854)), together
+  with `model/fuxi_ens.onnx` and its external weight file `model/fuxi_ens`. The bundled README
+  additionally points to a restricted Google Drive folder (contact Prof. Li Hao,
+  lihao_lh@fudan.edu.cn).
+- **FuXi-2.1** — `input.nc` (2 × 85 × 721 × 1440, initialization 2024-09-29 00Z, already z-score
+  normalized) ships in the Hugging Face repository
+  [tpys/fuxi-2.1](https://huggingface.co/tpys/fuxi-2.1) together with `fuxi-2.1.pt2`, `mean.nc`
+  and `std.nc`; the model is part of the
+  [FuXi Single collection](https://huggingface.co/collections/tpys/fuxi-single).
+
+Neither recipe preprocesses the nc in the dataset layer. FuXi-ENS normalizes inside the ONNX graph
+(physical in, physical out); FuXi-2.1's `input.nc` is already z-score normalized and its output is
+denormalized with the `mean.nc`/`std.nc` next to the `.pt2`. The nc alone supplies the history
+window; the init time is its last `time` frame, so `cfg.times` is empty. The FuXi-ENS example runs
+2 members × 2 steps as a smoke test — use `--members 51 --steps 60` (or edit the recipe) for a full
+run; the graph samples noise internally.
+
+Point `SAMPLE_ROOT` in each recipe at the directory holding the upstream release files:
+
+- FuXi-ENS — `input.nc`, `fuxi_ens_onnx/fuxi_ens.onnx`, and the external weight file `fuxi_ens`
+  it references (≈9.3 GiB, extensionless, must sit next to the .onnx).
+- FuXi-2.1 — `input.nc`, `mean.nc`, `std.nc`, and `fuxi-2.1.pt2` (3.7 GiB).
+
+Then one command each:
+
+```bash
+python -m xmetai_inference --config weather_nc_fuxiens --out <output_dir>
+python -m xmetai_inference --config weather_nc_fuxi21  --out <output_dir>
+```
+
+Output lands at `{out}/{YYYYMMDD|YYYYMMDDHH}/[member_XXX/]{step:03d}.nc` (no `member_XXX` layer
+when `members=1`).
+
+An input nc only works if it matches the graph: physical quantities (or normalized values for
+FuXi-2.1) in `input_channels` order, the model's grid orientation, `float32`, `(time=history,
+channel=N, 721, 1440)`, and `sst` cold-spots filled where the graph expects it.
 
 ### Override Parameters
 
@@ -139,10 +172,10 @@ xmetai-infer --config weather_era_0p25_fuxi_ens \
 |------|------|------|------|------|------|------|------|--------|
 | FuXi-Ens | `weather_era_0p25_fuxi_ens` | `onnx` | Ensemble | 51 | 78 | `GRID_025` | 6h / 2 frames | Baked into graph; physical units in/out |
 | FuXi-2.1 | `weather_era_0p25_fuxi21` | `pt2` | Deterministic | 1 | 85 | `GRID_025` | 6h / 2 frames | Data-side `normalize`, output `denormalize` (mean.nc/std.nc next to the weights) |
-| IWC FGVP GDN2 | `weather_era_0p25_fgvp` | `onnx` | Deterministic | 1 | 78 | `GRID_025` | 6h / 2 frames | Baked into graph; custom ops (`GatedDeltaNet2Fn`) require `ops_library` |
-| IWC FGVP Mamba-Ens | `weather_era_0p25_fgvp_ens` | `onnx` | Ensemble | 51 | 78 | `GRID_025` | 6h / 2 frames | Baked into graph; the `.onnx.data` external-weights file must sit next to the graph |
+| Tongyun (det) | `weather_era_0p25_tongyun` | `onnx` | Deterministic | 1 | 78 | `GRID_025` | 6h / 2 frames | Baked into graph; custom ops (`GatedDeltaNet2Fn`) require `ops_library` |
 | FengQing V1.5Beta | `weather_era_0p25_fengqing` | `onnx` | Deterministic | 1 | 70 | `GRID_025` | 6h / 2 frames | `normalize_fengqing` / `denormalize_fengqing` (per-pixel stats; graph emits a residual) |
 | Pangu-Weather | `weather_era_0p25_pangu` | `onnx` | Deterministic | 1 | 69 | `GRID_025` | 6h / 1 frame (+24h jump) | Baked into graph; physical units in/out |
+| Tongyun-Ens | `weather_era_0p25_tongyun_ens` | `onnx` | Ensemble | 51 | 78 | `GRID_025` | 6h / 2 frames | Baked into graph; physical units in/out; custom ops require `ops_library` |
 | Tongyun-Ens (CRA) | `weather_cra_0p25_tongyun_ens` | `onnx` | Ensemble | 51 | 71 | `GRID_025_S` | 6h / 2 frames | Store-normalized → data-side `denormalize`; graph normalizes at its head, outputs physical units |
 | fengshun2.0 | `s2s_cra_0p25_fengshun20_ens` | `onnx` | Ensemble | 51 | 87 | `GRID_025` | 24h / 2 frames | Store-normalized → data-side `denormalize` (tp via `expm1`); graph normalizes at its head |
 
@@ -195,17 +228,19 @@ aligns store stats by underscore-insensitive, lower-cased name and tolerates a s
 > `domain` = `weather` (15-day, 6-hourly) or `s2s` (subseasonal, daily steps); `source` = `era`
 > (ERA5) or `cra` (CRA-40); `resolution` = `0p25` (0.25°) or `1p5`. The trailing `_ens` marks an
 > ensemble output when the model name doesn't already contain `ens`; deterministic configs carry
-> no suffix. Examples: `weather_era_0p25_fuxi_ens`, `weather_cra_0p25_tongyun_ens`,
-> `s2s_cra_0p25_fengshun20_ens`. Each maps to the eponymous recipe under `configs/`.
+> no suffix. Examples: `weather_era_0p25_fuxi_ens`, `weather_era_0p25_tongyun_ens`,
+> `weather_cra_0p25_tongyun_ens`, `s2s_cra_0p25_fengshun20_ens`. Each maps to the eponymous
+> recipe under `configs/`.
 > **Model-class registry names** (the `model_class=` in recipes, e.g. `fuxi_ens_onnx`,
-> `fuxi21_pt2`, `iwc_fgvp_gdn2_onnx`, `iwc_fgvp_mamba_ens_onnx`, `fengqing_pre_onnx`,
-> `pangu_onnx`, `tongyun_cra_ens_onnx`, `fengshun20_onnx`) map to `MODEL_REGISTRY` in
+> `fuxi21_pt2`, `iwc_tongyun_gdn2_onnx` (the Tongyun det graph), `fengqing_pre_onnx`,
+> `pangu_onnx`, `tongyun_era_ens_onnx`, `tongyun_cra_ens_onnx`, `fengshun20_onnx`) map to `MODEL_REGISTRY` in
 > `utils/model_factory.py`.
 
 ## Supported Datasets
 
-All datasources are ingested via `processed_multi_zarr`, backed by `xmetai-core`'s
-`MultiZarrDataset`.
+Two dataset types: `processed_multi_zarr` (the production path, backed by `xmetai-core`'s
+`MultiZarrDataset`) and `netcdf_data` (one given `.nc` per initialization, for demos and
+business-supplied inputs).
 
 ### Dataset Spec
 
@@ -227,28 +262,23 @@ dataset = {
 - History frames are read backwards from each init time; a requested init time without enough
   history raises.
 
-**`example_nc`** — infer straight from one business-supplied `.nc` file instead of a Zarr store:
+**`netcdf_data`** — infer straight from given `.nc` files, one file per initialization:
 
 ```python
 dataset = {
-    "type": "example_nc",
+    "type": "netcdf_data",
     "paths": ["/abs/input.nc"],
-    "mode": "model_ready",   # default; or "native"
-    # "processors": [...],   # native mode only; model_ready must not set it
 }
 ```
 
-Each file is one initialization; all history frames live inside the nc itself (the engine never
-reads back into a store). The init time is the last `time` frame's value, so `cfg.times` is not
-consulted for this type. Two modes:
-
-- `model_ready` (default): the nc already holds exactly the model input — physical quantities in
-  `input_channels` order, in the model's native grid orientation. No processor chain runs; only
-  the channel axis is verified/rewritten.
-- `native`: the nc holds raw fields in its own channel order; the model's `dataset.processors`
-  chain runs as in `processed_multi_zarr`, then the channel axis is reordered to `input_channels`.
-
-Samples are built eagerly once at dataset build time, so this type is single-process-only.
+Each file holds the full model input window `[time, channel, lat, lon]`; all history frames live
+inside the nc itself (the engine never reads back into a store). The init time is the last `time`
+frame's value, so `cfg.times` is not consulted for this type. Values pass through **untouched** —
+no processor chain runs: this type serves graphs that normalize inside (FuXi-ENS, Tongyun det) and
+pre-normalized inputs (FuXi-2.1). Only the channel axis is verified and rewritten to
+`input_channels` by name (underscore-insensitive, case-insensitive); a missing channel or a
+count mismatch fails at build time. Samples are built eagerly once at dataset build time, so this
+type is single-process-only.
 
 ### Store Inventory
 
@@ -258,9 +288,9 @@ The store root names below are relative to the data roots declared at the top of
 
 | Store | Channels | Coverage / step | Layout | Orientation | What it holds | Used by |
 |---|---|---|---|---|---|---|
-| `era5_foundation_store2/era5_pl_...c84.p25.h6.zarr` | 84 | 2025-01 … 2026-07, 6h | **Raw** | north→south | Upper-air pressure-level fields | fuxi_ens, fuxi21, fgvp, fgvp_ens, fengqing, pangu |
+| `era5_foundation_store2/era5_pl_...c84.p25.h6.zarr` | 84 | 2025-01 … 2026-07, 6h | **Raw** | north→south | Upper-air pressure-level fields | fuxi_ens, fuxi21, tongyun, tongyun_ens, fengqing, pangu |
 | `.../era5_sfc_...c15.p25.h6.zarr` | 15 | same | **Raw** | north→south | Surface fields; `tp`/radiation are 1 h accumulations | same as above |
-| `.../era5_cldrad_...c8.p25.h6.zarr` | 8 | same | **Raw** | north→south | Radiation and cloud-cover channels | fuxi_ens, fuxi21, fgvp, fgvp_ens |
+| `.../era5_cldrad_...c8.p25.h6.zarr` | 8 | same | **Raw** | north→south | Radiation and cloud-cover channels | fuxi_ens, fuxi21, tongyun, tongyun_ens |
 | `.../era5_soil_...c4.p25.h6.zarr` | 4 | same | **Raw** | north→south | Soil channels | listed by fuxi21, but no soil channel is in its 85-channel set (selected channels come from pl/sfc/cldrad) |
 | `.../era5_wave_...c5.p25.h6.zarr` | 5 | same | **Raw** | north→south | Wave channels | same as soil: listed by fuxi21, not selected by its channel set |
 | `era5_tp_zarr/era5.202501-202607.c1.p25.h6.v1.lon180.zarr` | 1 | 2025-01 … 2026-07, 6h | **Raw** | global (`lon180` naming) | True 6h-accumulated `tp` (metres) | fengqing (listed first to override the sfc store's 1h tp) |
@@ -308,8 +338,8 @@ How to tell them apart:
 
 | Quantity | store2 (raw) | zarr_refresh_v3 (after `denormalize`) | Model expectation → processor |
 |---|---|---|---|
-| `q` | kg/kg | **g/kg** | FuXi / FGVP / fengshun use g/kg directly; FengQing / Pangu need kg/kg ⇒ `unit_convert {"q": 1e-3}` when switching to v3 |
-| `tp` | 1 h accumulation, metres (the sfc store); the separate tp store is true 6 h accumulation | **log1p(6h mm)** | FuXi / FGVP: 6 h mm ⇒ store2 `×6000`; v3 `expm1_channels=["tp"]`. FengQing overrides with the 6 h tp store and multiplies by 1000 |
+| `q` | kg/kg | **g/kg** | FuXi / Tongyun / fengshun use g/kg directly; FengQing / Pangu need kg/kg ⇒ `unit_convert {"q": 1e-3}` when switching to v3 |
+| `tp` | 1 h accumulation, metres (the sfc store); the separate tp store is true 6 h accumulation | **log1p(6h mm)** | FuXi / Tongyun: 6 h mm ⇒ store2 `×6000`; v3 `expm1_channels=["tp"]`. FengQing overrides with the 6 h tp store and multiplies by 1000 |
 | radiation (`ssr`/`ssrd`/`fdir`/`ttr`) | 1 h accumulation, J/m² | **W/m²** (step mean) | 6 h Wh/m² ⇒ store2 `×6/3600`; v3 `×6` |
 | `z`, `t`, `u`, `v`, `msl`, surface fields | physical | physical | 1:1 |
 | CRA c71 (Tongyun) | — | — | normalized store: no unit conversion; `tp` stays log1p (the graph expects it) |
@@ -321,7 +351,7 @@ How to tell them apart:
 |---|---|---|---|
 | fuxi_ens | `unit_convert` (q×1000, rad×6/3600, tp×6000) → `geometry` | — | — |
 | fuxi21 | `unit_convert` → `geometry` → `normalize` (log1p tp) → `fill_missing` (`{"*": 0.0}`, keep) | `zero_channels` (ssr, ssrd, fdir, ttr, tp) | `denormalize` (expm1 tp, nonnegative tp) |
-| fgvp / fgvp_ens | `unit_convert` (same) → `geometry` → `fill_missing` (sst=287.066, error) | — | — |
+| tongyun / tongyun_ens | `unit_convert` (same) → `geometry` → `fill_missing` (sst=287.066, error) | — | — |
 | fengqing | `unit_convert` (tp×1000) → `geometry` → `normalize_fengqing` | — | `denormalize_fengqing` |
 | pangu | `geometry` | — | — |
 | tongyun_cra | `denormalize` (stats_path=CRA), **no geometry** | — | — |

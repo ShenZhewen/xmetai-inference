@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for ``configs/weather_era_0p25_fuxi21.py``: consistency between the
 configuration and the FuXi-2.1 contract (a change detector, following
-``test_fgvp_config.py``). The biggest difference from the fgvp family: normalization
+``test_tongyun_config.py``). The biggest difference from the Tongyun family: normalization
 is **not** in the graph and is performed explicitly by config-side
 normalize/denormalize, which makes the configuration fragile. The key invariants:
 the ``log1p`` <-> ``expm1`` pairing (breaking either side makes values silently
@@ -137,7 +137,7 @@ def test_recurrent_zero_channels_covers_diagnostics(cfg, model_cls):
 
 
 def test_unit_convert_scales_are_the_agreed_conventions(cfg, model_cls):
-    """Conversion factors are pinned (same conventions as the fgvp family, sharing the same source stores)."""
+    """Conversion factors are pinned (same conventions as the Tongyun family, sharing the same source stores)."""
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     scales = processors["unit_convert"]["scales"]
 
@@ -154,7 +154,7 @@ def test_unit_convert_scales_are_the_agreed_conventions(cfg, model_cls):
 def test_fill_missing_is_constant_zero_after_normalization(cfg):
     """Filling with 0 happens after normalization; missing-data combinations not yet
     surveyed are kept for now (the fuxi21 source stores add soil/wave compared with
-    fgvp, unlike fgvp's error choice).
+    Tongyun, unlike Tongyun's error choice).
     """
     processors = {p["name"]: p for p in cfg.dataset["processors"]}
     fill = processors["fill_missing"]
@@ -173,7 +173,7 @@ def test_declared_vars_are_real_model_output_channels(cfg, model_cls):
 
 
 def test_dynamic_stores_are_the_expected_five(cfg):
-    """fuxi21 uses 5 dynamic stores (soil and wave in addition to the fgvp family) -- the source of the 85 channels."""
+    """fuxi21 uses 5 dynamic stores (soil and wave in addition to the Tongyun family) -- the source of the 85 channels."""
     paths = cfg.dataset["paths"]
     assert cfg.dataset["type"] == "processed_multi_zarr"
     assert len(paths) == 5

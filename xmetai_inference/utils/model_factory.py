@@ -13,13 +13,9 @@ MODEL_REGISTRY = {
         "xmetai_inference.configs.weather_era_0p25_fuxi21",
         "Fuxi21Pt2Model",
     ),
-    "iwc_fgvp_gdn2_onnx": (
-        "xmetai_inference.configs.weather_era_0p25_fgvp",
-        "IwcFgvpGdn2Model",
-    ),
-    "iwc_fgvp_mamba_ens_onnx": (
-        "xmetai_inference.configs.weather_era_0p25_fgvp_ens",
-        "IwcFgvpMambaEnsModel",
+    "iwc_tongyun_gdn2_onnx": (
+        "xmetai_inference.configs.weather_era_0p25_tongyun",
+        "IwcTongyunGdn2Model",
     ),
     "fengqing_pre_onnx": (
         "xmetai_inference.configs.weather_era_0p25_fengqing",
@@ -28,6 +24,10 @@ MODEL_REGISTRY = {
     "pangu_onnx": (
         "xmetai_inference.configs.weather_era_0p25_pangu",
         "PanguOnnxModel",
+    ),
+    "tongyun_era_ens_onnx": (
+        "xmetai_inference.configs.weather_era_0p25_tongyun_ens",
+        "TongyunEraEnsModel",
     ),
     "tongyun_cra_ens_onnx": (
         "xmetai_inference.configs.weather_cra_0p25_tongyun_ens",

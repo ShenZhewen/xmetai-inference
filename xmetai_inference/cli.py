@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Unified inference entry point: config loading, multi-GPU scheduling, autoregressive inference, and NetCDF output.
 
-Usage: xmetai-infer --config weather_era_0p25_fgvp --times 2025010700..2025020500:24
+Usage: xmetai-infer --config weather_era_0p25_tongyun --times 2025010700..2025020500:24
 Outputs ``{out}/{init}/member_{member:03d}/{step:03d}.nc`` (deterministic runs omit the member level).
 Multi-GPU runs split members or init times across subprocesses; writes go through a single background thread (netCDF4/HDF5 are not thread-safe).
 """
@@ -218,17 +218,17 @@ def _run_scope(cfg, overrides):
     model_path = _pick(overrides, "model_path", cfg.model_path)
 
     dataset_type = str((cfg.dataset or {}).get("type", ""))
-    if dataset_type == "example_nc":
-        # Business single-input: init times come from the nc files' time coords, not cfg.times.
-        from xmetai_inference.data.weather import example_nc_init_times
-        inits = example_nc_init_times(cfg.dataset.get("paths", []))
+    if dataset_type == "netcdf_data":
+        # Single-nc samples: init times come from the nc files' time coords, not cfg.times.
+        from xmetai_inference.data.weather import netcdf_data_init_times
+        inits = netcdf_data_init_times(cfg.dataset.get("paths", []))
     else:
         inits = parse_times(_pick(overrides, "times", cfg.times))
     if not inits:
-        raise SystemExit(
-            "配置 {}：推理必须指定 times（如 \"2025010600..2025020500:24\"）"
-            .format(cfg.name) if dataset_type != "example_nc" else
-            f"配置 {cfg.name}：example_nc 的 dataset.paths 没有可用的 nc")
+        reason = ("netcdf_data 的 dataset.paths 没有可用的 nc"
+                  if dataset_type == "netcdf_data" else
+                  "推理必须指定 times（如 \"2025010600..2025020500:24\"）")
+        raise SystemExit(f"配置 {cfg.name}：{reason}")
     steps = _pick(overrides, "steps", cfg.steps)
     if int(steps) < 1:
         raise SystemExit(f"配置 {cfg.name}：steps 必须 >= 1，实际 {steps}")

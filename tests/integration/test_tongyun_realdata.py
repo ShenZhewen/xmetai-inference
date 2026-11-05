@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""fgvp realdata suite: run the real ONNX model on sliced data and compare against golden.
+"""Tongyun realdata suite: run the real ONNX model on sliced data and compare against golden.
 
-The recipe is derived by deepcopying configs/weather_era_0p25_fgvp.py and overrides only
+The recipe is derived by deepcopying configs/weather_era_0p25_tongyun.py and overrides only
 fixture-specific entries; PASS requires the worst verdict to be in {IDENTICAL, CLOSE}. The
 classification criteria are frozen in realdata_common and bit-identical output is not required.
 The provenance of the golden data is unconfirmed: it guards against regressions only and does
 not prove the current results are correct.
 
-Usage: pytest -m realdata tests/integration/test_fgvp_realdata.py
+Usage: pytest -m realdata tests/integration/test_tongyun_realdata.py
 """
 import sys
 from pathlib import Path
@@ -22,12 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from realdata_common import (ATOL, RTOL, VERDICT_RANK, FGVP_FIXTURE_ROOT,
+from realdata_common import (ATOL, RTOL, VERDICT_RANK, TONGYUN_FIXTURE_ROOT,
                              compare_dirs, data_root_hint, expected_vars)
 
 #: Fixture root. Four components: dataset/*.zarr (3 sliced stores), the ONNX under test,
 #: the operator .so, and golden. The absolute path is configured at the top of realdata_common.py.
-DATA_ROOT = FGVP_FIXTURE_ROOT
+DATA_ROOT = TONGYUN_FIXTURE_ROOT
 
 #: Initialization time. The slice covers only this one, and the golden data is for it alone.
 TIMES = "2025010200"
@@ -59,8 +59,8 @@ if not (DATA_ROOT / "dataset").is_dir():
     _missing.append("dataset/")
 elif len(list((DATA_ROOT / "dataset").glob("*.zarr"))) != 3:
     _missing.append("dataset/ 下的 3 个切片 store")
-if not (DATA_ROOT / "iwc_fgvp_gdn2_260901.onnx").is_file():
-    _missing.append("iwc_fgvp_gdn2_260901.onnx")
+if not (DATA_ROOT / "iwc_tongyun_gdn2_260901.onnx").is_file():
+    _missing.append("iwc_tongyun_gdn2_260901.onnx")
 if not list(DATA_ROOT.glob("xmetai_onnx_plugins*.so")):
     _missing.append("xmetai_onnx_plugins*.so")
 if not (GOLDEN_ROOT / INIT_DIR).is_dir():
@@ -78,11 +78,11 @@ if _missing:
 # string.Template rather than f-string/format: the template is full of braces.
 _CONFIG_TEMPLATE = Template('''\
 # -*- coding: utf-8 -*-
-"""fgvp realdata inference recipe; generated at runtime by test_fgvp_realdata.py. Do not edit."""
+"""Tongyun realdata inference recipe; generated at runtime by test_tongyun_realdata.py. Do not edit."""
 import copy
 from pathlib import Path
 
-from xmetai_inference.configs.weather_era_0p25_fgvp import cfg as _production
+from xmetai_inference.configs.weather_era_0p25_tongyun import cfg as _production
 
 # deepcopy: import returns the same cached object; mutating it directly would point the production recipe at the fixture.
 cfg = copy.deepcopy(_production)
@@ -98,7 +98,7 @@ if len(_paths) != 3:
     )
 cfg.dataset["paths"] = [str(p) for p in _paths]
 
-cfg.model_path = f"{DATA_ROOT}/iwc_fgvp_gdn2_260901.onnx"
+cfg.model_path = f"{DATA_ROOT}/iwc_tongyun_gdn2_260901.onnx"
 # The .so is ABI-bound to onnxruntime/CUDA; use the copy shipped with the fixture.
 cfg.ops_library = "$ops_library"
 
@@ -149,8 +149,8 @@ def run(tmp_path_factory):
     from xmetai_inference import main
 
     config_path = _write_config(
-        tmp_path_factory.mktemp("fgvp_config") / "fgvp_realdata_cfg.py")
-    out_dir = tmp_path_factory.mktemp("fgvp_realdata")
+        tmp_path_factory.mktemp("tongyun_config") / "tongyun_realdata_cfg.py")
+    out_dir = tmp_path_factory.mktemp("tongyun_realdata")
     print(f"\n[fixture] 本次用的配方：{config_path}")
 
     # Catch SystemExit separately so upstream validation failures are not buried in pytest internals.
@@ -168,7 +168,7 @@ def run(tmp_path_factory):
     return out_dir, rows, skipped, config_path
 
 
-def test_fgvp_matches_golden(run):
+def test_tongyun_matches_golden(run):
     """Core: the worst verdict for every (step, variable) must be in {IDENTICAL, CLOSE}."""
     _, rows, _, _ = run
     assert rows, "没有可比对象 —— 产物和标准答案没有共同的 (起报, 步, 变量)"
@@ -189,7 +189,7 @@ def test_fgvp_matches_golden(run):
         )
 
 
-def test_fgvp_coverage(run):
+def test_tongyun_coverage(run):
     """Coverage guard: writing fewer steps makes passing easier, so step- and variable-level skips are failures (initialization-level skips are tolerated)."""
     _, rows, skipped, config_path = run
 
@@ -209,7 +209,7 @@ def test_fgvp_coverage(run):
     assert not level_skips, f"有步/变量被静默跳过：{level_skips}"
 
 
-def test_fgvp_no_nan_mismatch(run):
+def test_tongyun_no_nan_mismatch(run):
     """Cells that are NaN on one side and numeric on the other do not enter the exceed statistics; missing-data positions are checked separately."""
     _, rows, _, _ = run
     bad = [r for r in rows if r["nan_mismatch"] > 0]

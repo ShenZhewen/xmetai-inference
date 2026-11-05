@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Unit tests for ``configs/weather_era_0p25_fgvp.py``: consistency between the
+"""Unit tests for ``configs/weather_era_0p25_tongyun.py``: consistency between the
 configuration and the model contract.
 
 A config is a series of declarations; most mistakes raise nothing and merely fail
 silently (a misspelled unit-conversion key means no conversion happens; a misspelled
 ``vars`` entry means one fewer variable is written). These tests check **consistency
 between declarations** and act as a change detector; whether the values themselves
-are correct is verified against the reference by ``test_fgvp_realdata.py``.
+are correct is verified against the reference by ``test_tongyun_realdata.py``.
 """
 import re
 from datetime import datetime
@@ -37,7 +37,7 @@ def _base_names(channels):
 
 @pytest.fixture(scope="module")
 def cfg():
-    return load_config("weather_era_0p25_fgvp")
+    return load_config("weather_era_0p25_tongyun")
 
 
 @pytest.fixture(scope="module")
@@ -45,15 +45,15 @@ def model_cls(cfg):
     return get_model_class(cfg.model_class)
 
 
-def test_loads_as_inferconfig_named_fgvp(cfg):
+def test_loads_as_inferconfig_named_tongyun(cfg):
     assert isinstance(cfg, InferConfig)
-    assert cfg.name == "weather_era_0p25_fgvp"
+    assert cfg.name == "weather_era_0p25_tongyun"
 
 
 def test_model_class_is_the_gdn2_backbone(cfg, model_cls):
-    """Must resolve to the deterministic gdn2 backbone, not the ensemble mamba_ens variant with the same channel layout."""
-    assert cfg.model_class == "iwc_fgvp_gdn2_onnx"
-    assert model_cls.__name__ == "IwcFgvpGdn2Model"
+    """Must resolve to the deterministic gdn2 backbone declared by this recipe."""
+    assert cfg.model_class == "iwc_tongyun_gdn2_onnx"
+    assert model_cls.__name__ == "IwcTongyunGdn2Model"
     assert model_cls.windowed_output is False
 
 
@@ -75,7 +75,7 @@ def test_gpu_state_is_off_by_default(cfg, monkeypatch):
 
     Reload instead of using the fixture: gpu_state is derived from an environment
     variable at module exec time. The file loaded must be the one ``cfg`` came from
-    (``cfg._source_path``), not a hard-coded "fgvp" -- otherwise the test always
+    (``cfg._source_path``), not a hard-coded config name -- otherwise the test always
     checks the packaged original config rather than the object under test.
     """
     monkeypatch.delenv("XMETAI_GPU_STATE", raising=False)
